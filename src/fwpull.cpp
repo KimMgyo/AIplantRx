@@ -46,7 +46,7 @@
 #include <string.h>
 #include <strings.h>
 #include "fwpull.h"
-#include "plantrx_config.h"
+#include "sitecfg.h"          // the server address and shared secret, NVS-backed
 #include "health.h"
 #include "hlog.h"
 #include "net.h"
@@ -110,6 +110,9 @@ static bool     s_configured = false;
 static char     s_host[64];
 static uint16_t s_port = 80;
 static char     s_prefix[48];      // path prefix from the base URL, "" for none
+// Borrowed from sitecfg rather than copied, for the reason plantrx.cpp gives at its own s_tok:
+// the buffer outlives this file and never changes after init.
+static const char *s_tok = "";
 
 // ---- small helpers ----------------------------------------------------------
 
@@ -212,7 +215,7 @@ static void write_get_head(WiFiClient &c, const char *path, const char *accept) 
     c.print("Host: "); c.print(s_host); c.print(":"); c.print(s_port); c.print("\r\n");
     c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
     c.print("Accept: "); c.print(accept); c.print("\r\n");
-    if (PLANTRX_TOKEN[0]) { c.print("Authorization: Bearer " PLANTRX_TOKEN "\r\n"); }
+    if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
     c.print("Connection: close\r\n\r\n");
     // No flush(). NetworkClient.h declares it `void flush(); // Print::flush tx` and then
     // implements it as clear(), which empties the RX buffer - so the call reads as "make sure
@@ -575,7 +578,10 @@ static void fwpull_task(void *arg) {
 void fwpull_init(void) {
     s_host[0] = s_prefix[0] = '\0';
 
-    if (PLANTRX_BASE_URL[0] == '\0' || !parse_base_url(PLANTRX_BASE_URL)) {
+    const char *base = sitecfg_base_url();
+    s_tok = sitecfg_token();
+
+    if (base[0] == '\0' || !parse_base_url(base)) {
         // No task at all in this case. A worker that can never do anything would still cost its
         // whole stack in internal DRAM, which on this board is the scarce half of memory, and
         // fwpull_request() below turns the request away on its own.

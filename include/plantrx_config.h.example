@@ -1,6 +1,13 @@
 // plantrx server address — copy to plantrx_config.h and fill in.
 // The real file is gitignored: the address is per-greenhouse, not per-firmware,
 // since the server runs on whatever box is on that site's LAN.
+//
+// What is here is the SEED, not the only source. sitecfg.cpp is the one file
+// that reads these, and it writes anything non-empty into NVS on boot so that a
+// later image built with these blank - which is what CI builds, because a public
+// artifact must not carry a secret - keeps the site it was provisioned with.
+// Fill this in, flash once over USB, and every update after that can arrive over
+// the air with nothing in it. sitecfg.h has the full rule.
 #pragma once
 
 // Base URL of the plantrx server, without a trailing slash. Empty means the

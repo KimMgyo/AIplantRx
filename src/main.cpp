@@ -17,6 +17,7 @@
 #include "reading.h"
 #include "aijudge.h"
 #include "plantrx.h"
+#include "sitecfg.h"
 #include "hlog.h"
 
 using namespace esp_panel::drivers;
@@ -38,6 +39,11 @@ void setup() {
     // First, before anything that can itself crash: it reads why the LAST run ended, and it
     // is also what keeps the bootloader from accepting this image until it has proved itself.
     health_init();
+    // Right after health, before anything that could want a server address. Pure
+    // NVS, no hardware, and both the uplink and the firmware pull read it - see
+    // sitecfg.h for why the address and the secret are no longer only in the
+    // header they used to be compiled in from.
+    sitecfg_init();
 
     board = new Board();
     board->init();

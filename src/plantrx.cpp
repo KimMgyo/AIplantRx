@@ -49,7 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "plantrx.h"
-#include "plantrx_config.h"
+#include "sitecfg.h"          // the server address and shared secret, NVS-backed
 #include "aijudge.h"
 #include "camnet.h"
 #include "camprov.h"
@@ -134,6 +134,11 @@ static char     s_prefix[48];      // path prefix from the base URL, "" for none
 // settings page polls it on a UI timer, and an snprintf per tick to rebuild a
 // string that cannot change is work the panel pays for as long as it is up.
 static char     s_host_disp[72];
+// Borrowed from sitecfg, not copied: its buffers outlive every caller and never
+// change after init, so a second copy of a secret in DRAM would buy nothing.
+// "" until plantrx_init() runs, which keeps write_request_head() honest if it is
+// ever reached before then.
+static const char *s_tok = "";
 
 static char    *s_req  = nullptr;  // PSRAM: the request body
 static char    *s_resp = nullptr;  // PSRAM: the reply (NUL-terminated)
@@ -560,7 +565,7 @@ static void write_request_head(WiFiClient &c, const char *path, const char *ctyp
     c.print("Accept: application/json\r\n");
     c.print("Content-Type: "); c.print(ctype); c.print("\r\n");
     c.print("Content-Length: "); c.print(clen); c.print("\r\n");
-    if (PLANTRX_TOKEN[0]) { c.print("Authorization: Bearer " PLANTRX_TOKEN "\r\n"); }
+    if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
     if (xdev)  { c.print("X-Device: "); c.print(xdev); c.print("\r\n"); }
     if (xkind) { c.print("X-Kind: ");   c.print(xkind); c.print("\r\n"); }
     c.print("Connection: close\r\n\r\n");
@@ -1468,11 +1473,14 @@ void plantrx_init(void) {
     memset(s_action, 0, sizeof(s_action));
     memset(s_window, 0, sizeof(s_window));
 
-    if (PLANTRX_BASE_URL[0] == '\0') {
+    const char *base = sitecfg_base_url();
+    s_tok = sitecfg_token();
+
+    if (base[0] == '\0') {
         hlogf("[plantrx] no server configured; rule engine only" "\n");
         return;
     }
-    if (!parse_base_url(PLANTRX_BASE_URL)) {
+    if (!parse_base_url(base)) {
         hlogf("[plantrx] base URL is not http://host[:port][/prefix]; uplink off" "\n");
         return;
     }

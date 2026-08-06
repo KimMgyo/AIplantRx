@@ -7,7 +7,7 @@
 #include "camprov.h"
 #include "hlog.h"
 #include "plantrx.h"          // the server address, parsed once by the uplink
-#include "plantrx_config.h"   // PLANTRX_TOKEN, the same bearer the uplink sends
+#include "sitecfg.h"          // the same bearer the uplink sends
 
 static const size_t MAX_PHOTO = 250 * 1024;   // CAM UXGA still is ~130-160KB
 // The reply is one flat object: a flag, three names, a score and the quota
@@ -161,7 +161,8 @@ static void write_request_head(WiFiClient &c, size_t clen) {
     c.print("Accept: application/json\r\n");
     c.print("Content-Type: image/jpeg\r\n");
     c.print("Content-Length: "); c.print(clen); c.print("\r\n");
-    if (PLANTRX_TOKEN[0]) { c.print("Authorization: Bearer " PLANTRX_TOKEN "\r\n"); }
+    const char *tok = sitecfg_token();
+    if (tok[0]) { c.print("Authorization: Bearer "); c.print(tok); c.print("\r\n"); }
     c.print("Connection: close\r\n\r\n");
 }
 
@@ -288,7 +289,7 @@ static void plantid_task(void *arg) {
         // as the fault: an empty host is plantrx_init() having found no usable
         // base URL, which is a panel that was never told where its server is.
         // "서버 연결 실패" would send the reader to the LAN for a problem that
-        // lives in plantrx_config.h.
+        // lives in provisioning - see sitecfg.h.
         if (!plantrx_srv_host()[0]) {
             set_err("서버 주소 없음");
             continue;
