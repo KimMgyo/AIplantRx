@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# Build output.
+#
+# `.pio` carries no slash, so git matches it at every depth: this one line also
+# covers sensor_node/.pio and esp32cam-streamer/.pio (~1.2 GB between the three).
+# ---------------------------------------------------------------------------
+.pio
+build/
+
+# ESP-IDF component manager cache: 325 MB of downloaded third-party sources,
+# re-fetched from the committed dependencies.lock rather than versioned here.
+managed_components/
+
+# Generated sdkconfig. sdkconfig.defaults is the committed source of truth.
+sdkconfig.esp32-s3-touch-lcd-7
+
+# ---------------------------------------------------------------------------
+# Secrets and machine-local config.
+#
+# The *.example templates ARE committed; these are the filled-in copies and
+# must never leave this PC:
+#   server/.env               PLANTRX_TOKEN, GEMINI_API_KEY, PLANTNET_API_KEYS
+#   include/plantrx_config.h  this LAN's server URL and device token
+# ---------------------------------------------------------------------------
+server/.env
+include/plantrx_config.h
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# The server's runtime volume: the live SQLite database and the published OTA
+# image. Dokploy mounts this as /srv/data, and firmware.manifest() treats a
+# missing image as an ordinary 404 - so an empty directory is a valid deploy
+# and nothing in here belongs in git.
+# ---------------------------------------------------------------------------
+server/data/
+
+# ---------------------------------------------------------------------------
+# Build and debug artifacts
+# ---------------------------------------------------------------------------
+smartfarm-merged.bin
+coredump.bin
+*.log
+scd41_diagnostic_log.txt
+scd41_raw_serial_logs.txt
+
+# ---------------------------------------------------------------------------
+# Editor and agent state, local to this machine
+# ---------------------------------------------------------------------------
+.vscode/
+.claude/settings.local.json
+
+# Scratch files from interactive debugging
+.tmp_*

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;}
+body{margin:0;background:oklch(21% 0.01 240);font-family:'Noto Sans KR',system-ui,sans-serif;}
+@keyframes livePulse{0%,100%{opacity:1;}50%{opacity:.25;}}
+a{color:oklch(58% 0.14 235);}
+a:hover{color:oklch(50% 0.14 235);}
+input[type="range"]{-webkit-appearance:none;height:6px;border-radius:3px;background:oklch(90% 0.006 240);}
+input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:#fff;border:3px solid oklch(58% 0.14 235);box-shadow:0 1px 2px rgba(0,0,0,.3);cursor:pointer;}
+input[type="range"]:disabled::-webkit-slider-thumb{border-color:oklch(75% 0.006 240);}
+</style>
+</helmet>
+<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:oklch(21% 0.01 240);padding:24px;">
+  <div style="width:824px;height:504px;padding:12px;border-radius:26px;background:oklch(14% 0.01 240);box-shadow:0 24px 60px rgba(0,0,0,.5);">
+    <div style="width:800px;height:480px;border-radius:16px;overflow:hidden;background:oklch(96% 0.006 200);display:flex;flex-direction:column;position:relative;">
+
+      <div style="height:40px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:#ffffff;border-bottom:1px solid oklch(89% 0.006 240);position:relative;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:oklch(60% 0.13 155);"></div>
+          <div style="font-size:13px;font-weight:800;letter-spacing:.3px;color:oklch(20% 0.01 240);">SMART FARM</div>
+        </div>
+
+        <div onClick="{{ toggleMenu }}" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;gap:8px;padding:6px 10px 6px 8px;border-radius:999px;background:oklch(97% 0.004 240);border:1px solid oklch(89% 0.006 240);cursor:pointer;">
+          <div style="width:20px;height:15px;border:2px solid oklch(52% 0.014 240);border-radius:3px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <div style="width:5px;height:5px;border:2px solid oklch(52% 0.014 240);border-radius:50%;"></div>
+          </div>
+          <div style="font-size:13px;font-weight:700;color:oklch(20% 0.01 240);white-space:nowrap;flex-shrink:0;">{{ pillLabel }}</div>
+          <div style="width:8px;height:8px;border-right:2px solid oklch(52% 0.014 240);border-bottom:2px solid oklch(52% 0.014 240);transform:rotate(45deg) {{ chevronTransform }};transition:transform .15s ease;margin-top:-3px;"></div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="display:flex;align-items:flex-end;gap:2px;height:12px;">
+            <div style="width:3px;height:5px;background:oklch(60% 0.13 155);border-radius:1px;"></div>
+            <div style="width:3px;height:7px;background:oklch(60% 0.13 155);border-radius:1px;"></div>
+            <div style="width:3px;height:9px;background:oklch(60% 0.13 155);border-radius:1px;"></div>
+            <div style="width:3px;height:12px;background:oklch(60% 0.13 155);border-radius:1px;"></div>
+          </div>
+          <div style="font-size:13px;font-weight:700;color:oklch(20% 0.01 240);font-variant-numeric:tabular-nums;">{{ timeStr }}</div>
+        </div>
+      </div>
+
+      <sc-if value="{{ menuOpen }}" hint-placeholder-val="{{ false }}">
+        <div onClick="{{ closeMenu }}" style="position:absolute;inset:0;z-index:40;"></div>
+        <div style="position:absolute;top:46px;left:50%;transform:translateX(-50%);width:200px;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;box-shadow:0 14px 30px rgba(0,0,0,.2);padding:6px;z-index:50;display:flex;flex-direction:column;gap:2px;">
+          <div onClick="{{ selectMonitor }}" style="display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;cursor:pointer;background:{{ monitorItemBg }};color:{{ monitorItemColor }};">
+            <div style="width:20px;height:15px;border:2px solid currentColor;border-radius:3px;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><div style="width:5px;height:5px;border:2px solid currentColor;border-radius:50%;"></div></div>
+            <div style="font-size:13px;font-weight:700;white-space:nowrap;flex-shrink:0;">모니터링</div>
+          </div>
+          <div onClick="{{ selectControl }}" style="display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;cursor:pointer;background:{{ controlItemBg }};color:{{ controlItemColor }};">
+            <div style="display:flex;flex-direction:column;gap:3px;width:20px;flex-shrink:0;align-items:center;">
+              <div style="width:16px;height:2px;background:currentColor;border-radius:1px;"></div>
+              <div style="width:16px;height:2px;background:currentColor;border-radius:1px;"></div>
+              <div style="width:16px;height:2px;background:currentColor;border-radius:1px;"></div>
+            </div>
+            <div style="font-size:13px;font-weight:700;white-space:nowrap;flex-shrink:0;">컨트롤</div>
+          </div>
+        </div>
+      </sc-if>
+
+      <div style="flex:1;display:flex;min-height:0;">
+
+        <div style="flex:1;min-width:0;height:100%;">
+
+          <sc-if value="{{ isMonitor }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;flex-direction:column;gap:16px;height:100%;padding:16px;box-sizing:border-box;">
+
+            <div style="flex:1;display:flex;gap:16px;min-height:0;">
+
+              <div style="width:360px;flex-shrink:0;display:flex;flex-direction:column;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;overflow:hidden;">
+                <div style="height:40px;flex-shrink:0;display:flex;gap:6px;padding:6px;background:oklch(97% 0.004 240);border-bottom:1px solid oklch(89% 0.006 240);">
+                  <div onClick="{{ setRgb }}" style="flex:1;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;cursor:pointer;background:{{ camRgbBg }};color:{{ camRgbColor }};">일반 RGB</div>
+                  <div onClick="{{ setThermal }}" style="flex:1;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;cursor:pointer;background:{{ camThermalBg }};color:{{ camThermalColor }};">열화상 IR</div>
+                </div>
+                <div style="flex:1;position:relative;overflow:hidden;">
+                  <sc-if value="{{ isRgb }}" hint-placeholder-val="{{ true }}">
+                    <div style="position:absolute;inset:0;background:repeating-linear-gradient(45deg, oklch(90% 0.01 235) 0 10px, oklch(94% 0.006 235) 10px 20px);"></div>
+                  </sc-if>
+                  <sc-if value="{{ isThermal }}" hint-placeholder-val="{{ false }}">
+                    <div style="position:absolute;inset:0;background:repeating-linear-gradient(45deg, oklch(70% 0.15 40) 0 10px, oklch(62% 0.18 22) 10px 20px);"></div>
+                  </sc-if>
+                  <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+                    <sc-if value="{{ isRgb }}" hint-placeholder-val="{{ true }}">
+                      <div style="font-family:ui-monospace,'SF Mono',monospace;font-size:12px;letter-spacing:1px;color:oklch(40% 0.02 235);background:rgba(255,255,255,.65);padding:6px 10px;border-radius:6px;">RGB CAMERA FEED</div>
+                    </sc-if>
+                    <sc-if value="{{ isThermal }}" hint-placeholder-val="{{ false }}">
+                      <div style="font-family:ui-monospace,'SF Mono',monospace;font-size:12px;letter-spacing:1px;color:#fff;background:rgba(0,0,0,.28);padding:6px 10px;border-radius:6px;">THERMAL CAMERA FEED</div>
+                    </sc-if>
+                  </div>
+                  <div style="position:absolute;top:8px;left:8px;display:flex;align-items:center;gap:5px;background:rgba(0,0,0,.4);padding:3px 8px;border-radius:10px;">
+                    <div style="width:6px;height:6px;border-radius:50%;background:#ff4444;animation:livePulse 1.4s ease-in-out infinite;"></div>
+                    <span style="color:#fff;font-size:10px;font-weight:700;letter-spacing:.5px;">LIVE</span>
+                  </div>
+                  <div style="position:absolute;bottom:8px;right:10px;color:rgba(255,255,255,.85);font-size:10px;">실시간 영상</div>
+                </div>
+              </div>
+
+              <div style="flex:1;display:flex;flex-direction:column;gap:10px;min-width:0;">
+                <div style="flex:1;display:flex;gap:10px;">
+                  <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;">
+                    <div style="font-size:11px;font-weight:700;color:oklch(52% 0.014 240);letter-spacing:.3px;">CO2</div>
+                    <div style="font-size:19px;font-weight:800;color:oklch(20% 0.01 240);white-space:nowrap;">{{ co2Str }}</div>
+                    <div style="height:5px;border-radius:3px;background:oklch(91% 0.004 240);overflow:hidden;"><div style="height:100%;border-radius:3px;width:{{ co2Pct }}%;background:{{ co2BarColor }};"></div></div>
+                  </div>
+                  <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;">
+                    <div style="font-size:11px;font-weight:700;color:oklch(52% 0.014 240);letter-spacing:.3px;">온도 Temp</div>
+                    <div style="font-size:19px;font-weight:800;color:oklch(20% 0.01 240);white-space:nowrap;">{{ tempStr }}</div>
+                    <div style="height:5px;border-radius:3px;background:oklch(91% 0.004 240);overflow:hidden;"><div style="height:100%;border-radius:3px;width:{{ tempPct }}%;background:{{ tempBarColor }};"></div></div>
+                  </div>
+                  <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;">
+                    <div style="font-size:11px;font-weight:700;color:oklch(52% 0.014 240);letter-spacing:.3px;">습도 Humidity</div>
+                    <div style="font-size:19px;font-weight:800;color:oklch(20% 0.01 240);white-space:nowrap;">{{ humidityStr }}</div>
+                    <div style="height:5px;border-radius:3px;background:oklch(91% 0.004 240);overflow:hidden;"><div style="height:100%;border-radius:3px;width:{{ humPct }}%;background:{{ humBarColor }};"></div></div>
+                  </div>
+                </div>
+                <div style="flex:1;display:flex;gap:10px;">
+                  <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;">
+                    <div style="font-size:11px;font-weight:700;color:oklch(52% 0.014 240);letter-spacing:.3px;">조도 Lux</div>
+                    <div style="font-size:19px;font-weight:800;color:oklch(20% 0.01 240);white-space:nowrap;">{{ luxStr }}</div>
+                    <div style="height:5px;border-radius:3px;background:oklch(91% 0.004 240);overflow:hidden;"><div style="height:100%;border-radius:3px;width:{{ luxPct }}%;background:{{ luxBarColor }};"></div></div>
+                  </div>
+                  <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;justify-content:space-between;min-width:0;">
+                    <div style="font-size:11px;font-weight:700;color:oklch(52% 0.014 240);letter-spacing:.3px;">토양습도 Soil</div>
+                    <div style="font-size:19px;font-weight:800;color:oklch(20% 0.01 240);white-space:nowrap;">{{ soilStr }}</div>
+                    <div style="height:5px;border-radius:3px;background:oklch(91% 0.004 240);overflow:hidden;"><div style="height:100%;border-radius:3px;width:{{ soilPct }}%;background:{{ soilBarColor }};"></div></div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            <div style="height:104px;flex-shrink:0;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:10px;display:flex;gap:8px;">
+              <div onClick="{{ toggleFan }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ fanPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ fanDot }};"></div>
+                <div style="font-size:10px;color:{{ fanPillText }};font-weight:600;text-align:center;line-height:1.2;">냉각팬</div>
+                <div style="font-size:12px;font-weight:800;color:{{ fanPillText }};">{{ fanStateStr }}</div>
+              </div>
+              <div onClick="{{ toggleHeater }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ heaterPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ heaterDot }};"></div>
+                <div style="font-size:10px;color:{{ heaterPillText }};font-weight:600;text-align:center;line-height:1.2;">PTC 히터</div>
+                <div style="font-size:12px;font-weight:800;color:{{ heaterPillText }};">{{ heaterStateStr }}</div>
+              </div>
+              <div onClick="{{ toggleMist }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ mistPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ mistDot }};"></div>
+                <div style="font-size:10px;color:{{ mistPillText }};font-weight:600;text-align:center;line-height:1.2;">초음파 미스트</div>
+                <div style="font-size:12px;font-weight:800;color:{{ mistPillText }};">{{ mistStateStr }}</div>
+              </div>
+              <div onClick="{{ togglePumpA }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ pumpAPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ pumpADot }};"></div>
+                <div style="font-size:10px;color:{{ pumpAPillText }};font-weight:600;text-align:center;line-height:1.2;">펌프 A</div>
+                <div style="font-size:12px;font-weight:800;color:{{ pumpAPillText }};">{{ pumpAStateStr }}</div>
+              </div>
+              <div onClick="{{ togglePumpB }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ pumpBPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ pumpBDot }};"></div>
+                <div style="font-size:10px;color:{{ pumpBPillText }};font-weight:600;text-align:center;line-height:1.2;">펌프 B</div>
+                <div style="font-size:12px;font-weight:800;color:{{ pumpBPillText }};">{{ pumpBStateStr }}</div>
+              </div>
+              <div onClick="{{ togglePumpC }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ pumpCPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ pumpCDot }};"></div>
+                <div style="font-size:10px;color:{{ pumpCPillText }};font-weight:600;text-align:center;line-height:1.2;">펌프 C</div>
+                <div style="font-size:12px;font-weight:800;color:{{ pumpCPillText }};">{{ pumpCStateStr }}</div>
+              </div>
+              <div onClick="{{ toggleLed }}" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;border-radius:10px;cursor:pointer;background:{{ ledPillBg }};">
+                <div style="width:7px;height:7px;border-radius:50%;background:{{ ledDot }};"></div>
+                <div style="font-size:10px;color:{{ ledPillText }};font-weight:600;text-align:center;line-height:1.2;">LED 식물등</div>
+                <div style="font-size:12px;font-weight:800;color:{{ ledPillText }};">{{ ledStateStr }}</div>
+              </div>
+            </div>
+
+          </div>
+          </sc-if>
+
+          <sc-if value="{{ isControl }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;flex-direction:column;gap:16px;height:100%;padding:16px;box-sizing:border-box;">
+
+            <div style="flex:1;display:flex;gap:16px;">
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.035 235);color:oklch(58% 0.14 235);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">A</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">펌프 A</div>
+                  </div>
+                  <div onClick="{{ togglePumpA }}" style="{{ pumpATrack }}"><div style="{{ pumpAKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ pumpAStatusColor }};">{{ pumpAStateStr }}</span></div>
+              </div>
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.035 235);color:oklch(58% 0.14 235);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">B</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">펌프 B</div>
+                  </div>
+                  <div onClick="{{ togglePumpB }}" style="{{ pumpBTrack }}"><div style="{{ pumpBKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ pumpBStatusColor }};">{{ pumpBStateStr }}</span></div>
+              </div>
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.035 235);color:oklch(58% 0.14 235);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">C</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">펌프 C</div>
+                  </div>
+                  <div onClick="{{ togglePumpC }}" style="{{ pumpCTrack }}"><div style="{{ pumpCKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ pumpCStatusColor }};">{{ pumpCStateStr }}</span></div>
+              </div>
+            </div>
+
+            <div style="flex:1;display:flex;gap:16px;">
+              <div style="flex:2;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;gap:8px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.035 235);color:oklch(58% 0.14 235);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">F</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">냉각팬 Cooling Fan</div>
+                  </div>
+                  <div onClick="{{ toggleFan }}" style="{{ fanTrack }}"><div style="{{ fanKnob }}"></div></div>
+                </div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:oklch(52% 0.014 240);margin-bottom:4px;">
+                    <span>속도 Speed</span><span style="font-weight:800;color:{{ fanStatusColor }};">{{ fanStateStr }}</span>
+                  </div>
+                  <input type="range" min="0" max="100" step="5" value="{{ fanSpeed }}" onChange="{{ setFanSpeed }}" disabled="{{ fanDisabled }}" style="width:100%;accent-color:oklch(58% 0.14 235);"/>
+                </div>
+              </div>
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.06 75);color:oklch(66% 0.15 75);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">H</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">PTC 히터</div>
+                  </div>
+                  <div onClick="{{ toggleHeater }}" style="{{ heaterTrack }}"><div style="{{ heaterKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ heaterStatusColor }};">{{ heaterStateStr }}</span></div>
+              </div>
+            </div>
+
+            <div style="flex:1;display:flex;gap:16px;">
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.035 235);color:oklch(58% 0.14 235);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">M</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">초음파 미스트</div>
+                  </div>
+                  <div onClick="{{ toggleMist }}" style="{{ mistTrack }}"><div style="{{ mistKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ mistStatusColor }};">{{ mistStateStr }}</span></div>
+              </div>
+              <div style="flex:1;background:#fff;border:1px solid oklch(89% 0.006 240);border-radius:14px;padding:14px;display:flex;flex-direction:column;justify-content:space-between;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:28px;height:28px;border-radius:8px;background:oklch(94% 0.05 155);color:oklch(60% 0.13 155);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;">L</div>
+                    <div style="font-size:14px;font-weight:700;color:oklch(20% 0.01 240);">LED 식물등</div>
+                  </div>
+                  <div onClick="{{ toggleLed }}" style="{{ ledTrack }}"><div style="{{ ledKnob }}"></div></div>
+                </div>
+                <div style="font-size:12px;color:oklch(52% 0.014 240);">현재 상태 <span style="font-weight:800;color:{{ ledStatusColor }};">{{ ledStateStr }}</span></div>
+              </div>
+              <div onClick="{{ allStop }}" style="flex:1;background:oklch(94% 0.05 25);border:1px solid oklch(58% 0.19 25);border-radius:14px;padding:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;" style-hover="background:oklch(90% 0.06 25);">
+                <div style="width:32px;height:32px;border-radius:8px;background:oklch(58% 0.19 25);display:flex;align-items:center;justify-content:center;">
+                  <div style="width:13px;height:13px;background:#fff;border-radius:2px;"></div>
+                </div>
+                <div style="font-size:13px;font-weight:800;color:oklch(45% 0.18 25);">전체 정지</div>
+                <div style="font-size:10px;color:oklch(50% 0.15 25);letter-spacing:.5px;">ALL STOP</div>
+              </div>
+            </div>
+
+          </div>
+          </sc-if>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    page: 'monitor',
+    camMode: 'rgb',
+    co2: 612,
+    temp: 24.5,
+    humidity: 58,
+    lux: 8400,
+    soil: 38,
+    fanOn: true,
+    fanSpeed: 65,
+    heaterOn: false,
+    mistOn: true,
+    pumpA: true,
+    pumpB: false,
+    pumpC: false,
+    ledOn: true,
+    menuOpen: false,
+  };
+
+  componentDidMount() {
+    this._tick = setInterval(() => {
+      this.setState(s => {
+        const j = (v, amt, min, max) => Math.min(max, Math.max(min, v + (Math.random() - 0.5) * amt));
+        return {
+          co2: Math.round(j(s.co2, 10, 400, 1500)),
+          temp: Math.round(j(s.temp, 0.2, 15, 35) * 10) / 10,
+          humidity: Math.round(j(s.humidity, 1.5, 30, 85)),
+          lux: Math.round(j(s.lux, 200, 0, 20000)),
+          soil: Math.round(j(s.soil, 0.8, 0, 100)),
+        };
+      });
+    }, 4000);
+  }
+
+  componentWillUnmount() {
+    clearInterval(this._tick);
+  }
+
+  trackStyle(on, color) {
+    return {
+      width: '44px', height: '24px', borderRadius: '12px',
+      background: on ? color : 'oklch(78% 0.006 240)',
+      position: 'relative', cursor: 'pointer',
+      transition: 'background .2s ease', flexShrink: '0',
+    };
+  }
+  knobStyle(on) {
+    return {
+      width: '18px', height: '18px', borderRadius: '50%', background: '#fff',
+      position: 'absolute', top: '3px', left: on ? '23px' : '3px',
+      transition: 'left .2s ease', boxShadow: '0 1px 2px rgba(0,0,0,.25)',
+    };
+  }
+
+  renderVals() {
+    const s = this.state;
+    const C = {
+      textSecondary: 'oklch(52% 0.014 240)',
+      green: 'oklch(60% 0.13 155)',
+      greenTint: 'oklch(94% 0.045 155)',
+      blue: 'oklch(58% 0.14 235)',
+      blueTint: 'oklch(94% 0.035 235)',
+      amber: 'oklch(66% 0.15 75)',
+      amberTint: 'oklch(94% 0.06 75)',
+      gray: 'oklch(75% 0.006 240)',
+      grayTint: 'oklch(95% 0.004 240)',
+    };
+
+    const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+    const timeStr = new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+    const co2Ok = s.co2 <= 1000;
+    const tempOk = s.temp >= 18 && s.temp <= 28;
+    const humOk = s.humidity >= 40 && s.humidity <= 70;
+    const luxOk = s.lux >= 1500;
+    const soilOk = s.soil >= 40 && s.soil <= 70;
+    const barColor = ok => ok ? C.green : C.amber;
+
+    const pillBg = on => on ? C.greenTint : C.grayTint;
+    const pillText = on => on ? 'oklch(38% 0.09 155)' : C.textSecondary;
+    const dotColor = on => on ? C.green : C.gray;
+    const statusColor = (on, onColor) => on ? onColor : C.textSecondary;
+
+    return {
+      isMonitor: s.page === 'monitor',
+      isControl: s.page === 'control',
+      timeStr,
+      menuOpen: s.menuOpen,
+      toggleMenu: () => this.setState(st => ({ menuOpen: !st.menuOpen })),
+      closeMenu: () => this.setState({ menuOpen: false }),
+      selectMonitor: () => this.setState({ page: 'monitor', menuOpen: false }),
+      selectControl: () => this.setState({ page: 'control', menuOpen: false }),
+      pillLabel: s.page === 'monitor' ? '모니터링' : '컨트롤',
+      chevronTransform: s.menuOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+      monitorItemBg: s.page === 'monitor' ? C.greenTint : 'transparent',
+      monitorItemColor: s.page === 'monitor' ? C.green : 'oklch(30% 0.01 240)',
+      controlItemBg: s.page === 'control' ? C.blueTint : 'transparent',
+      controlItemColor: s.page === 'control' ? C.blue : 'oklch(30% 0.01 240)',
+
+      isRgb: s.camMode === 'rgb',
+      isThermal: s.camMode === 'thermal',
+      setRgb: () => this.setState({ camMode: 'rgb' }),
+      setThermal: () => this.setState({ camMode: 'thermal' }),
+      camRgbBg: s.camMode === 'rgb' ? C.blueTint : 'transparent',
+      camRgbColor: s.camMode === 'rgb' ? C.blue : C.textSecondary,
+      camThermalBg: s.camMode === 'thermal' ? C.amberTint : 'transparent',
+      camThermalColor: s.camMode === 'thermal' ? C.amber : C.textSecondary,
+
+      co2Str: s.co2 + ' ppm',
+      tempStr: s.temp.toFixed(1) + ' °C',
+      humidityStr: s.humidity + ' %RH',
+      luxStr: s.lux.toLocaleString('ko-KR') + ' lx',
+      soilStr: s.soil + ' %',
+      co2Pct: clamp((s.co2 - 400) / (1500 - 400) * 100, 2, 100),
+      tempPct: clamp((s.temp - 15) / (35 - 15) * 100, 2, 100),
+      humPct: clamp((s.humidity - 30) / (85 - 30) * 100, 2, 100),
+      luxPct: clamp(s.lux / 20000 * 100, 2, 100),
+      soilPct: clamp(s.soil, 2, 100),
+      co2BarColor: barColor(co2Ok),
+      tempBarColor: barColor(tempOk),
+      humBarColor: barColor(humOk),
+      luxBarColor: barColor(luxOk),
+      soilBarColor: barColor(soilOk),
+
+      fanSpeed: s.fanSpeed,
+      fanDisabled: !s.fanOn,
+      fanStateStr: s.fanOn ? s.fanSpeed + '%' : 'OFF',
+      heaterStateStr: s.heaterOn ? 'ON' : 'OFF',
+      mistStateStr: s.mistOn ? 'ON' : 'OFF',
+      pumpAStateStr: s.pumpA ? 'ON' : 'OFF',
+      pumpBStateStr: s.pumpB ? 'ON' : 'OFF',
+      pumpCStateStr: s.pumpC ? 'ON' : 'OFF',
+      ledStateStr: s.ledOn ? 'ON' : 'OFF',
+
+      fanPillBg: pillBg(s.fanOn), fanPillText: pillText(s.fanOn), fanDot: dotColor(s.fanOn),
+      heaterPillBg: pillBg(s.heaterOn), heaterPillText: pillText(s.heaterOn), heaterDot: dotColor(s.heaterOn),
+      mistPillBg: pillBg(s.mistOn), mistPillText: pillText(s.mistOn), mistDot: dotColor(s.mistOn),
+      pumpAPillBg: pillBg(s.pumpA), pumpAPillText: pillText(s.pumpA), pumpADot: dotColor(s.pumpA),
+      pumpBPillBg: pillBg(s.pumpB), pumpBPillText: pillText(s.pumpB), pumpBDot: dotColor(s.pumpB),
+      pumpCPillBg: pillBg(s.pumpC), pumpCPillText: pillText(s.pumpC), pumpCDot: dotColor(s.pumpC),
+      ledPillBg: pillBg(s.ledOn), ledPillText: pillText(s.ledOn), ledDot: dotColor(s.ledOn),
+
+      fanStatusColor: statusColor(s.fanOn, C.blue),
+      heaterStatusColor: statusColor(s.heaterOn, C.amber),
+      mistStatusColor: statusColor(s.mistOn, C.blue),
+      pumpAStatusColor: statusColor(s.pumpA, C.blue),
+      pumpBStatusColor: statusColor(s.pumpB, C.blue),
+      pumpCStatusColor: statusColor(s.pumpC, C.blue),
+      ledStatusColor: statusColor(s.ledOn, C.green),
+
+      toggleFan: () => this.setState(st => ({ fanOn: !st.fanOn })),
+      toggleHeater: () => this.setState(st => ({ heaterOn: !st.heaterOn })),
+      toggleMist: () => this.setState(st => ({ mistOn: !st.mistOn })),
+      togglePumpA: () => this.setState(st => ({ pumpA: !st.pumpA })),
+      togglePumpB: () => this.setState(st => ({ pumpB: !st.pumpB })),
+      togglePumpC: () => this.setState(st => ({ pumpC: !st.pumpC })),
+      toggleLed: () => this.setState(st => ({ ledOn: !st.ledOn })),
+      setFanSpeed: (e) => this.setState({ fanSpeed: parseInt(e.target.value, 10) }),
+      allStop: () => this.setState({ fanOn: false, heaterOn: false, mistOn: false, pumpA: false, pumpB: false, pumpC: false, ledOn: false }),
+
+      fanTrack: this.trackStyle(s.fanOn, C.blue),
+      fanKnob: this.knobStyle(s.fanOn),
+      heaterTrack: this.trackStyle(s.heaterOn, C.amber),
+      heaterKnob: this.knobStyle(s.heaterOn),
+      mistTrack: this.trackStyle(s.mistOn, C.blue),
+      mistKnob: this.knobStyle(s.mistOn),
+      pumpATrack: this.trackStyle(s.pumpA, C.blue),
+      pumpAKnob: this.knobStyle(s.pumpA),
+      pumpBTrack: this.trackStyle(s.pumpB, C.blue),
+      pumpBKnob: this.knobStyle(s.pumpB),
+      pumpCTrack: this.trackStyle(s.pumpC, C.blue),
+      pumpCKnob: this.knobStyle(s.pumpC),
+      ledTrack: this.trackStyle(s.ledOn, C.green),
+      ledKnob: this.knobStyle(s.ledOn),
+    };
+  }
+}
+</script>
+</body>
+</html>

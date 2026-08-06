@@ -1,0 +1,19 @@
+// plantrx server address — copy to plantrx_config.h and fill in.
+// The real file is gitignored: the address is per-greenhouse, not per-firmware,
+// since the server runs on whatever box is on that site's LAN.
+#pragma once
+
+// Base URL of the plantrx server, without a trailing slash. Empty means the
+// uplink is not configured at all: plantrx_configured() goes false, the client
+// never opens a socket, and the panel runs on its local rule engine.
+//
+// http:// only. The server sits on the same LAN the camera already streams
+// MJPEG across, so TLS would buy nothing here and would cost an mbedtls context
+// per poll on a board whose PSRAM is already carrying the decode buffers. A
+// URL with any other scheme is treated as unconfigured rather than guessed at.
+#define PLANTRX_BASE_URL "http://192.168.1.10:8000"
+
+// Shared secret matching PLANTRX_TOKEN in the server's environment. Empty when
+// the server runs without one (its auth dependency skips the check), which is
+// the usual case on a closed greenhouse LAN.
+#define PLANTRX_TOKEN ""

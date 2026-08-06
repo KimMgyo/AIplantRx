@@ -1,0 +1,38 @@
+Micro-RTSP, vendored from https://github.com/geeksville/Micro-RTSP
+
+Vendored rather than pulled through lib_deps because it carries local fixes that
+a dependency checkout would silently discard. Only the files this project
+actually compiles are here; OV2640Streamer, SimStreamer, JPEGSamples and
+platglue-mbed.h are upstream-only and were left out.
+
+Local changes, all in CRtspSession.cpp:
+
+  1. Handle_RtspSETUP reported "destination=127.0.0.1;source=127.0.0.1" while
+     CStreamer actually sends RTP to the peer address it reads back from
+     socketpeeraddr(). The packets therefore arrived, but any client that
+     believes the Transport header discards them. ffmpeg hangs forever on
+     "-rtsp_transport udp" for exactly this reason; TCP interleaved was never
+     affected, which is what made the failure look intermittent rather than
+     total. Now reports the real destination, and omits "source" (optional per
+     RFC 2326, and the other platglue headers have no local-address call).
+
+     Measured: UDP went from a hang with zero frames to 175 frames in 14.98s.
+
+  2. The session ID is printed with %u instead of %i. The constructor forces
+     bit 31 set, so the signed form emitted tokens like "Session: -2147463434".
+
+  3. Handle_RtspSETUP answers 461 Unsupported Transport for plain UDP, gated on
+     -DRTSP_REQUIRE_TCP=1 (set in platformio.ini; build with 0 to allow UDP).
+
+     RTP has no retransmission and this WiFi link stalls for hundreds of
+     milliseconds at a time, so whole seconds of video simply vanish. A UDP
+     viewer logs "RTP: missed 14-26 packets" over and over, freezes, holds the
+     freeze, then drops the session and reconnects. Over TCP interleaved the
+     same stalls are only latency.
+
+     Measured back to back: 90s of TCP delivered 502 frames with no errors, and
+     130s with the client left to choose its own transport produced no log lines
+     at all - it takes the 461 and retries interleaved, which is what RFC 2326
+     asks clients to do.
+
+Verified with ffmpeg 'master-latest-win64-gpl-shared' against this board.

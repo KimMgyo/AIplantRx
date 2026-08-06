@@ -1,0 +1,1170 @@
+// Settings page: merged WiFi card (status + scan + uplink diagnostics + network
+// list) and the display (dark mode) card. Networking goes through net.h; UI
+// state is refreshed by a 1 Hz poll timer, never from WiFi callbacks.
+#include <stdio.h>
+#include <string.h>
+#include "ui_internal.h"
+#include "net.h"
+#include "reading.h"
+#include "camprov.h"
+#include "camnet.h"
+#include "paneloled.h"
+#include "sensornode.h"
+#include "thermal.h"
+#include "plantid.h"
+#include "plantrx.h"
+#include "updatemode.h"
+#include "fwpull.h"
+
+static ToggleWidgets t_wifi, t_dark;
+static lv_obj_t *st_wifi, *st_dark;
+static lv_obj_t *v_ssid, *v_ip, *v_rssi, *v_wifi_mac;   // WiFi info row value labels
+static lv_obj_t *st_cam;                    // ESP-NOW camera online status
+static lv_obj_t *v_cam_ip, *v_cam_rssi, *v_cam_mac, *v_cam_video;
+static lv_obj_t *v_cam_stream, *v_cam_image, *v_cam_rtsp;  // URL rows, built from the IP
+static lv_obj_t *st_node;                   // ESP-NOW sensor-node online status
+static lv_obj_t *v_node_age, *v_node_rx, *v_node_thermal, *v_node_peak;
+#if PANEL_OLED
+static lv_obj_t *v_oled;                    // rear OLED state; see the note where it is built
+#endif
+static lv_obj_t *v_plantnet;                      // PlantNet daily quota remaining
+static lv_obj_t *st_rx;                     // uplink link state, in the section header's value slot
+static lv_obj_t *w_rx_rows, *v_rx_none;     // detail rows / the "no server" one-liner
+static lv_obj_t *v_rx_host, *v_rx_age, *v_rx_judged, *v_rx_resp;
+static lv_obj_t *v_rx_err, *v_rx_fails, *v_rx_count, *v_rx_mode;
+static lv_obj_t *w_net_list;               // scrollable scan-result list
+static lv_obj_t *w_dlg;                    // password dialog root (NULL = closed)
+static lv_obj_t *w_dlg_ta;
+static char s_dlg_ssid[33];
+static lv_obj_t *s_page = NULL;  // page root; used to skip the 1Hz refresh when hidden
+
+// ---------------------------------------------------------------------------
+// Password dialog (modal on the top layer)
+// ---------------------------------------------------------------------------
+
+static void dialog_close(void) {
+    if (w_dlg != NULL) {
+        lv_obj_del(w_dlg);
+        w_dlg = NULL;
+        w_dlg_ta = NULL;
+    }
+}
+
+static void on_dlg_cancel(lv_event_t *e) { dialog_close(); }
+
+static void on_dlg_connect(lv_event_t *e) {
+    net_connect(s_dlg_ssid, lv_textarea_get_text(w_dlg_ta));
+    dialog_close();
+    page_settings_refresh();
+}
+
+static void on_kb_event(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        on_dlg_connect(e);
+    } else if (code == LV_EVENT_CANCEL) {
+        dialog_close();
+    }
+}
+
+static void dialog_open(const char *ssid) {
+    if (w_dlg != NULL) return;
+    strncpy(s_dlg_ssid, ssid, sizeof(s_dlg_ssid) - 1);
+    s_dlg_ssid[sizeof(s_dlg_ssid) - 1] = '\0';
+
+    // Dim backdrop; tap outside cancels.
+    w_dlg = plain(lv_layer_top());
+    lv_obj_set_size(w_dlg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(w_dlg, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(w_dlg, 120, 0);
+    clickable(w_dlg);
+    lv_obj_add_event_cb(w_dlg, on_dlg_cancel, LV_EVENT_CLICKED, NULL);
+
+    // Card. All Korean strings use font_bold_12 for the full-Hangul fallback.
+    lv_obj_t *box_ = card(w_dlg, C_SURFACE, 14, true);
+    lv_obj_set_width(box_, 420);
+    lv_obj_set_height(box_, LV_SIZE_CONTENT);
+    ignore_layout(box_);
+    lv_obj_align(box_, LV_ALIGN_TOP_MID, 0, 36);
+    flex_col(box_, 10, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(box_, 16);
+    clickable(box_);  // swallow taps so the backdrop doesn't close under the card
+
+    char title[64];
+    snprintf(title, sizeof(title), "\"%s\" 비밀번호 입력", s_dlg_ssid);
+    label(box_, title, &font_bold_12, C_TEXT_DARK);
+
+    w_dlg_ta = lv_textarea_create(box_);
+    lv_textarea_set_one_line(w_dlg_ta, true);
+    lv_textarea_set_password_mode(w_dlg_ta, true);
+    lv_textarea_set_placeholder_text(w_dlg_ta, "비밀번호");
+    lv_obj_set_width(w_dlg_ta, LV_PCT(100));
+    lv_obj_set_style_text_font(w_dlg_ta, &font_bold_12, 0);
+    lv_obj_set_style_bg_color(w_dlg_ta, C_PILL_BG, 0);
+    lv_obj_set_style_text_color(w_dlg_ta, C_TEXT_DARK, 0);
+    lv_obj_set_style_border_color(w_dlg_ta, C_BORDER, 0);
+    lv_obj_set_style_border_width(w_dlg_ta, 1, 0);
+    lv_obj_set_style_radius(w_dlg_ta, 8, 0);
+
+    lv_obj_t *btn_row = plain(box_);
+    lv_obj_set_width(btn_row, LV_PCT(100));
+    lv_obj_set_height(btn_row, LV_SIZE_CONTENT);
+    flex_row(btn_row, 8, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *btn_cancel = box(btn_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT, C_GRAY_TINT, 8);
+    lv_obj_set_style_pad_hor(btn_cancel, 14, 0);
+    lv_obj_set_style_pad_ver(btn_cancel, 7, 0);
+    clickable(btn_cancel);
+    lv_obj_add_event_cb(btn_cancel, on_dlg_cancel, LV_EVENT_CLICKED, NULL);
+    label(btn_cancel, "취소", &font_bold_12, C_TEXT_SECONDARY);
+
+    lv_obj_t *btn_ok = box(btn_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT, C_BLUE_TINT, 8);
+    lv_obj_set_style_pad_hor(btn_ok, 14, 0);
+    lv_obj_set_style_pad_ver(btn_ok, 7, 0);
+    clickable(btn_ok);
+    lv_obj_add_event_cb(btn_ok, on_dlg_connect, LV_EVENT_CLICKED, NULL);
+    label(btn_ok, "연결", &font_bold_12, C_BLUE);
+
+    // Created per-dialog, so it always picks up the active palette.
+    lv_obj_t *kb = lv_keyboard_create(w_dlg);
+    lv_obj_set_size(kb, LV_PCT(100), 190);
+    lv_obj_set_style_bg_color(kb, C_SCREEN_BG, 0);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(kb, C_SURFACE, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, C_TEXT_DARK, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, C_BORDER, LV_PART_ITEMS);
+    lv_obj_set_style_radius(kb, 6, LV_PART_ITEMS);
+    // Special keys (backspace, enter, mode switch) carry the CHECKED ctrl
+    // flag and render in LV_STATE_CHECKED — style it or they stay theme-white.
+    lv_obj_set_style_bg_color(kb, C_PILL_BG, (uint32_t)LV_PART_ITEMS | (uint32_t)LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(kb, C_TEXT_SECONDARY, (uint32_t)LV_PART_ITEMS | (uint32_t)LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(kb, C_BLUE_TINT, (uint32_t)LV_PART_ITEMS | (uint32_t)LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, C_BLUE, (uint32_t)LV_PART_ITEMS | (uint32_t)LV_STATE_PRESSED);
+    lv_keyboard_set_textarea(kb, w_dlg_ta);
+    lv_obj_add_event_cb(kb, on_kb_event, LV_EVENT_ALL, NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Network list
+// ---------------------------------------------------------------------------
+
+static void on_net_row(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    const NetScanItem *it = net_scan_item(idx);
+    if (it == NULL || !net_enabled()) return;
+    if (net_state() == NET_CONNECTED && strcmp(net_ssid(), it->ssid) == 0) return;  // already on it
+    if (it->secured) {
+        dialog_open(it->ssid);
+    } else {
+        net_connect(it->ssid, NULL);
+        page_settings_refresh();
+    }
+}
+
+static int rssi_to_bars(int rssi) {
+    if (rssi > -55) return 4;
+    if (rssi > -65) return 3;
+    if (rssi > -75) return 2;
+    return 1;
+}
+
+static void build_network_row(lv_obj_t *parent, const NetScanItem *it, int idx, bool connected) {
+    lv_obj_t *row = plain(parent);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    flex_row(row, 0, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(row, 10, 0);
+    lv_obj_set_style_pad_ver(row, 8, 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    clickable(row);
+    lv_obj_add_event_cb(row, on_net_row, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+    if (connected) {
+        lv_obj_set_style_bg_color(row, C_BLUE_TINT, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    }
+
+    lv_obj_t *left = plain(row);
+    lv_obj_set_size(left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    flex_row(left, 8);
+    make_wifi_bars(left, rssi_to_bars(it->rssi), connected ? C_BLUE : C_TEXT_SECONDARY, C_PROGRESS_TRACK);
+    label(left, it->ssid, &font_bold_12, C_TEXT_DARK);
+
+    if (connected) {
+        lv_obj_t *chip = plain(row);
+        lv_obj_set_size(chip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(chip, C_BLUE, 0);
+        lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(chip, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_hor(chip, 8, 0);
+        lv_obj_set_style_pad_ver(chip, 3, 0);
+        flex_row(chip, 0, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        label(chip, "연결됨", &font_bold_10, C_WHITE);
+    } else {
+        label(row, it->secured ? "보안" : "개방", &font_bold_12, C_TEXT_SECONDARY);
+    }
+}
+
+// Skeleton placeholders while a scan is running: 7 static rows pulsed in
+// unison by a 120ms timer (idle unless s_skel_active).
+static bool s_skel_active = false;
+#define SKEL_ROWS 7
+
+static void build_skeleton_rows(void) {
+    static const lv_coord_t name_w[SKEL_ROWS] = {120, 90, 140, 100, 130, 85, 110};
+    for (int i = 0; i < SKEL_ROWS; i++) {
+        lv_obj_t *row = plain(w_net_list);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        flex_row(row, 0, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_hor(row, 10, 0);
+        lv_obj_set_style_pad_ver(row, 9, 0);
+
+        lv_obj_t *left = plain(row);
+        lv_obj_set_size(left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        flex_row(left, 8);
+        box(left, 18, 12, C_SKELETON, 2);
+        box(left, name_w[i], 10, C_SKELETON, 5);
+
+        box(row, 30, 10, C_SKELETON, 5);
+    }
+}
+
+static void skel_timer_cb(lv_timer_t *t) {
+    if (!s_skel_active) return;
+    static const lv_opa_t phase[6] = {90, 130, 180, 230, 180, 130};
+    static uint8_t p = 0;
+    p = (p + 1) % 6;
+    // Pulse only the actual skeleton bars (leaf boxes). Never the group
+    // containers: those are `plain()` objects whose default bg is white, and
+    // raising their opacity would flash that white through in dark mode.
+    for (uint32_t r = 0; r < lv_obj_get_child_cnt(w_net_list); r++) {
+        lv_obj_t *row = lv_obj_get_child(w_net_list, r);
+        for (uint32_t k = 0; k < lv_obj_get_child_cnt(row); k++) {
+            lv_obj_t *el = lv_obj_get_child(row, k);
+            if (lv_obj_get_child_cnt(el) == 0) {
+                lv_obj_set_style_bg_opa(el, phase[p], 0);  // leaf bar
+            } else {
+                for (uint32_t m = 0; m < lv_obj_get_child_cnt(el); m++) {
+                    lv_obj_set_style_bg_opa(lv_obj_get_child(el, m), phase[p], 0);
+                }
+            }
+        }
+    }
+}
+
+// True once this settings visit has rendered a completed scan; the skeleton is
+// shown only for the visit's first scan, then results update in place.
+static bool s_shown_results_this_visit = false;
+
+static void rebuild_net_list(void) {
+    lv_obj_clean(w_net_list);
+    s_skel_active = false;
+    if (!net_enabled()) {
+        label(w_net_list, "WiFi가 꺼져 있습니다", &font_bold_12, C_TEXT_SECONDARY);
+        return;
+    }
+    if (net_scanning() && !s_shown_results_this_visit) {   // this visit's first scan -> skeleton
+        s_skel_active = true;
+        build_skeleton_rows();
+        return;
+    }
+    s_shown_results_this_visit = true;   // first scan done this visit: update in place from now on
+    int n = net_scan_count();
+    if (n == 0) {
+        label(w_net_list, "주변 네트워크가 없습니다", &font_bold_12, C_TEXT_SECONDARY);
+        return;
+    }
+    const char *cur = (net_state() == NET_CONNECTED) ? net_ssid() : "";
+    // The connected network always leads, regardless of its RSSI-sorted
+    // position; everything else keeps the scan's original (RSSI) order.
+    int connected_idx = -1;
+    if (cur[0] != '\0') {
+        for (int i = 0; i < n; i++) {
+            if (strcmp(cur, net_scan_item(i)->ssid) == 0) {
+                connected_idx = i;
+                break;
+            }
+        }
+    }
+    if (connected_idx >= 0) {
+        build_network_row(w_net_list, net_scan_item(connected_idx), connected_idx, true);
+    }
+    for (int i = 0; i < n; i++) {
+        if (i == connected_idx) continue;
+        build_network_row(w_net_list, net_scan_item(i), i, false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 펌웨어 업데이트 버튼
+// ---------------------------------------------------------------------------
+
+// Two taps, and only the second one does anything.
+//
+// WHAT THE SECOND TAP DOES is ask the board to fetch the newest image from the server and
+// install it - fwpull_request(), not updatemode_enter(). That distinction is the whole reason
+// this control exists. Entering update mode on its own only quiets the board and waits for
+// somebody else to push an image at it, which needs a laptop with the toolchain awake on the
+// same network; the person standing in front of the greenhouse has neither, and a button
+// labelled 업데이트 that produces five minutes of silence and a reboot has lied to them.
+// fwpull_request() enters the mode itself before it writes a byte, so none of the load-shedding
+// described in updatemode.cpp is given up by going through it - the button just stopped being
+// the half of the job the panel could not finish alone.
+//
+// Every other control on this page is undone by pressing it again: WiFi comes back on, the theme
+// flips back, a network row can be left alone. This one has no way back - the pull deinitialises
+// ESP-NOW, stops the camera pull and the server poll, covers the screen, and ends either in a
+// reboot into different firmware or in a board that stood still for the whole of the deadline.
+// So a finger that lands here on the way to 화면 설정 costs the greenhouse a panel that reports
+// nothing for minutes, and the grower has no way to tell it was an accident rather than a crash.
+//
+// A press-and-hold would buy the same safety, but nothing else on this panel is held, so the
+// gesture would have to be discovered; a modal would need the dialog machinery above and its own
+// dismiss target. Asking the question in the button itself needs neither, and the question is
+// visible to whoever is standing there rather than living in a habit.
+//
+// The confirmation expires on its own for the mirror-image reason: the way out of a half-pressed
+// update must not be another press on the control that starts one. Someone who reads 정말
+// 업데이트?, thinks better of it and walks away has already done everything required - five
+// seconds later the button is an ordinary button again, and nothing is left armed for the next
+// person who leans on the screen.
+static const int UPD_CONFIRM_SECONDS = 5;
+
+static lv_obj_t *w_upd_btn, *w_upd_title, *w_upd_hint;
+static bool s_upd_confirm;
+static int s_upd_left;
+// One timer for the life of the program, paused whenever no confirmation is pending - the rule
+// the all-stop undo window already follows (page_control.cpp:43). Creating it per press leaks a
+// timer per tap, and this page is destroyed and rebuilt whole on every theme switch, which would
+// leak the survivors again with no widget left for them to paint.
+static lv_timer_t *s_upd_timer;
+
+// Colour and wording move together and only when the state flips, so they are written together
+// and not from the countdown tick: the seconds change every second, the amber does not, and
+// lv_obj_set_style_text_color invalidates whether or not the colour moved - the same per-second
+// waste ui_set_label_text exists to avoid (see rx_set_state above).
+static void upd_apply_state(void) {
+    if (s_upd_confirm) {
+        lv_obj_set_style_bg_color(w_upd_btn, C_AMBER_TINT, 0);
+        lv_obj_set_style_border_color(w_upd_btn, C_AMBER, 0);
+        lv_label_set_text(w_upd_title, "정말 업데이트?");
+        lv_obj_set_style_text_color(w_upd_title, C_AMBER, 0);
+        lv_obj_set_style_text_color(w_upd_hint, C_AMBER, 0);
+    } else {
+        lv_obj_set_style_bg_color(w_upd_btn, C_SURFACE, 0);
+        lv_obj_set_style_border_color(w_upd_btn, C_BORDER, 0);
+        lv_label_set_text(w_upd_title, "최신 펌웨어로 업데이트");
+        lv_obj_set_style_text_color(w_upd_title, C_TEXT_DARK, 0);
+        lv_obj_set_style_text_color(w_upd_hint, C_TEXT_SECONDARY, 0);
+        // The consequence, on the control, in the idle state - a grower has to be able to decide
+        // whether to press this before the first press, not after it. It says where the image
+        // comes from, because a panel that goes quiet and then reboots on its own only reads as
+        // intended if you were told beforehand that this is what you asked for.
+        lv_label_set_text(w_upd_hint, "누르면 확인 · 서버에서 받아 설치");
+    }
+}
+
+// How long a finished pull's answer stays on the hint line before the instruction comes back.
+//
+// It has to outlast the glance: a pull that ends in "이미 최신" or "서버 연결 실패" produces no
+// takeover screen, no reboot and no other trace, so this label is the entire result. Thirty
+// seconds is long enough to walk back to the panel after pressing and short enough that the
+// button explains itself again to the next person.
+static const uint32_t UPD_STATUS_HOLD_MS = 30000;
+static uint32_t s_upd_status_until;
+static bool s_upd_showing_status;
+
+// The last string handed to the hint line, so an outcome that landed while nothing was looking
+// still gets drawn. Compared by pointer - see the note in upd_sync_enabled().
+static const char *s_upd_status_shown;
+
+// Puts fwpull's own words on the hint line, in the amber the confirmation used, and opens the
+// window during which they stay there.
+//
+// WHY THIS EXISTS AT ALL. The takeover screen used to be the answer to every press, because the
+// old fwpull_request() entered update mode before it knew whether there was anything to install.
+// It no longer does - checking costs the panel nothing, so a press that finds the board already
+// current, or cannot reach the server, now leaves the page exactly where it was (see the note
+// above updatemode_enter() in fwpull.cpp). That is strictly better and it moves the whole burden
+// of saying what happened onto this one label.
+static void upd_show_status(void) {
+    if (w_upd_hint == NULL) return;
+    const char *st = fwpull_status();
+    if (st == NULL || st[0] == '\0') return;
+    lv_obj_set_style_text_color(w_upd_hint, C_AMBER, 0);
+    ui_set_label_text(w_upd_hint, st);
+    s_upd_status_until = lv_tick_get() + UPD_STATUS_HOLD_MS;
+    s_upd_showing_status = true;
+    s_upd_status_shown = st;
+}
+
+static void upd_paint_left(void) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "다시 누르면 시작 · %d초 후 취소", s_upd_left);
+    ui_set_label_text(w_upd_hint, buf);
+}
+
+static void upd_confirm_clear(void) {
+    s_upd_confirm = false;
+    s_upd_left = 0;
+    lv_timer_pause(s_upd_timer);
+    upd_apply_state();
+}
+
+static void upd_confirm_arm(void) {
+    s_upd_confirm = true;
+    s_upd_left = UPD_CONFIRM_SECONDS;
+    upd_apply_state();
+    upd_paint_left();
+    lv_timer_reset(s_upd_timer);   // a fresh five seconds, not the remainder of an older window
+    lv_timer_resume(s_upd_timer);
+}
+
+static void upd_timer_cb(lv_timer_t *t) {
+    if (--s_upd_left <= 0) {
+        upd_confirm_clear();
+        return;
+    }
+    upd_paint_left();
+}
+
+// The other two ways into update mode - a command from the server and the arrival of a push
+// upload - know nothing about this page, so the button's state cannot be set where the mode is
+// entered. The 1Hz refresh reads the mode instead. lv_obj_add_state and lv_obj_clear_state both
+// compare before they write (lv_obj.c:294, :304), so an unchanged state costs a comparison per
+// second and no redraw, which is what makes this safe to call from the poll at all.
+//
+// fwpull_active() is read alongside it rather than trusted to follow from it. A pull is armed
+// here and finished on another task, and this page must not depend on how much of that arming
+// happens before fwpull_request() returns: an armed pull that has not yet entered the mode is
+// still a board with one update on the way, and the offer of a second one is meaningless.
+static void upd_sync_enabled(void) {
+    if (w_upd_btn == NULL) return;   // the poll timer can outlive a rebuild that has not run yet
+    if (updatemode_active() || fwpull_active()) {
+        lv_obj_add_state(w_upd_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(w_upd_btn, LV_STATE_DISABLED);
+    }
+
+    // The hint line doubles as the pull's only progress report while no takeover screen is up -
+    // the check phase deliberately does not raise one. Driven from this 1Hz poll rather than from
+    // the press, because the answer arrives on fwpull's worker task some seconds later and the
+    // press has long returned by then.
+    //
+    // The confirmation owns the line while it is counting down, so it is left alone: overwriting
+    // "다시 누르면 시작 · N초 후 취소" would drop the one instruction that press depends on.
+    if (s_upd_confirm) return;
+
+    // Painted on a CHANGE and not merely while a pull is running, because the outcome exists
+    // exactly when the pull stops running: 이미 최신 is written on the line above the return that
+    // clears s_running, so a paint gated on fwpull_active() can only ever show the phase the
+    // press started on. An already-current check is two round trips and finishes inside the first
+    // second, so the panel sat on 물어보는 중 for the whole thirty-second window and never said
+    // what happened - which is the one job this label has.
+    //
+    // The pointer IS the message: fwpull's status is `const char *volatile` and every assignment
+    // to it is a string literal (fwpull.cpp:97), so identity is the whole change test and this
+    // costs one compare per second rather than a strcmp on the 1Hz path. fwpull_active() stays in
+    // the condition so a phase that holds one string for many seconds - 다운로드 중 - keeps
+    // re-arming its window instead of expiring partway through an install.
+    const char *st = fwpull_status();
+    if (fwpull_active() || (st != NULL && st[0] != '\0' && st != s_upd_status_shown)) {
+        upd_show_status();
+    } else if (s_upd_showing_status && (int32_t)(lv_tick_get() - s_upd_status_until) >= 0) {
+        // The window closed. upd_apply_state() restores both the wording and the colour, so the
+        // amber goes with the message rather than staying behind on an idle control.
+        s_upd_showing_status = false;
+        upd_apply_state();
+    }
+}
+
+static void on_update_pressed(lv_event_t *e) {
+    // LV_STATE_DISABLED is a style state, not an input filter: lv_indev consults it on the keypad
+    // path only (lv_indev.c:412), so a touch still lands here with the button greyed out. The
+    // takeover screen is opaque and clickable and covers this page, so it should never happen -
+    // but if it does, re-arming a confirmation nobody can see, on a board that is being flashed,
+    // is not the failure to have. fwpull_request() is idempotent; this page's state is not.
+    if (updatemode_active() || fwpull_active()) return;
+    if (!s_upd_confirm) {
+        upd_confirm_arm();
+        return;
+    }
+    // The second tap inside the window. Everything past this line is one-way.
+    upd_confirm_clear();
+    // fwpull_request() takes it from here, and it is the only call this button makes. It does NOT
+    // take the panel over - it asks the server what it has first, and enters update mode only if
+    // an install is actually going to happen (see fwpull.cpp). So a press that finds the board
+    // already current, or that cannot reach the server, leaves this page exactly where it is.
+    fwpull_request("버튼");
+    upd_sync_enabled();
+
+    // Painted here as well as from the 1Hz poll, so the line changes in the repaint the press
+    // caused rather than up to a second later. Without it the panel looks like it ignored the
+    // tap, and on this board the next thing tried is the power switch.
+    upd_show_status();
+}
+
+// ---------------------------------------------------------------------------
+// Refresh / handlers
+// ---------------------------------------------------------------------------
+
+// ---- uplink diagnostics ----
+//
+// A panel that has stopped receiving prescriptions gives a grower nothing to act
+// on: the local rule keeps judging and the last prescription keeps showing, which
+// is the uplink's design and also why its failure is invisible. These rows are
+// the whole diagnosis - address, both freshnesses, last status, last reason - so
+// the answer does not require a serial console and a laptop in the greenhouse.
+// Both freshnesses, because a working wire carrying a dead model's last answer is
+// a failure the transport cannot see and the one this block is worst at showing.
+
+// The state word and its colour are both functions of the state being drawn, and
+// no two words share a colour, so an unchanged word means an unchanged colour and
+// one guard covers both writes.
+// lv_obj_set_style_text_color refreshes the style and invalidates whether or not
+// the colour moved, which is the same per-second waste ui_set_label_text avoids.
+static void rx_set_state(lv_obj_t *lbl, const char *txt, lv_color_t color) {
+    const char *cur = lv_label_get_text(lbl);
+    if (cur != NULL && strcmp(cur, txt) == 0) return;
+    lv_label_set_text(lbl, txt);
+    lv_obj_set_style_text_color(lbl, color, 0);
+}
+
+// Guarded on the current flag: lv_obj_add_flag / lv_obj_clear_flag invalidate the
+// object and dirty the parent's layout unconditionally for LV_OBJ_FLAG_HIDDEN, so
+// re-hiding an already hidden row would relayout the WiFi card every second.
+static void rx_visible(lv_obj_t *o, bool show) {
+    if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN) != show) return;
+    if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void rx_row_set(lv_obj_t *value, const char *txt) {
+    rx_visible(lv_obj_get_parent(value), true);
+    ui_set_label_text(value, txt);
+}
+
+static void rx_row_hide(lv_obj_t *value) { rx_visible(lv_obj_get_parent(value), false); }
+
+// One ladder for both of the uplink's ages. Drawing them together is the entire
+// point - the comparison is the diagnosis - and two formats would make "3초 전"
+// and "0시간 7분 전" look like different kinds of number. Negative is "없음" and
+// not a zero: no exchange, or no judgment, is not an age of nothing.
+static void rx_fmt_age(char *buf, size_t cap, int32_t s) {
+    if (s < 0)         snprintf(buf, cap, "없음");
+    else if (s < 60)   snprintf(buf, cap, "%ld초 전", (long)s);
+    else if (s < 3600) snprintf(buf, cap, "%ld분 전", (long)(s / 60));
+    else               snprintf(buf, cap, "%ld시간 %ld분 전", (long)(s / 3600), (long)((s % 3600) / 60));
+}
+
+static void refresh_uplink(void) {
+    // No server: one line, and none of the eight rows. A column of "-" under the
+    // header reads as a panel that lost its uplink, which is the opposite of what
+    // an unconfigured build means.
+    if (!plantrx_configured()) {
+        rx_set_state(st_rx, "미설정", C_TEXT_SECONDARY);
+        rx_visible(w_rx_rows, false);
+        rx_visible(v_rx_none, true);
+        return;
+    }
+    rx_visible(v_rx_none, false);
+    rx_visible(w_rx_rows, true);
+
+    RxLink link = plantrx_link();
+
+    // A successful exchange is not a fresh judgment. When the model is down the
+    // server answers every poll with the previous prescription verbatim
+    // (server/app/main.py:312), so the transport reads perfect while the content
+    // ages - and this is the screen a grower opens to find out which of the two
+    // has stopped. Same rule and the same rx_content_stale_s() as the top bar; the
+    // two screens disagreeing about what "stale" means is the class of bug this
+    // round exists to remove. Only at RX_OK: behind a dead link a climbing
+    // judgment age is that one outage told twice, and 마지막 수신 already told it.
+    int32_t cage = plantrx_content_age_s();
+    bool content_stale = (link == RX_OK) && (cage < 0 || cage >= rx_content_stale_s());
+
+    // ...and a server with no model at all is not a delayed judgment. It answers
+    // every poll cleanly and will never send one, so content_stale is permanently
+    // true on a keyless install and this line spent an unactionable amber on it
+    // forever - on the very screen a grower opens to find out what is wrong. Same
+    // split, same reason and the same wording as the top bar's (src/ui/topbar.cpp,
+    // no_model): a configuration is not an event, and the two screens have to
+    // answer this identically or one of them is lying.
+    //
+    // cage < 0 gates it because a server that judged and then lost its key still
+    // holds a real judgment that is really ageing, and that IS a delay.
+    bool no_model = content_stale && rx_no_model();
+
+    // Amber for 지연 / 실패, not the plain secondary grey the other cards use for
+    // "off": those two are the states a grower can act on, and RX_STALE in
+    // particular is easy to read as healthy when it is drawn the same as 대기 중.
+    // 판단 지연 earns that same amber for that same reason, and keeps 정상 in the
+    // string so the line cannot be read as a transport fault: that one says 실패
+    // with no 정상 in it and brings 실패 원인 and 연속 실패 along with it. No red is
+    // spent here at all - red on this panel is the all-stop, and the two faults
+    // send a grower to two different places.
+    //
+    // 모델 없음 keeps the 정상 for the same reason and takes the grey, because there
+    // is nothing here to chase: the fix is a key on the server, and the line's job
+    // is to name that rather than to imply the panel is waiting.
+    if (no_model) {
+        rx_set_state(st_rx, "정상 (모델 없음)", C_TEXT_SECONDARY);
+    } else if (content_stale) {
+        rx_set_state(st_rx, "정상 (판단 지연)", C_AMBER);
+    } else {
+        switch (link) {
+            case RX_OK:    rx_set_state(st_rx, "정상", C_BLUE); break;
+            case RX_STALE: rx_set_state(st_rx, "지연", C_AMBER); break;
+            case RX_ERROR: rx_set_state(st_rx, "실패", C_AMBER); break;
+            default:       rx_set_state(st_rx, "대기 중", C_TEXT_SECONDARY); break;
+        }
+    }
+
+    char buf[48];
+    const char *host = plantrx_host();
+    rx_row_set(v_rx_host, host[0] != '\0' ? host : "-");
+
+    // Both "3초 전" and "40분 전" are RX_OK and only one of them means the panel is
+    // current, which is the whole reason plantrx_age_s() exists.
+    int32_t age = plantrx_age_s();
+    rx_fmt_age(buf, sizeof(buf), age);
+    rx_row_set(v_rx_age, buf);
+
+    // 마지막 판단, and only when there is something to say - the rule 실패 원인 /
+    // 연속 실패 / 서버 모드 already follow here. While the judgment is current the
+    // row above answers the only question anyone came with, and a row that is
+    // always present is a row a grower stops reading. "없음" is not a formatting
+    // fallback: it is a server that has never diagnosed this device, which over
+    // the wire is indistinguishable from one that answers every minute.
+    if (content_stale) {
+        rx_fmt_age(buf, sizeof(buf), cage);
+        rx_row_set(v_rx_judged, buf);
+    } else {
+        rx_row_hide(v_rx_judged);
+    }
+
+    // The round trip belongs to the last COMPLETED exchange, so pairing it with a
+    // transport failure would attribute an old timing to an attempt that never
+    // reached the server. Those two cases print the reason instead of a number.
+    int status = plantrx_last_status();
+    uint32_t rtt = plantrx_last_rtt_ms();
+    if (status == 0) {
+        snprintf(buf, sizeof(buf), "교신 없음");
+    } else if (status < 0) {
+        snprintf(buf, sizeof(buf), "전송 실패");
+    } else if (rtt > 0) {
+        snprintf(buf, sizeof(buf), "%d (%lums)", status, (unsigned long)rtt);
+    } else {
+        snprintf(buf, sizeof(buf), "%d", status);
+    }
+    rx_row_set(v_rx_resp, buf);
+
+    const char *err = plantrx_last_error();
+    if (err[0] != '\0') rx_row_set(v_rx_err, err);
+    else                rx_row_hide(v_rx_err);
+
+    // Zero consecutive failures is the absence of a problem, not a measurement.
+    uint32_t fails = plantrx_failures();
+    if (fails > 0) {
+        snprintf(buf, sizeof(buf), "%lu회", (unsigned long)fails);
+        rx_row_set(v_rx_fails, buf);
+    } else {
+        rx_row_hide(v_rx_fails);
+    }
+
+    snprintf(buf, sizeof(buf), "%lu회", (unsigned long)plantrx_exchanges());
+    rx_row_set(v_rx_count, buf);
+
+    // Only once a REAL prescription has landed: before that plantrx_mode_auto() is
+    // a boot default, and drawing it would put words in the server's mouth. An
+    // arrived reply is not enough to clear that bar - _empty_prescription
+    // (server/app/main.py:88-91) is a clean 200 whose mode is server policy for a
+    // device the model has never assessed, so age >= 0 alone would print exactly
+    // the words this comment refuses to. plantrx_rx_real() is the same third gate
+    // the AI-RX page's conflict chip uses (page_auto.cpp refresh_mode_conflict) and
+    // for the same reason; the two screens have to answer this question identically
+    // or one of them is lying - which is why the two words below are the two that
+    // page_auto's own mode label uses, and not a third pair. They used to read
+    // 자율제어 / 수동 here while that label said 자동 집행 / 자문 전용, so the same
+    // server bit was printed in three vocabularies across two screens.
+    // A disagreement with the panel's own switch is shown rather than resolved -
+    // the switch is the device's, and silently picking a winner hides the split.
+    if (age >= 0 && plantrx_rx_real()) {
+        bool srv_auto = plantrx_mode_auto();
+        const char *mode = srv_auto ? "자동 실행" : "판단 전용";
+        if (srv_auto == g_auto_control) snprintf(buf, sizeof(buf), "%s", mode);
+        else                            snprintf(buf, sizeof(buf), "%s (패널 불일치)", mode);
+        rx_row_set(v_rx_mode, buf);
+    } else {
+        rx_row_hide(v_rx_mode);
+    }
+}
+
+void page_settings_refresh(void) {
+    NetState st = net_state();
+
+    update_toggle(t_wifi, net_enabled(), C_BLUE);
+    // "연결 없음" was the whole vocabulary for three different faults, and a grower
+    // does three different things about them: retype the password, check the router
+    // is on, or wait. net_fail() holds its tongue until the failure is trustworthy
+    // (this AP refuses the first association of every boot on a correct password),
+    // so an unnamed cause here means the panel does not know yet - not that it knows
+    // nothing is wrong. NET_FAIL_OTHER carries the driver's own code rather than a
+    // sentence invented for it, because a number a search engine can answer beats a
+    // guess that sounds like a diagnosis.
+    char fail_buf[40];
+    const char *down_txt = "연결 없음";
+    switch (net_fail()) {
+    case NET_FAIL_NOT_FOUND: down_txt = "네트워크 없음"; break;
+    case NET_FAIL_AUTH:      down_txt = "비밀번호 확인"; break;
+    case NET_FAIL_OTHER:
+        snprintf(fail_buf, sizeof(fail_buf), "연결 실패 (%u)", (unsigned)net_fail_code());
+        down_txt = fail_buf;
+        break;
+    case NET_FAIL_NONE:      break;
+    }
+    const char *st_txt = (st == NET_OFF)          ? "OFF"
+                         : (st == NET_CONNECTED)  ? "연결됨"
+                         : net_scanning()         ? "검색 중..."
+                         : (st == NET_CONNECTING) ? "연결 중..."
+                                                  : down_txt;
+    set_status(st_wifi, st == NET_CONNECTED, C_BLUE, st_txt);
+
+    char buf[40];
+    lv_label_set_text(v_ssid, (st == NET_CONNECTED) ? net_ssid() : "-");
+    if (st == NET_CONNECTED) {
+        snprintf(buf, sizeof(buf), "%d dBm", net_rssi());
+        lv_label_set_text(v_rssi, buf);
+    } else {
+        lv_label_set_text(v_rssi, "-");
+    }
+    net_ip(buf, sizeof(buf));
+    lv_label_set_text(v_ip, buf);
+    net_mac(buf, sizeof(buf));
+    lv_label_set_text(v_wifi_mac, buf);
+
+    update_toggle(t_dark, g_dark, C_AMBER);
+    set_status(st_dark, g_dark, C_AMBER, g_dark ? "다크" : "라이트");
+
+    // ESP-NOW camera link (creds provisioning + status beacon)
+    bool cam_online = camprov_cam_online();
+    set_status(st_cam, cam_online, C_GREEN, cam_online ? "온라인" : "오프라인");
+    char cam_ip[24];
+    camprov_cam_ip(cam_ip, sizeof(cam_ip));
+    lv_label_set_text(v_cam_ip, cam_ip);
+    if (cam_online) {
+        snprintf(buf, sizeof(buf), "%d dBm", camprov_cam_rssi());
+        lv_label_set_text(v_cam_rssi, buf);
+    } else {
+        lv_label_set_text(v_cam_rssi, "-");
+    }
+    camprov_cam_mac(buf, sizeof(buf));
+    lv_label_set_text(v_cam_mac, buf);
+
+    // The video path, which is not the link the status line above describes. camnet
+    // pulls MJPEG over HTTP and a session already open outlives a lapsed beacon, so
+    // this can read 수신 중 under an 오프라인 badge - and that combination is the
+    // truth about this device, not a contradiction: pictures are arriving and
+    // provisioning is not answering. The monitor page's badge reads the same call.
+    bool video = camnet_live();
+    lv_label_set_text(v_cam_video, video ? "수신 중" : "수신 없음");
+
+    // Browser URLs, and the gate is the beacon rather than the video on purpose: the
+    // address in them is only as current as the beacon that carried it, and handing
+    // a grower a stale IP to type is worse than handing them nothing. A live stream
+    // on a lapsed beacon says the row above, not a URL this card cannot vouch for.
+    if (cam_online) {
+        snprintf(buf, sizeof(buf), "http://%s/rgb/image", cam_ip);
+        lv_label_set_text(v_cam_image, buf);
+        snprintf(buf, sizeof(buf), "http://%s/rgb/stream", cam_ip);
+        lv_label_set_text(v_cam_stream, buf);
+        snprintf(buf, sizeof(buf), "rtsp://%s:8554/mjpeg/1", cam_ip);
+        lv_label_set_text(v_cam_rtsp, buf);
+    } else {
+        lv_label_set_text(v_cam_image, "-");
+        lv_label_set_text(v_cam_stream, "-");
+        lv_label_set_text(v_cam_rtsp, "-");
+    }
+
+    // ESP-NOW sensor node (SCD41 + BH1750 + MLX90640 on an ESP32 devkit).
+    bool node_online = sensornode_online();
+    set_status(st_node, node_online, C_GREEN, node_online ? "온라인" : "오프라인");
+    if (node_online) {
+        snprintf(buf, sizeof(buf), "%lums 전", (unsigned long)sensornode_age_ms());
+    } else {
+        snprintf(buf, sizeof(buf), "-");
+    }
+    lv_label_set_text(v_node_age, buf);
+    // Three figures, and the third only when it is not zero. 수신 and 유실 describe
+    // the LINK; 무효 describes the SENSOR, and until it existed a node whose SCD41
+    // had failed showed a healthy count beside six blank tiles and left the grower
+    // to work out which half was broken. Hidden at zero for the reason 연속 실패
+    // above is: the absence of a fault is not a measurement.
+    uint32_t bad = sensornode_rejected();
+    if (bad > 0) {
+        snprintf(buf, sizeof(buf), "%lu수신 / %lu유실 / %lu무효",
+                 (unsigned long)sensornode_readings(),
+                 (unsigned long)sensornode_lost(), (unsigned long)bad);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu수신 / %lu유실",
+                 (unsigned long)sensornode_readings(),
+                 (unsigned long)sensornode_lost());
+    }
+    lv_label_set_text(v_node_rx, buf);
+    if (thermal_live()) {
+        snprintf(buf, sizeof(buf), "%.1f fps", thermal_fps());
+    } else {
+        snprintf(buf, sizeof(buf), "수신 없음");
+    }
+    lv_label_set_text(v_node_thermal, buf);
+    // No thermal_live() test beside the one on the row above, and not an omission:
+    // thermal_max() returns its < -999 sentinel the moment the stream goes quiet
+    // (thermal.cpp:148), so this row falls to "-" on exactly the tick that row
+    // falls to "수신 없음". They cannot contradict each other any more - this one
+    // used to hold the last peak the MLX90640 ever sent, indefinitely, beside a
+    // row saying nothing was arriving.
+    float peak = thermal_max();
+    if (reading_present(peak)) {
+        snprintf(buf, sizeof(buf), "%.1f\xC2\xB0""C", peak);
+    } else {
+        snprintf(buf, sizeof(buf), "-");
+    }
+    lv_label_set_text(v_node_peak, buf);
+
+#if PANEL_OLED
+    // Three states, and they need three different actions, so they get three different
+    // words. Found and drawing; found once and now silent, which is a power problem on the
+    // module; and never found, which means the board's UART switch is still routing GPIO
+    // 43/44 to the USB bridge rather than to the header the display is wired to.
+    uint8_t oa = paneloled_address();
+    if (oa == 0) {
+        snprintf(buf, sizeof(buf), "없음 (UART 스위치 확인)");
+    } else if (paneloled_ready()) {
+        snprintf(buf, sizeof(buf), "0x%02X 표시 중", oa);
+    } else {
+        snprintf(buf, sizeof(buf), "0x%02X 응답 없음", oa);
+    }
+    lv_label_set_text(v_oled, buf);
+#endif
+
+    // PlantNet daily quota, total remaining across all keys - and 최대 until every
+    // key has actually answered. The count is the server's now and rides back on
+    // each identify reply, so a boot that has not identified anything yet has not
+    // been told a figure: -1 means unknown and prints as "-", the same dash the
+    // rows above use for a value the panel has not heard. This row printed a bare
+    // "2000" once, which is four keys' allowance assumed and nothing measured; the
+    // denominator the AI-RX page's chip carries is not here, so the qualifier is
+    // the only thing standing between an estimate and a reading. See
+    // plantid_total_is_measured().
+    int pn_left = plantid_total_remaining();
+    if (pn_left < 0) {
+        snprintf(buf, sizeof(buf), "-");
+    } else if (plantid_total_is_measured()) {
+        snprintf(buf, sizeof(buf), "%d", pn_left);
+    } else {
+        snprintf(buf, sizeof(buf), "최대 %d", pn_left);
+    }
+    lv_label_set_text(v_plantnet, buf);
+
+    refresh_uplink();
+
+    // Update mode can be entered from the server or by a push upload without this page hearing
+    // about it, so the button's disabled state is a poll, not an event; see upd_sync_enabled().
+    upd_sync_enabled();
+
+    // Rebuild the list on fresh scan results or when scan/link state changes.
+    static bool prev_scanning = false;
+    static NetState prev_state = NET_OFF;
+    if (net_scan_fresh() || net_scanning() != prev_scanning || st != prev_state) {
+        net_scan_clear_fresh();
+        rebuild_net_list();
+    }
+    if (st != prev_state && st != NET_CONNECTED) {
+        net_scan_start();   // re-scan the instant the link drops
+    }
+    prev_scanning = net_scanning();
+    prev_state = st;
+}
+
+static void on_toggle_wifi(lv_event_t *e) {
+    net_set_enabled(!net_enabled());
+    if (net_enabled()) net_scan_start();  // radio back on -> refresh the list
+    page_settings_refresh();
+}
+
+static void on_toggle_dark(lv_event_t *e) {
+    bool next = !g_dark;
+    // Immediate feedback: flip the toggle and show progress, then force one
+    // render pass so the state is visible before the full-UI rebuild.
+    update_toggle(t_dark, next, C_AMBER);
+    set_status(st_dark, next, C_AMBER, "변경 중...");
+    lv_refr_now(NULL);
+    ui_set_dark(next);  // rebuilds the UI asynchronously
+}
+
+// Called by ui_set_page() whenever the settings page becomes visible.
+void page_settings_on_show(void) {
+    s_shown_results_this_visit = false;   // this visit's first scan gets the skeleton
+    net_scan_start();
+    rebuild_net_list();                   // paint the skeleton now, don't wait for a refresh tick
+    page_settings_refresh();
+}
+static void settings_timer_cb(lv_timer_t *t) {
+    // Only refresh while the settings page is actually on screen — the ~22
+    // label writes/sec are wasted (and cause redraws) when it's hidden.
+    if (s_page != NULL && lv_obj_has_flag(s_page, LV_OBJ_FLAG_HIDDEN)) return;
+    static uint32_t last_scan = 0;
+    // 10s, not 5. Every scan costs the camera stream a ~0.6s sweep off-channel;
+    // a settings list does not need to be fresher than this.
+    //
+    // AND NOT AT ALL WHILE A PULL IS RUNNING. That sweep leaves the associated channel, which is
+    // why net.cpp's own note says a scan stalls the camera and why ui.cpp aborts one on leaving
+    // this page. The camera surviving a stalled second is a fair trade for a fresh network list;
+    // a firmware fetch is not. This page is where the update button lives, so its own scanning
+    // was the first thing the button's HTTP had to compete with - and it lost: the first press
+    // from a panel sitting on this page reported "서버 연결 실패" while every other path to the
+    // same server worked. A list that stops refreshing for the twenty seconds a pull takes costs
+    // nobody anything.
+    // The refresh below must still run while a pull is going: the hint line is the pull's only
+    // report when no takeover screen is up, so returning early here would freeze the one label
+    // that is supposed to be narrating.
+    if (!fwpull_active() && !updatemode_active() && lv_tick_get() - last_scan >= 10000) {
+        last_scan = lv_tick_get();
+        net_scan_start();
+    }
+    page_settings_refresh();
+}
+
+// ---------------------------------------------------------------------------
+// Builders
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *build_info_row(lv_obj_t *parent, const char *key,
+                                const lv_font_t *keyfont = &font_reg_12) {
+    lv_obj_t *row = plain(parent);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    flex_row(row, 0, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+    label(row, key, keyfont, C_TEXT_SECONDARY);
+    return label(row, "-", &font_bold_12, C_TEXT_DARK);
+}
+
+// The panel's own maintenance action, so it sits under the three cards rather than among them:
+// everything above reports something, and a firmware update is not a reading. Last in the column
+// also puts the most distance the page has between it and the two toggles a grower actually
+// touches - the WiFi header and 화면 설정 - which is exactly the mis-tap this button can least
+// afford, for the reason the block above it in this file spells out.
+//
+// LV_SIZE_CONTENT: a title, a hint line and 12px of padding, ~63px with the column's 16px gap. It
+// comes off the camera and sensor cards above, and off no rows - both of those are scrollable by
+// construction precisely so their row counts do not depend on what else the column carries.
+static void build_update_button(lv_obj_t *parent) {
+    w_upd_btn = card(parent, C_SURFACE, 12, true);
+    lv_obj_set_width(w_upd_btn, LV_PCT(100));
+    lv_obj_set_height(w_upd_btn, LV_SIZE_CONTENT);
+    flex_col(w_upd_btn, 4, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    pad_all(w_upd_btn, 12);
+    clickable(w_upd_btn);
+    lv_obj_add_event_cb(w_upd_btn, on_update_pressed, LV_EVENT_CLICKED, NULL);
+    // Already in update mode means the offer is meaningless, and a control that still looks live
+    // invites the press that proves it is not. Object opacity, so the two labels fade with the
+    // card and the state needs no second style to stay consistent.
+    lv_obj_set_style_opa(w_upd_btn, LV_OPA_50, LV_STATE_DISABLED);
+
+    // font_bold_14 and font_reg_12, like the card headers and hint lines above, and not a heavier
+    // or larger face: these two are rewritten at runtime (the countdown, the question), and only
+    // fonts declaring .fallback = &font_kr_full_12 can be trusted with Korean nobody checked
+    // against a subset - server/tests/test_font_coverage.py fails the suite over exactly that.
+    // Both labels start empty; upd_confirm_clear() at the end of the build writes the idle pair,
+    // so the wording lives in one place instead of being duplicated here.
+    w_upd_title = label(w_upd_btn, "", &font_bold_14, C_TEXT_DARK);
+    w_upd_hint = label(w_upd_btn, "", &font_reg_12, C_TEXT_SECONDARY);
+}
+
+lv_obj_t *page_settings_build(lv_obj_t *parent) {
+    lv_obj_t *page = plain(parent);
+    s_page = page;
+    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
+    flex_row(page, 16, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(page, 16);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+
+    // Left: merged WiFi card — status, connection info, scan, network list
+    lv_obj_t *c = card(page, C_SURFACE, 14, true);
+    lv_obj_set_flex_grow(c, 1);
+    lv_obj_set_height(c, LV_PCT(100));
+    flex_col(c, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(c, 14);
+    build_device_header(c, ICON_WIFI, C_BLUE_TINT, C_BLUE, "WiFi 설정", t_wifi, on_toggle_wifi);
+    build_status_line(c, &st_wifi);
+    v_ssid = build_info_row(c, "네트워크");
+    v_ip = build_info_row(c, "IP 주소");
+    v_rssi = build_info_row(c, "신호 세기");
+    v_wifi_mac = build_info_row(c, "MAC");
+
+    box(c, LV_PCT(100), 1, C_BORDER, 0);  // divider
+
+    // The uplink's diagnostics sit inside the WiFi card rather than in a card of
+    // their own. Two reasons. The server is reached over the very link the four
+    // rows above describe, so a grower chasing "nothing is arriving" is already
+    // looking here. And on a 800x480 panel this card is the only one with slack
+    // to give: the right column's three cards leave 298px for the camera and
+    // sensor cards, 149px each, and a fourth ~190px card there would have left
+    // them 45px apiece - one row and a scrollbar. Here the cost lands on the
+    // scrollable network list instead, ~225px down to ~84px, and it drops to
+    // ~172px when no server is configured and the rows below stay hidden. Four of
+    // the eight rows are drawn only when they have something to say, so each costs
+    // the list another 22px (a 14px line plus the 8px gap) exactly while a grower
+    // is being told something - and never in the healthy case.
+    //
+    // The section header carries the link state in its own value slot, so the
+    // state costs no extra line and the section still opens with a bold key like
+    // every other block on this page.
+    st_rx = build_info_row(c, "판단 서버", &font_bold_12);
+
+    // One container, so the unconfigured case hides eight rows with one flag.
+    w_rx_rows = plain(c);
+    lv_obj_set_width(w_rx_rows, LV_PCT(100));
+    lv_obj_set_height(w_rx_rows, LV_SIZE_CONTENT);
+    flex_col(w_rx_rows, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    v_rx_host = build_info_row(w_rx_rows, "주소");
+    v_rx_age = build_info_row(w_rx_rows, "마지막 수신");
+    v_rx_judged = build_info_row(w_rx_rows, "마지막 판단");
+    v_rx_resp = build_info_row(w_rx_rows, "응답");
+    v_rx_err = build_info_row(w_rx_rows, "실패 원인");
+    v_rx_fails = build_info_row(w_rx_rows, "연속 실패");
+    v_rx_count = build_info_row(w_rx_rows, "수신 횟수");
+    v_rx_mode = build_info_row(w_rx_rows, "서버 모드");
+
+    // Same shape as rebuild_net_list()'s "WiFi가 꺼져 있습니다": one secondary line
+    // where a list would be, rather than a list of nothing.
+    v_rx_none = label(c, "서버 주소가 없습니다", &font_bold_12, C_TEXT_SECONDARY);
+    lv_obj_add_flag(v_rx_none, LV_OBJ_FLAG_HIDDEN);  // definite start: the rows are the common case
+
+    box(c, LV_PCT(100), 1, C_BORDER, 0);  // divider
+
+    w_net_list = plain(c);
+    lv_obj_set_width(w_net_list, LV_PCT(100));
+    lv_obj_set_flex_grow(w_net_list, 1);
+    flex_col(w_net_list, 4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_add_flag(w_net_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(w_net_list, LV_DIR_VER);
+
+    // Right: display (dark mode) card
+    lv_obj_t *right = plain(page);
+    lv_obj_set_flex_grow(right, 1);
+    lv_obj_set_height(right, LV_PCT(100));
+    flex_col(right, 16, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // Same shape as the control-page cards: header (badge + name + toggle)
+    // then a single status line. No extra info row.
+    lv_obj_t *d = card(right, C_SURFACE, 14, true);
+    lv_obj_set_width(d, LV_PCT(100));
+    lv_obj_set_height(d, LV_SIZE_CONTENT);
+    flex_col(d, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(d, 14);
+    // Icon reflects the current theme: moon in dark, sun in light. The whole UI
+    // rebuilds on toggle, so picking it at build time keeps it in sync.
+    build_device_header(d, g_dark ? ICON_MOON : ICON_SUN, C_AMBER_TINT, C_AMBER, "화면 설정", t_dark, on_toggle_dark);
+    build_status_line(d, &st_dark);
+
+#if PANEL_OLED
+    // The rear OLED belongs on the DISPLAY card, not the sensor node's.
+    //
+    // It was put on the node's card first, reasoning that the numbers it shows are that
+    // node's readings. Wrong reason: this row answers "is the panel's second screen
+    // working", which is a fact about THIS board. And the node card already carried five
+    // rows inside a scrollable box, so the row landed below the fold and could not be
+    // found at all - a diagnostic nobody can see is not a diagnostic. This card is
+    // LV_SIZE_CONTENT and grows to fit.
+    //
+    // It is also the only window into that display: it lives on GPIO 43/44, which are
+    // UART0's pins, so a build that finds it has no serial console by construction.
+    v_oled = build_info_row(d, "보조 화면");
+#endif
+
+    // The camera used to take the whole remaining column. It now shares that
+    // space with the sensor node: two info cards, equal halves, each scrollable
+    // so neither clips if the row count grows. Both are read-only - no toggle.
+    //
+    // The camera's "네트워크" row is gone: the CAM is provisioned onto the very
+    // network the WiFi card above already names, so it only ever repeated it.
+    lv_obj_t *e = card(right, C_SURFACE, 14, true);
+    lv_obj_set_width(e, LV_PCT(100));
+    lv_obj_set_flex_grow(e, 1);
+    flex_col(e, 6, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(e, 12);
+    lv_obj_add_flag(e, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(e, LV_DIR_VER);
+
+    lv_obj_t *ehdr = plain(e);
+    lv_obj_set_width(ehdr, LV_PCT(100));
+    lv_obj_set_height(ehdr, LV_SIZE_CONTENT);
+    flex_row(ehdr, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    make_badge(ehdr, ICON_CAMERA, C_GREEN_TINT, C_GREEN);
+    label(ehdr, "카메라 노드", &font_bold_14, C_TEXT_DARK);
+
+    build_status_line(e, &st_cam);
+    v_cam_ip = build_info_row(e, "IP 주소");
+    v_cam_rssi = build_info_row(e, "신호 세기");
+    v_cam_mac = build_info_row(e, "MAC");
+    // Two links reach this one device and only one of them was ever on this card.
+    // The status line above is the ESP-NOW beacon: provisioning and presence. The
+    // pictures travel over HTTP, and camnet keeps an open session running after the
+    // beacon lapses - so the monitor page could read MJPEG LIVE while every row
+    // here said the camera was gone. Two screens, one camera, opposite answers.
+    // This row is the video path speaking for itself, which is also the fact a
+    // grower came to check.
+    v_cam_video = build_info_row(e, "영상 수신");
+    v_cam_image = build_info_row(e, "RGB 사진");
+    v_cam_stream = build_info_row(e, "RGB 스트림");
+    v_cam_rtsp = build_info_row(e, "RGB RTSP");
+    v_plantnet = build_info_row(e, "식별 API");
+
+    // Sensor node (ESP32 devkit): the other half. Its readings already have a
+    // home on the monitor page, so this card carries what only a settings page
+    // wants - is the ESP-NOW link healthy, and how fast is thermal arriving.
+    // Green like the camera card: both are remote devices on the ESP-NOW link,
+    // and amber is spoken for by the display/theme card above.
+    lv_obj_t *n = card(right, C_SURFACE, 14, true);
+    lv_obj_set_width(n, LV_PCT(100));
+    lv_obj_set_flex_grow(n, 1);
+    flex_col(n, 6, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    pad_all(n, 12);
+    lv_obj_add_flag(n, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(n, LV_DIR_VER);
+
+    lv_obj_t *nhdr = plain(n);
+    lv_obj_set_width(nhdr, LV_PCT(100));
+    lv_obj_set_height(nhdr, LV_SIZE_CONTENT);
+    flex_row(nhdr, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    make_badge(nhdr, ICON_NODE, C_GREEN_TINT, C_GREEN);
+    label(nhdr, "센서 노드", &font_bold_14, C_TEXT_DARK);
+
+    build_status_line(n, &st_node);
+    v_node_age = build_info_row(n, "마지막 수신");
+    v_node_rx = build_info_row(n, "텔레메트리");
+    v_node_thermal = build_info_row(n, "열화상");
+    v_node_peak = build_info_row(n, "피크 온도");
+
+    build_update_button(right);
+    if (s_upd_timer == NULL) {
+        s_upd_timer = lv_timer_create(upd_timer_cb, 1000, NULL);
+    }
+    // Idle wording and colours, and the reset that matters across a theme switch: ui_set_dark()
+    // cleans the screen and rebuilds it in one pass (ui.cpp theme_reload_cb), so no tick can land
+    // on the destroyed labels - but a confirmation armed before the switch would come back as a
+    // primed button nobody remembers arming, one tap from taking the board off the air.
+    upd_confirm_clear();
+    upd_sync_enabled();
+
+    rebuild_net_list();
+
+    // Theme rebuild re-runs this builder; the timers must be created once.
+    static lv_timer_t *s_timer = NULL;
+    if (s_timer == NULL) {
+        s_timer = lv_timer_create(settings_timer_cb, 1000, NULL);
+        lv_timer_create(skel_timer_cb, 120, NULL);
+    }
+    return page;
+}
