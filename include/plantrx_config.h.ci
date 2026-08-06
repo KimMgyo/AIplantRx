@@ -1,0 +1,23 @@
+// The config GitHub Actions builds with. Copied over plantrx_config.h by
+// .github/workflows/firmware.yml, and deliberately blank.
+//
+// This repository is public, so every artifact and every release asset it
+// produces is public. A bearer token compiled into one of those is a token
+// anyone can lift back out with `strings` and spend against the greenhouse it
+// belongs to, and there is no workflow setting that makes that safe - the only
+// fix is for the secret to not be in the image. So it is not.
+//
+// A published image is therefore site-less, and sitecfg.cpp is what makes that
+// work rather than break: blank defines mean NVS wins, so an image that lands
+// over the air on a panel that was provisioned once over USB keeps that panel's
+// server and secret. On a board that was never provisioned it comes up with no
+// uplink and runs its local rule engine, which is the same state as a panel that
+// was never told where its server is. See sitecfg.h for the whole rule.
+//
+// Kept as a committed file rather than a heredoc in the workflow so that the
+// reason lives next to plantrx_config.h.example, where somebody comparing the
+// two will find it.
+#pragma once
+
+#define PLANTRX_BASE_URL ""
+#define PLANTRX_TOKEN ""

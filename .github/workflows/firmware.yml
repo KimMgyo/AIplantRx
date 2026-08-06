@@ -1,0 +1,195 @@
+# Builds the panel firmware on a cold Linux checkout, and on a tag publishes the
+# image the greenhouse server hands to panels over the air.
+#
+# WHY THE BUILD IS WORTH HAVING EVEN THOUGH ONE MACHINE ALREADY BUILDS FINE.
+# Everything this firmware depends on came from a warm .pio on one Windows box:
+# a display driver fetched from an unpinned branch, a bounce-buffer patch applied
+# by a pre-build hook that used to warn-and-continue when it found nothing, and a
+# config header that is gitignored. None of that is visible from a clean clone,
+# which is the only state anybody else - or this project six months from now -
+# can actually start from. A cold build is the test for all of it at once.
+#
+# WHY A RELEASE AND NOT AN ARTIFACT IS WHAT THE SERVER PULLS.
+# Workflow artifacts of a public repository still need a token to download: the
+# actions/artifacts/{id}/zip endpoint is authenticated. Release asset URLs are
+# not. The server does an unauthenticated GET, so the asset has to be on a
+# release, and artifacts are left as the convenience copy for whoever is looking
+# at a build of main.
+#
+# WHY NO SECRET IS CONFIGURED HERE, AND WHY THAT IS THE POINT.
+# This repository is public, so everything below is public. The build uses
+# include/plantrx_config.h.ci - blank on purpose - and the resulting image
+# carries no server address and no bearer token. sitecfg.cpp is what makes a
+# site-less image still work on a provisioned panel: NVS holds the site, the
+# image inherits it. See include/sitecfg.h.
+
+name: firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# No paths filter, deliberately. A filter that lists src/ and platformio.ini goes
+# stale the first time something outside the list changes the binary - a new
+# sdkconfig default, a font regenerated into src/fonts, a script the build calls -
+# and a stale filter does not fail, it silently reports green for a build that
+# never ran. Public-repo minutes are free; a wrong green is not.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only used by the release step below, on tags
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Keyed on platformio.ini because that file now pins every version this
+      # build resolves - the platform zip, the two framework packages, and all
+      # five libraries. Change any of them and the key changes with it, which is
+      # the property an unpinned lib_deps could not give: a cache hit used to be
+      # able to hand back a display driver from a different day.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - run: pip install --upgrade platformio
+
+      # The real header is gitignored and per-greenhouse. This one is committed
+      # and blank; include/plantrx_config.h.ci says why at length.
+      - name: Install the blank site config
+        run: cp include/plantrx_config.h.ci include/plantrx_config.h
+
+      # Before the build, not as part of it. scripts/patch_rgb_bounce.py runs at
+      # config time and can therefore reach a tree where lib_deps has not been
+      # fetched yet; installing in its own step means the file it patches is
+      # already on disk when it looks.
+      - name: Install dependencies
+        run: pio pkg install -e esp32-s3-touch-lcd-7
+
+      # PATCH_RGB_STRICT turns "bounce-buffer patch target not found" from a
+      # warning into a failure. Locally that condition is a first build of a
+      # fresh clone and a warning is right; here it would mean publishing a
+      # WiFi-unstable image that looks identical to a good one.
+      - name: Build
+        env:
+          PATCH_RGB_STRICT: "1"
+        run: pio run -e esp32-s3-touch-lcd-7
+
+      # size and md5 of the exact bytes a panel will install. md5 is not decorative:
+      # it is the field the server puts in /v1/firmware/latest and the one
+      # fwpull.cpp hands to Update.setMD5(), so a release whose md5 matches what
+      # the panel reports is proof the two are talking about the same image.
+      # The app-elf sha256 that the device actually compares is deliberately NOT
+      # recomputed here - server/app/firmware.py owns that parse, and a second
+      # copy of those offsets in a YAML file is a contract with two definitions.
+      - name: Describe the image
+        id: img
+        run: |
+          BIN=.pio/build/esp32-s3-touch-lcd-7/firmware.bin
+          SIZE=$(stat -c%s "$BIN")
+          MD5=$(md5sum "$BIN" | cut -d' ' -f1)
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "md5=$MD5" >> "$GITHUB_OUTPUT"
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| size | $SIZE bytes |"
+            echo "| md5 | \`$MD5\` |"
+            echo "| app slot | 6553600 bytes (default_16MB.csv, ota_0/ota_1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A published image that carries the greenhouse's bearer token would be the
+      # one failure this whole arrangement exists to prevent, and it would be
+      # invisible - a working build, a working panel, and a secret on the open
+      # internet. So it is checked rather than trusted, on the way in and on the
+      # way out.
+      #
+      # The allow-list is measured, not guessed. An image built from the blank
+      # header contains exactly two http:// strings and both are code: the format
+      # string plantrx.cpp logs its address with, and the literal inside "base URL
+      # is not http://host[:port][/prefix]". The same build with the real header
+      # adds a third, the site itself. So anything outside those two is a site
+      # that should not be here.
+      - name: Refuse an image that carries a site
+        run: |
+          BIN=.pio/build/esp32-s3-touch-lcd-7/firmware.bin
+          fail=0
+          # The input: whatever ended up at include/plantrx_config.h.
+          for d in PLANTRX_BASE_URL PLANTRX_TOKEN; do
+            if ! grep -qE "^#define $d \"\"$" include/plantrx_config.h; then
+              echo "::error::$d is not blank in include/plantrx_config.h"
+              fail=1
+            fi
+          done
+          # The output: grep -a because firmware.bin is binary, and grep would
+          # otherwise print "binary file matches" and exit 0 whatever it found.
+          leaked=$(grep -aoE 'http://[A-Za-z0-9._%-]+(:[0-9]+)?' "$BIN" \
+                   | grep -vxE 'http://%s|http://host' | sort -u)
+          if [ -n "$leaked" ]; then
+            echo "::error::the image carries a server address: $leaked"
+            fail=1
+          fi
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          # firmware.bin is what a panel installs. The other three are what a USB
+          # flash of a bare board needs, and firmware.elf is the only way to turn
+          # a backtrace from a released build into line numbers - which this
+          # project has needed more than once; see the addr2line note in
+          # platformio.ini.
+          path: |
+            .pio/build/esp32-s3-touch-lcd-7/firmware.bin
+            .pio/build/esp32-s3-touch-lcd-7/firmware.elf
+            .pio/build/esp32-s3-touch-lcd-7/bootloader.bin
+            .pio/build/esp32-s3-touch-lcd-7/partitions.bin
+          if-no-files-found: error
+
+      # Tags only. The assets are named without the version in them on purpose:
+      # server/app/ghfw.py looks for the exact name firmware.bin, so the puller
+      # never has to know how this project spells its tags.
+      #
+      # create-then-upload rather than create alone so that re-running a tag's
+      # build replaces the assets instead of failing on a release that exists.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIZE: ${{ steps.img.outputs.size }}
+          MD5: ${{ steps.img.outputs.md5 }}
+        run: |
+          B=.pio/build/esp32-s3-touch-lcd-7
+          set -- \
+            "$B/firmware.bin#firmware.bin" \
+            "$B/firmware.elf#firmware.elf" \
+            "$B/bootloader.bin#bootloader.bin" \
+            "$B/partitions.bin#partitions.bin"
+          NOTES=$(cat <<EOF
+          firmware.bin — size $SIZE bytes, md5 \`$MD5\`
+
+          The server publishes this to panels: it pulls firmware.bin from the newest
+          release and serves it at /v1/firmware/image, and a panel installs it only
+          once somebody arms that panel. Publishing a release does not update
+          anything by itself.
+
+          Built from a blank include/plantrx_config.h, so this image carries no
+          server address and no bearer token. A panel provisioned once over USB
+          keeps both in NVS — see include/sitecfg.h.
+          EOF
+          )
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$NOTES" "$@" \
+            || gh release upload "$GITHUB_REF_NAME" --clobber "$@"
