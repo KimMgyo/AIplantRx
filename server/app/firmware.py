@@ -93,6 +93,23 @@ def _app_desc(head: bytes) -> Optional[dict]:
     }
 
 
+def describe(path: Path) -> Optional[dict[str, str]]:
+    """The descriptor fields of an arbitrary file, or None if it is not one of our images.
+
+    manifest() answers this question about the image that is already published and adds size,
+    md5 and mtime to the answer. This is the half a *candidate* needs. ghfw.py has just
+    downloaded some bytes from a release and has two things to establish before it replaces
+    anything: that they are an ESP32 application at all, and that they are not byte-for-byte the
+    application already published. Both come off the same 288-byte read, and both use the same
+    parser as the manifest rather than a second copy of these offsets.
+    """
+    try:
+        with path.open("rb") as fh:
+            return _app_desc(fh.read(_DESC_AT + _DESC_LEN))
+    except OSError:
+        return None
+
+
 # md5 of the whole image, remembered against the file identity that produced it.
 #
 # The manifest is fetched on every pull attempt, and re-reading 2.5MB off disk to arrive at the

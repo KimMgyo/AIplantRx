@@ -38,7 +38,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import brain, derive, firmware, plantnet, render, scheduler, store
+from . import brain, derive, firmware, ghfw, plantnet, render, scheduler, store
 from .schema import (Control, Display, FirmwareManifest, FrameAck,
                      Identification, Prescription, Telemetry)
 
@@ -84,6 +84,11 @@ def _startup() -> None:
         bool(DEVICE_TOKEN),
         render.ALLOWED_DESC,
     )
+    # After the banner, because it logs a line of its own and the order reads as
+    # "here is the server, here is where its firmware comes from". Returns as soon
+    # as its thread is running; the first pull happens on that thread, so a slow or
+    # unreachable GitHub delays no request and fails no startup.
+    ghfw.start()
 
 
 @app.get("/health")
