@@ -38,6 +38,7 @@
 #include "CStreamer.h"
 #include "CRtspSession.h"
 #include "provision.h"
+#include "nodeagent.h"
 
 // AI-Thinker ESP32-CAM pin map
 #define PWDN_GPIO_NUM  32
@@ -194,12 +195,57 @@ static volatile bool s_rtsp_sessions = false;  // published by rtsp_task
 // under an in-flight write is a use-after-free waiting to happen.
 static volatile bool s_http_busy = false;
 
+// ---- standing the streamer down for a firmware download ---------------------
+//
+// An OTA write on this board competes with the two things it does for a living. RTSP and HTTP
+// MJPEG hold PSRAM frame buffers and between them saturate a link that carries ~142KB/s on a good
+// day, and the camera's DMA into PSRAM is what was measured adding ~380ms of latency to every
+// packet this board sent at the stock sensor clock (see the header). A download fighting all of
+// that does not merely go slowly, it stalls - and a stalled OTA on a camera bolted to a
+// greenhouse wall is the expensive failure the whole feature exists to avoid.
+//
+// WHY THIS IS A HANDSHAKE AND NOT vTaskSuspend(). Suspending rtsp_task or http_writer_task by
+// force stops them wherever they happen to be, and where they usually are is inside a socket
+// write - which on ESP32 means holding lwIP's core lock. Freezing a task in there deadlocks the
+// TCP stack for everything else on the board, the download that suspended it included. So each
+// path is ASKED to stop and publishes an acknowledgement once it has reached a point where it
+// holds nothing, and the camera driver is only torn down after all three have answered.
+//
+// The two LISTENING sockets stay bound throughout, and that is deliberate. Nothing is accepted
+// while the paths are parked - rtsp_task never reaches rtspServer.accept() and loop() returns
+// before the HTTP one - so a viewer arriving mid-download waits in the backlog and is served
+// when the board comes back, which is a better answer than a refused connection plus the mDNS
+// re-advertisement that rebinding them would need.
+//
+// Each *_parked flag is written by exactly one task and read by camstream_stand_down(), which is
+// why none of them needs a lock: a stale read costs one 10ms poll and nothing else.
+static volatile bool s_stand_down  = false;
+static volatile bool s_loop_parked = false;   // written by loop() on core 1
+static volatile bool s_rtsp_parked = false;   // written by rtsp_task
+static volatile bool s_http_parked = false;   // written by http_writer_task
+
 // Drains the mailbox at whatever rate the viewer can take. Runs on core 0 with
 // the network stack; blocking here costs nothing because the capture loop is on
 // core 1 and never waits for it.
 static void http_writer_task(void *arg) {
     (void)arg;
     for (;;) {
+        // Ahead of the connected() check on purpose: that branch never publishes an ack, so a
+        // task sitting in it while the flag went up would make camstream_stand_down() wait out
+        // its whole budget and then refuse a download that was perfectly safe to start.
+        //
+        // The ack can lag the request by as long as an in-flight write takes - 1.05s measured for
+        // a viewer that could not keep up. loop()'s park closes the socket, which is what makes
+        // that write return instead of sitting there.
+        if (s_stand_down) {
+            for (int i = 0; i < HTTP_SLOTS; i++) s_http_len[i] = 0;
+            s_http_cons = 0;
+            s_http_parked = true;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        s_http_parked = false;
+
         // Release both slots ONLY when the viewer is gone. Clearing after the
         // idle delay destroys whatever the capture loop queued during that
         // delay, which starves the stream instead of pacing it.
@@ -245,6 +291,32 @@ static void http_writer_task(void *arg) {
 static void rtsp_task(void *arg) {
     (void)arg;
     for (;;) {
+        // Before the rtsp_up check, not after. On a board whose WiFi never came up rtsp_up is
+        // false forever and the branch below spins on a 100ms delay without ever acknowledging
+        // anything - which would make a stand-down time out on the one board most likely to be
+        // asked for a firmware update.
+        if (s_stand_down) {
+            if (!s_rtsp_parked) {
+                // Drop the viewer rather than leave it staring at a frozen frame for the length
+                // of a download. stop() closes the socket and the next handleRequests() is what
+                // makes CStreamer notice and reap the session - the same path a viewer that walks
+                // away already takes, so the delete below is the same single ownership rule as
+                // the accept branch further down.
+                if (rtsp_client != nullptr) {
+                    rtsp_client->stop();
+                    streamer->handleRequests(0);
+                    delete rtsp_client;
+                    rtsp_client = nullptr;
+                }
+                s_rtsp_len = 0;
+                s_rtsp_sessions = false;
+                s_rtsp_parked = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        s_rtsp_parked = false;
+
         if (!rtsp_up) {           // set once the loop has bound the listener
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -317,30 +389,30 @@ static void print_status(void) {
     wifi_ps_type_t ps = WIFI_PS_NONE;
     esp_wifi_get_ps(&ps);  // association silently reinstates it; see provision.cpp
     uint32_t mean_bytes = (uint32_t)(s_win_bytes / n);
-    Serial.printf("[cam] cam=%s frames=%lu %.1ffps %luB/f rtsp=%s http=%s buf=%s "
-                  "| idle=%lu written=%lu short=%lu "
-                  "| cap=%lu rtsp=%lu http=%lu wr=%lu us/frame "
-                  "| wifi=%s ps=%s phy=%s ip=%s rssi=%ddBm | heap=%u\n",
-                  cam_ok ? "OK" : "FAIL",
-                  (unsigned long)frame_count,
-                  span ? (s_win_frames * 1000.0f / span) : 0.0f,
-                  (unsigned long)mean_bytes,
-                  s_rtsp_sessions ? "client" : "idle",
-                  http_client.connected() ? "client" : "idle",
-                  s_http_buf[0] ? "ok" : "NOALLOC",
-                  (unsigned long)s_win_idle,
-                  (unsigned long)s_http_written,
-                  (unsigned long)s_http_short,
-                  (unsigned long)(s_us_capture / gn),
-                  (unsigned long)(s_us_rtsp / n),
-                  (unsigned long)(s_us_http / n),
-                  (unsigned long)(s_us_write / wn),
-                  up ? "up" : "down",
-                  ps == WIFI_PS_NONE ? "off" : "ON(bad)",
-                  phy_name(),
-                  WiFi.localIP().toString().c_str(),
-                  (int)WiFi.RSSI(),
-                  (unsigned)ESP.getFreeHeap());
+    nodeagent_logf("[cam] cam=%s frames=%lu %.1ffps %luB/f rtsp=%s http=%s buf=%s "
+                   "| idle=%lu written=%lu short=%lu "
+                   "| cap=%lu rtsp=%lu http=%lu wr=%lu us/frame "
+                   "| wifi=%s ps=%s phy=%s ip=%s rssi=%ddBm | heap=%u\n",
+                   cam_ok ? "OK" : "FAIL",
+                   (unsigned long)frame_count,
+                   span ? (s_win_frames * 1000.0f / span) : 0.0f,
+                   (unsigned long)mean_bytes,
+                   s_rtsp_sessions ? "client" : "idle",
+                   http_client.connected() ? "client" : "idle",
+                   s_http_buf[0] ? "ok" : "NOALLOC",
+                   (unsigned long)s_win_idle,
+                   (unsigned long)s_http_written,
+                   (unsigned long)s_http_short,
+                   (unsigned long)(s_us_capture / gn),
+                   (unsigned long)(s_us_rtsp / n),
+                   (unsigned long)(s_us_http / n),
+                   (unsigned long)(s_us_write / wn),
+                   up ? "up" : "down",
+                   ps == WIFI_PS_NONE ? "off" : "ON(bad)",
+                   phy_name(),
+                   WiFi.localIP().toString().c_str(),
+                   (int)WiFi.RSSI(),
+                   (unsigned)ESP.getFreeHeap());
 
     s_us_capture = s_us_rtsp = s_us_http = s_win_frames = s_win_grabs = 0;
     s_us_write = s_win_written = s_win_idle = 0;
@@ -433,6 +505,71 @@ static bool cam_start_stream_mode(void) {
     return true;
 }
 
+// How long all three paths get to reach a safe stopping point. The capture loop parks within one
+// sensor period (48ms at 8MHz), rtsp_task within its 2ms tick, and http_writer_task only after
+// whatever socket write it is inside returns - measured at up to 1.05s for a viewer that could
+// not keep up. Five seconds is that worst case with room to spare; past it a task is wedged, and
+// a wedged task is a reboot's problem rather than a download's.
+static const uint32_t PARK_MS = 5000;
+
+bool camstream_stand_down(void) {
+    s_stand_down = true;
+
+    uint32_t t = millis();
+    while (!(s_loop_parked && s_rtsp_parked && s_http_parked)) {
+        if (millis() - t > PARK_MS) {
+            nodeagent_logf("[cam] stand-down timed out (loop=%d rtsp=%d http=%d); nothing stopped\n",
+                           (int)s_loop_parked, (int)s_rtsp_parked, (int)s_http_parked);
+            s_stand_down = false;
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // ONLY now, and this ordering is the whole reason the handshake exists: loop() is the thread
+    // that calls esp_camera_fb_get(), and deinit()ing the driver while it is blocked inside one
+    // frees the buffer it is about to be handed. The ack above is the proof it is not.
+    //
+    // Deinit rather than simply stopping the grab. loop()'s own comment records that leaving the
+    // driver's buffers unfetched makes it log "cam_hal: EV-VSYNC-OVF" and stall its pipeline,
+    // which would be the worst of both: the sensor still running and still DMAing into PSRAM,
+    // starving the radio this download needs, AND a wedged pipeline to recover from afterwards.
+    // Stopping the driver stops the DMA at its source.
+    if (cam_ok) {
+        esp_camera_deinit();
+        cam_ok = false;
+    }
+    nodeagent_logf("[cam] streaming stood down: camera off, RTSP and HTTP parked\n");
+    return true;
+}
+
+void camstream_resume(void) {
+    // Camera first, flag second. Clearing the flag first would let loop() start grabbing against
+    // a driver that is not up yet.
+    if (!cam_ok) {
+        cam_ok = cam_start_stream_mode();
+        if (!cam_ok) {
+            // Honest degradation rather than a reboot: RTSP and HTTP still answer, they just have
+            // no frames, and the status line says cam=FAIL. A board that reboots itself here
+            // would throw away the failure reason sitting on the panel's screen, which is the
+            // only thing anybody gets out of an update that did not work.
+            nodeagent_logf("[cam] camera did not come back after the download\n");
+        }
+    }
+    s_stand_down = false;
+    nodeagent_logf("[cam] streaming restored\n");
+}
+
+void camstream_summary(char *out, size_t cap) {
+    snprintf(out, cap, "stream cam=%s standby=%s frames=%lu rtsp=%s http=%s psram=%u",
+             cam_ok ? "OK" : "FAIL",
+             s_stand_down ? "yes" : "no",
+             (unsigned long)frame_count,
+             s_rtsp_sessions ? "client" : "idle",
+             http_client.connected() ? "client" : "idle",
+             (unsigned)ESP.getFreePsram());
+}
+
 // Send one frame as a standalone JPEG, at the streaming resolution.
 //
 // It used to promise a full-res UXGA still, and this board cannot deliver one.
@@ -477,7 +614,7 @@ static void serve_photo(WiFiClient &client) {
 void setup() {
     Serial.begin(115200);
     delay(200);  // let the host monitor reattach after reset, or the banner is lost
-    Serial.println("\n=== SmartFarm ESP32-CAM: RTSP :8554/mjpeg/1 + HTTP /rgb/image /rgb/stream ===");
+    nodeagent_logf("\n=== SmartFarm ESP32-CAM: RTSP :8554/mjpeg/1 + HTTP /rgb/image /rgb/stream ===\n");
 
     pinMode(FLASH_LED_PIN, OUTPUT);
     digitalWrite(FLASH_LED_PIN, LOW);  // flash off until /photo fires it
@@ -486,7 +623,7 @@ void setup() {
     // while the stream is live. Buffers are QVGA-sized.
     cam_ok = cam_start_stream_mode();
     if (!cam_ok) {
-        Serial.println("[cam] esp_camera_init failed");
+        nodeagent_logf("[cam] esp_camera_init failed\n");
     }
 
     // Bring up WiFi in the background: on a first boot the ESP-NOW handshake
@@ -521,7 +658,7 @@ void setup() {
     if (http_ok) {
         xTaskCreatePinnedToCore(http_writer_task, "http_tx", 4096, NULL, 2, NULL, 0);
     } else {
-        Serial.println("[cam] PSRAM alloc failed: /rgb/stream disabled");
+        nodeagent_logf("[cam] PSRAM alloc failed: /rgb/stream disabled\n");
     }
 
     // The frame mailbox is optional; the task is not. rtsp_task answers the
@@ -530,16 +667,44 @@ void setup() {
     // leave port 8554 open and silent.
     s_rtsp_buf = (uint8_t *)heap_caps_malloc(MAX_FRAME, MALLOC_CAP_SPIRAM);
     if (s_rtsp_buf == nullptr) {
-        Serial.println("[cam] PSRAM alloc failed: RTSP video disabled");
+        nodeagent_logf("[cam] PSRAM alloc failed: RTSP video disabled\n");
     }
     // 8192: this used to run on the Arduino loop task, which has that much.
     xTaskCreatePinnedToCore(rtsp_task, "rtsp", 8192, NULL, 2, NULL, 0);
+
+    // Last, because it is the only thing here that can tear the rest of it down: nodeagent's
+    // worker calls camstream_stand_down(), which waits on acknowledgements from the two tasks
+    // above and from loop(). Starting it before they exist would mean a NODE_UPDATE arriving in
+    // the first few milliseconds after boot waits out PARK_MS and then refuses itself.
+    nodeagent_start();
 }
 
 void loop() {
     // Ahead of the cam_ok bail-out below: a board whose sensor never came up is
     // exactly the one whose status line you need.
     print_status();
+
+    // Parked for a firmware download - ahead of the cam_ok bail-out and everything else, because
+    // the whole point of the stand-down is that this loop stops touching the sensor and the
+    // sockets, and the ack below is what nodeagent waits on before it deinits the driver.
+    if (s_stand_down) {
+        if (!s_loop_parked) {
+            // Same order the /rgb/stream accept path uses, and for the same reason: let an
+            // in-flight write finish before the socket goes away under it. Closing it is also
+            // what unblocks http_writer_task so it can park.
+            uint32_t t_wait = millis();
+            while (s_http_busy && millis() - t_wait < 500) delay(1);
+            for (int i = 0; i < HTTP_SLOTS; i++) s_http_len[i] = 0;
+            if (http_client.connected()) {
+                http_client.stop();
+            }
+            s_http_prod = 0;
+            s_loop_parked = true;
+        }
+        delay(50);
+        return;
+    }
+    s_loop_parked = false;
 
     if (!cam_ok) {
         delay(500);

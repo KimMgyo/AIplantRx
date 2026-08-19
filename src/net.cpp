@@ -365,10 +365,17 @@ void net_connect(const char *ssid, const char *pass) {
                         // has not failed yet, and net_fail() gates on the streak
                         // anyway, so this only stops a stale code surviving into
                         // the third failure of a different SSID.
-    // Hand the new creds to the CAM while we're still on the old network's
-    // channel — once we disconnect below, ESP-NOW can't reach a CAM on a
+    // Hand the new creds to both ESP-NOW boards while we're still on the old
+    // network's channel — once we disconnect below, ESP-NOW can't reach a peer on a
     // different channel until it re-provisions on its own.
+    //
+    // The sensor node is here too now, and it is the same one action: it needs
+    // credentials to download its own firmware (nodeota.h), and a grower who typed the
+    // new password once should not have to discover that one of two invisible boards
+    // kept the old one. Costs another ~90ms of pre-switch window on top of the CAM's,
+    // spent on a press that is about to drop the link anyway.
     camprov_push_to_cam(ssid, s_pending_pass);
+    camprov_push_to_node(ssid, s_pending_pass);
     quiet_disconnect(false);
     begin_target(ssid, s_pending_pass);
 }

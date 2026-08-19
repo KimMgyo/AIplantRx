@@ -1171,9 +1171,10 @@ def _actions(
 #                7 policy keys                             889
 #     envelope   rx_id, issued_ts, next_poll_s,
 #                want_frame, update_mode, firmware_pull,
-#                mode, outer braces                        144
+#                node_pull_cam, node_pull_node,
+#                mode, outer braces                        187
 #     ================================================= =======
-#     total                                               5311   (MAX_RESP 16384)
+#     total                                               5354   (MAX_RESP 16384)
 #
 # THE BODY IS FREE, and that is the whole reason it could be 1023 bytes. It costs
 # 1026 bytes on the wire at its budget, and it arrived in the same change that cut
@@ -1184,7 +1185,7 @@ def _actions(
 #
 # The escaped figure is the one that decides MAX_RESP, because a hop that
 # re-encodes the body with \uXXXX spends six bytes on a Hangul syllable where
-# UTF-8 spends three: 8215 bytes, against 8407 for the six-row shape. Both fit
+# UTF-8 spends three: 8258 bytes, against 8450 for the six-row shape. Both fit
 # 12288, so raising MAX_RESP to 16384 buys headroom rather than fixing an overrun -
 # it is what stops the next field from having to re-derive all of this.
 #

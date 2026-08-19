@@ -1,4 +1,4 @@
-"""FastAPI entry point: five endpoints the device drives, and one an operator does.
+"""FastAPI entry point: six endpoints the device drives, and three an operator does.
 
 The device is behind NAT wherever it happens to be plugged in, so nothing here
 ever connects outward to it. It polls; the response to its telemetry IS the
@@ -18,14 +18,24 @@ Consequences worth keeping in mind when editing this file:
     response carries out on its way past, so anything else added alongside it has
     to be shaped the same way: one-shot, and cleared as it is delivered rather
     than when it is acted on. See store.take_update_mode for what happens to a
-    signal that is not. firmware_pull is the second thing on that rail and is
-    armed by the same call.
+    signal that is not. firmware_pull is the second thing on that rail, armed by
+    the same call; node_pull_cam and node_pull_node are the third and fourth,
+    armed by /device/{device}/node_update, and they are the ones where the
+    clearing genuinely matters - they do not stop the panel polling, so a flag
+    that outlived its delivery re-arms a node update once a minute forever.
   - The two firmware endpoints break the "a response to a poll is the whole
     conversation" shape, and they are the only things here that do. They are a
-    manifest and a file, fetched by a panel that has already been told to update
-    and carrying no prescription at all. They are still device-driven for the
-    same NAT reason as everything else: the server cannot push an image any more
-    than it can push a setpoint, so the panel comes and gets it.
+    manifest and a file, fetched by a board that has already been told to update
+    and carrying no prescription at all. Three boards fetch them now - ?role=
+    picks which image, defaulting to panel because every panel already deployed
+    asks without it. They are still device-driven for the same NAT reason as
+    everything else: the server cannot push an image any more than it can push a
+    setpoint, so the board comes and gets it.
+  - /nodelog is the one endpoint whose payload is about a device that cannot
+    reach this server at all. The two nodes speak ESP-NOW and nothing else; the
+    panel relays their log lines here so there is somewhere to read them from,
+    which makes it the only POST where `device` names the forwarder rather than
+    the subject.
 """
 
 import asyncio
@@ -40,7 +50,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from . import brain, derive, firmware, ghfw, plantnet, render, scheduler, store
 from .schema import (Control, Display, FirmwareManifest, FrameAck,
-                     Identification, Prescription, Telemetry)
+                     Identification, NodeLogBatch, NodeLogRow, Prescription,
+                     Telemetry)
 
 log = logging.getLogger("plantrx")
 logging.basicConfig(level=os.getenv("PLANTRX_LOG", "INFO"))
@@ -72,6 +83,27 @@ def auth(authorization: Optional[str] = Header(default=None)) -> None:
         return  # unset in development; refuse to pretend it is secured
     if authorization != f"Bearer {DEVICE_TOKEN}":
         raise HTTPException(status_code=401, detail="bad token")
+
+
+def _role_q(role: str = firmware.DEFAULT_ROLE) -> str:
+    """?role= on the two firmware endpoints, refused before it can reach a path.
+
+    The default is the whole backward-compatibility story: a panel flashed before fwpull.cpp
+    learned to send the query builds its URL with no role at all, so "no role" has to keep
+    meaning the panel's image forever. Current panel builds send ?role=panel explicitly.
+
+    An unknown role is a 400 and not a fallback to that default, which is the one decision in
+    this function. Falling through would hand an ESP32-CAM a 7" RGB panel image: a
+    bootloader-valid application for the wrong hardware, written into the OTA slot of a board
+    sealed in a housing on a pole with no serial console. It boots, finds no PSRAM camera
+    where it expects one, and the only symptom anybody sees is a stream that stopped. A typo
+    in a curl is worth a 400; that is not worth anything.
+    """
+    if role not in firmware.ROLES:
+        log.info("firmware: refusing unknown role %r", role)
+        raise HTTPException(
+            status_code=400, detail="role must be one of %s" % ", ".join(firmware.ROLES))
+    return role
 
 
 @app.on_event("startup")
@@ -651,6 +683,14 @@ async def telemetry(t: Telemetry) -> Prescription:
     It hands back both halves of the arming at once - whether there is one, and whether it asked
     for a pull - because the two are one decision and reading them apart would let a second poll
     slip between them and take half of it.
+
+    The node armings are on the same rail and are deliberately NOT consumed on a response that
+    carries the panel's own. src/plantrx.cpp refuses to dispatch nodeota_request() when
+    update_mode or firmware_pull is set, because a node update is watched by the panel and this
+    panel is about to stand down and reboot - so taking the node flag here would spend a one-shot
+    arming on a response that is going to ignore it, and the operator's request would vanish with
+    no trace but a log line. Left armed, it is delivered on the panel's first poll after the
+    reboot, which is exactly when somebody is in a position to watch it.
     """
     rx = await _prescribe(t)
     armed, pull = store.take_update_mode(t.device)
@@ -658,6 +698,12 @@ async def telemetry(t: Telemetry) -> Prescription:
         log.info("update mode: handing the flag to %s (%s)", t.device,
                  "pull" if pull else "push")
         return rx.model_copy(update={"update_mode": True, "firmware_pull": pull})
+
+    cam, node = store.take_node_pull(t.device)
+    if cam or node:
+        log.info("node update: handing %s to %s", "+".join(
+            r for r, on in (("cam", cam), ("node", node)) if on), t.device)
+        return rx.model_copy(update={"node_pull_cam": cam, "node_pull_node": node})
     return rx
 
 
@@ -773,29 +819,64 @@ def request_update_mode(device: str, pull: bool = False) -> dict:
     return {"ok": True, "device": device, "firmware_pull": pull}
 
 
+@v1.post("/device/{device}/node_update", dependencies=[Depends(auth)])
+def request_node_update(device: str, role: str) -> dict:
+    """Arm "tell node `role` to update" on this panel's next poll.
+
+    The same rail as update_mode above, for the same NAT reason and one more: the nodes are not
+    on IP at all. The ESP32-CAM has WiFi but no route from here, and the sensor node has no WiFi
+    running except during a download - both are reachable only over ESP-NOW, from the panel. So
+    the only way to start a node update from outside the greenhouse is to leave a flag where the
+    panel's next poll will pick it up and pass it on.
+
+    `role` is cam or node. Refusing panel here is not an oversight: the panel updates itself
+    through this file's other operator endpoint (`update_mode?pull=1`), which stands its camera,
+    poll and radio down first. Accepting it here would arm a device to command itself, and the
+    error message says which endpoint to use instead rather than making somebody read the source.
+
+    Nothing is delivered by this call, and nothing here checks that an image is even published
+    for that role - same trade as update_mode: the node's own "already current"/"nothing
+    published" answer arrives on the panel minutes later, and checking at arming time would only
+    mean checking twice and believing the earlier answer.
+
+    Sync rather than async for the reason at the top of store.py: the write is blocking sqlite,
+    and a sync handler runs on anyio's worker threadpool instead of stalling the event loop the
+    telemetry polls share.
+    """
+    if role not in store.NODE_PULL_COLS:
+        raise HTTPException(
+            status_code=400,
+            detail="role must be one of %s (the panel updates itself via update_mode?pull=1)"
+                   % ", ".join(sorted(store.NODE_PULL_COLS)))
+    store.set_node_pull(device, role)
+    return {"ok": True, "device": device, "node_pull": role}
+
+
 @v1.get("/firmware/latest", response_model=FirmwareManifest, dependencies=[Depends(auth)])
-def firmware_latest() -> FirmwareManifest:
-    """What is published, so a panel can work out whether it already has it.
+def firmware_latest(role: str = Depends(_role_q)) -> FirmwareManifest:
+    """What is published for this role, so a board can work out whether it already has it.
 
     404 is the ordinary answer here, not an error path. Nothing published, or something
-    published that is not an ESP32 application image, both land on it, and the panel treats
-    them the same way it treats a refused connection: say so on the takeover screen and change
-    nothing. See firmware.manifest for why a wrong file is the operator's mistake to read in a
-    log rather than a 500 claiming the server is broken.
+    published that is not an ESP32 application image, both land on it, and the caller treats
+    them the same way it treats a refused connection: say so and change nothing. See
+    firmware.manifest for why a wrong file is the operator's mistake to read in a log rather
+    than a 500 claiming the server is broken. It is the ordinary answer twice over now that
+    there are three roles: a deployment that has never published a cam image answers 404 to
+    every cam request it will ever get, and that is a correctly configured server.
 
-    Sync, like the operator endpoint above and for the same reason: this reads a file, and a
+    Sync, like the operator endpoints above and for the same reason: this reads a file, and a
     sync handler does its blocking on anyio's worker threadpool instead of on the event loop
     the telemetry polls share.
     """
-    m = firmware.manifest()
+    m = firmware.manifest(role)
     if m is None:
-        log.info("firmware: nothing published; 404 to /firmware/latest")
+        log.info("firmware: nothing published for %s; 404 to /firmware/latest", role)
         raise HTTPException(status_code=404, detail="no firmware published")
     return FirmwareManifest(**m)
 
 
 @v1.get("/firmware/image", dependencies=[Depends(auth)])
-def firmware_image() -> FileResponse:
+def firmware_image(role: str = Depends(_role_q)) -> FileResponse:
     """The image itself, raw, with a Content-Length the device needs before it starts.
 
     Update.begin() has to be told how many bytes are coming before the first one arrives - the
@@ -816,19 +897,86 @@ def firmware_image() -> FileResponse:
     bytes stopped matching the manifest that described them is rejected on the device rather
     than booted.
     """
-    m = firmware.manifest()
+    m = firmware.manifest(role)
     if m is None:
-        log.info("firmware: nothing published; 404 to /firmware/image")
+        log.info("firmware: nothing published for %s; 404 to /firmware/image", role)
         raise HTTPException(status_code=404, detail="no firmware published")
-    log.info("firmware: serving %d bytes, elf %s", m["size"], m["elf_sha256"][:12])
-    return FileResponse(firmware.image_path(), media_type="application/octet-stream")
+    log.info("firmware: serving %s, %d bytes, elf %s", role, m["size"], m["elf_sha256"][:12])
+    return FileResponse(firmware.image_path(role), media_type="application/octet-stream")
+
+
+@v1.post("/nodelog", dependencies=[Depends(auth)])
+def post_nodelog(batch: NodeLogBatch) -> dict:
+    """Log lines the panel heard from its nodes, on their way to somewhere readable.
+
+    The nodes never call this. They have no route to this server - one has no WiFi except during
+    a download, the other has WiFi and no path in - so the line travels node -> panel over
+    ESP-NOW and the panel posts a batch of them here. That is also why the control plane is
+    ESP-NOW in the first place: a node that cannot get a DHCP lease is exactly the node somebody
+    needs a log line out of, and a log path that shared the failure it was reporting on would go
+    quiet at the only moment it mattered.
+
+    The receive time is stamped here, once for the batch, rather than trusted from the body. The
+    body's `ms` is the forwarding PANEL's millis() and not the node's - the node's clock never
+    reaches this server at millisecond resolution - so it can order lines inside one batch and
+    nothing wider than that. See schema.NodeLogLine and store.save_node_logs.
+
+    Behind the same bearer dependency as everything else on /v1, which is what stops anyone on
+    the LAN writing rows into the one table an operator reads to find out what a node did.
+    """
+    n = store.save_node_logs(batch.device, batch.lines, scheduler.now())
+    return {"ok": True, "stored": n}
+
+
+@v1.get("/nodelog", response_model=list[NodeLogRow], dependencies=[Depends(auth)])
+def read_nodelog(role: Optional[str] = None,
+                 limit: int = store.NODE_LOG_READ_DEFAULT) -> list[NodeLogRow]:
+    """The newest stored lines, so the log is readable with curl and not only with sqlite3.
+
+    This exists because the alternative is scp'ing the database off a Dokploy volume to answer
+    "what did the camera say while it was updating", which is enough friction that nobody does
+    it and the write path might as well not be there.
+
+    `role` is an unchecked filter and not the validated ?role= the firmware endpoints take - see
+    store.recent_node_logs for why refusing an unknown one here would hide exactly the rows worth
+    looking at. `limit` is clamped in the store rather than here, so it is bounded no matter who
+    calls.
+    """
+    return [NodeLogRow(**r) for r in store.recent_node_logs(role, limit)]
+
+
+# The only route where a server-side bug must still read as an ordinary answer, and the reason the
+# body below is shaped the way it is: `{rx_id, next_poll_s}` IS a Prescription (schema.py:578-584),
+# which means something to exactly one caller. Built from the router's own prefix so it cannot
+# drift away from where @v1.post("/telemetry") actually mounts.
+_POLL_PATH = v1.prefix + "/telemetry"
 
 
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
-    """Never 500 a polling device into a retry loop over a server-side bug."""
+    """Never 500 a polling device into a retry loop over a server-side bug - and never hand that
+    answer to anything that is not the poll.
+
+    A 200 from this server means "here is a valid Prescription", so returning one everywhere told
+    every other client that a crash had succeeded. On one route that had teeth: the panel advances
+    its nodelog cursor on ANY 2xx (src/nodelog.cpp:347, :432) and increments no counter while doing
+    it, so a save_node_logs that raised took twenty log lines off the panel's ring, stored none of
+    them, and left no trace at either end - precisely the hole the cursor rule at
+    src/nodelog.cpp:19-23 exists to prevent. /v1/identify had already had to absorb its own
+    exceptions to escape this (tests/test_identify_endpoint.py:148), which was the second witness.
+
+    Everything that is not the poll now gets a real 500, which every client in this tree already
+    handles as a loud failure rather than a silent success: the firmware endpoints' hand-rolled
+    parsers refuse any non-2xx (src/fwpull.cpp:325-330) and the log uplink keeps its cursor and
+    retries the same window (src/nodelog.cpp:425).
+
+    HTTPException and request validation keep their own handlers - FastAPI matches the most
+    specific one - so 404 "no firmware published" and the 422 the nodelog caps raise are unchanged.
+    """
     log.exception("unhandled on %s", request.url.path)
-    return JSONResponse(status_code=200, content={"rx_id": "error", "next_poll_s": 60})
+    if request.url.path == _POLL_PATH:
+        return JSONResponse(status_code=200, content={"rx_id": "error", "next_poll_s": 60})
+    return JSONResponse(status_code=500, content={"detail": "internal error"})
 
 
 app.include_router(v1)

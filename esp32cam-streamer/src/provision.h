@@ -28,6 +28,9 @@ struct __attribute__((packed)) ProvMsg {
     char     ssid[33];  // REPLY: XOR-obfuscated
     char     pass[65];  // REPLY: XOR-obfuscated
 };
+static_assert(sizeof(ProvMsg) == 103,
+              "ProvMsg must stay 103 bytes: every receiver of this family dispatches on payload "
+              "length, so a widening here is a message that silently never arrives");
 
 // Periodic health beacon the CAM broadcasts once online, so the S3 settings
 // page can show where to reach the camera. Distinct size from ProvMsg, which
@@ -40,5 +43,7 @@ struct __attribute__((packed)) StatusMsg {
     uint8_t  connected;  // 1 while joined to WiFi
     char     ssid[33];   // plaintext (not a credential, no need to obfuscate)
 };
+static_assert(sizeof(StatusMsg) == 44,
+              "StatusMsg must stay 44 bytes, and distinct from ProvMsg's 103; see above");
 
 void provision_start(void);  // init ESP-NOW + spawn the provisioning task

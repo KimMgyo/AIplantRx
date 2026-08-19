@@ -62,10 +62,23 @@
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
-    #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/
-    #define LV_MEM_CUSTOM_ALLOC   malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC realloc
+    /* Arduino-ESP32 builds with CONFIG_SPIRAM_USE_MALLOC=y and
+     * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096, so plain malloc() serves every
+     * request of 4 kB or less out of internal DRAM. Every LVGL object, style and
+     * label string is far under that line, so a UI this size parks its whole
+     * object population in the 320 kB that the WiFi driver, LwIP and mbedTLS also
+     * have to live in - measured on this board at 3399 internal blocks averaging
+     * 68 bytes, which left 3.6 kB free with a 3.3 kB largest block. LwIP then
+     * cannot allocate a pbuf to answer so much as a ping, and the panel stops
+     * dead a minute or two after it comes online. Asking for PSRAM explicitly
+     * steps over the threshold. Nothing lv_mem hands out is a DMA target here:
+     * in DIRECT_MODE the draw buffers are the panel driver's own frame buffers,
+     * and every buffer this firmware feeds to a canvas or an image decoder is
+     * already allocated with MALLOC_CAP_SPIRAM by the code that owns it. */
+    #define LV_MEM_CUSTOM_INCLUDE "esp_heap_caps.h"  /*Header for the dynamic memory function*/
+    #define LV_MEM_CUSTOM_ALLOC(size)           heap_caps_malloc((size), MALLOC_CAP_SPIRAM)
+    #define LV_MEM_CUSTOM_FREE                  free
+    #define LV_MEM_CUSTOM_REALLOC(p, new_size)  heap_caps_realloc((p), (new_size), MALLOC_CAP_SPIRAM)
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.

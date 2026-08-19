@@ -80,6 +80,7 @@ static bool s_validated = false;
 static bool s_ui_ready = false;
 static uint32_t s_up_start = 0;
 static uint32_t s_addr = 0;          // flash address this image is running from
+static uint32_t s_good = 0;          // last address that proved itself; 0 = none ever has
 static bool s_intentional = false;   // the last restart was one we asked for
 
 // The last crash, as the panic handler recorded it. Kept as strings because that is how they
@@ -253,8 +254,8 @@ void health_init(void) {
     // Zero means no image has ever proved itself on this board - a first boot, or a board
     // whose NVS was erased. There is nothing to revert TO, so the attempt counter still runs
     // (it is what tells the server this image is unproven) but the revert is skipped.
-    uint32_t good = s_prefs.getUInt("good", 0);
-    s_pending = (s_addr != 0 && s_addr != good);
+    s_good = s_prefs.getUInt("good", 0);
+    s_pending = (s_addr != 0 && s_addr != s_good);
 
     uint8_t tries = 0;
     if (s_pending) {
@@ -272,7 +273,7 @@ void health_init(void) {
     if (s_pending) {
         hlogf(" try=%u/%u at 0x%06lX back=0x%06lX",
                       (unsigned)tries, (unsigned)MAX_TRIES,
-                      (unsigned long)s_addr, (unsigned long)good);
+                      (unsigned long)s_addr, (unsigned long)s_good);
     }
     hlogf("\n");
 
@@ -288,7 +289,7 @@ void health_init(void) {
 
     read_coredump();
 
-    if (s_pending && tries > MAX_TRIES && good != 0) revert_to(good);
+    if (s_pending && tries > MAX_TRIES && s_good != 0) revert_to(s_good);
 }
 
 // Called by main once the display is up and drawing. Separate from the network check because
@@ -317,6 +318,11 @@ void health_tick(void) {
     // Accepted. `good` is what the next boot compares itself against, so writing it is the
     // whole of "this image works"; tries is cleared so a future image starts from zero.
     s_prefs.putUInt("good", s_addr);
+    // Kept in step with NVS. Nothing reads it after this point today - health_revert_addr()'s
+    // contract is that callers gate on health_image_pending(), which goes false one line below -
+    // but a shadow that silently stops matching the store is the kind of trap that costs an
+    // afternoon the first time somebody does read it.
+    s_good = s_addr;
     s_prefs.putUChar("tries", 0);
     s_validated = true;
 
@@ -400,6 +406,8 @@ void health_crash_reported(void) {
     hlogf("[health] coredump delivered and erased" "\n");
 }
 bool health_image_pending(void) { return s_pending && !s_validated; }
+uint32_t health_slot_addr(void) { return s_addr; }
+uint32_t health_revert_addr(void) { return s_good; }
 
 // Short, stable, wire-friendly names. Not esp_reset_reason()'s enum number: a server log
 // reading "reset=7" sends the reader to a header file, and the whole point of this field is

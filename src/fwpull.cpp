@@ -51,6 +51,7 @@
 #include "hlog.h"
 #include "net.h"
 #include "updatemode.h"
+#include "nodeproto.h"        // the firmware paths, shared with the two node firmwares
 
 static const uint32_t CONNECT_MS = 4000;
 // How long the server gets to produce a whole small reply - the manifest, or the headers in
@@ -307,7 +308,15 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         hlogf("[fwpull] cannot reach %s:%u\n", s_host, (unsigned)s_port);
         return false;
     }
-    write_get_head(c, "/v1/firmware/latest", "application/json");
+    // Composed from the shared macro and this board's own role rather than spelled out, the same
+    // way both node firmwares compose it (sensor_node/src/nodeota.cpp:323). The role is not
+    // optional here just because the server defaults it to "panel": that default exists for
+    // panels built before the query parameter did, and a build that leans on it is a build whose
+    // request stops saying which image it wants.
+    char path[64];
+    snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_LATEST,
+             nodeproto_role_name(NODE_ROLE_PANEL));
+    write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
@@ -360,7 +369,10 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         hlogf("[fwpull] cannot reach %s:%u for the image\n", s_host, (unsigned)s_port);
         return;
     }
-    write_get_head(c, "/v1/firmware/image", "application/octet-stream");
+    char path[64];
+    snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_IMAGE,
+             nodeproto_role_name(NODE_ROLE_PANEL));
+    write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);

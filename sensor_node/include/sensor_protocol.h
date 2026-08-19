@@ -22,6 +22,9 @@ struct __attribute__((packed)) ChannelMsg {
     uint8_t  type;     // SENSOR_CHANNEL
     uint8_t  channel;  // 1..13, the S3's current WiFi channel
 };
+static_assert(sizeof(ChannelMsg) == 6,
+              "ChannelMsg must stay 6 bytes: length is how a receiver tells the SENSOR_MAGIC "
+              "families apart, and the panel's copy must agree byte for byte");
 
 // Payload length decides whether this message is delivered at all. Measured on
 // this hardware, same sender, same channel, thousands of broadcasts each:
@@ -102,3 +105,52 @@ struct __attribute__((packed)) ThermalFragMsg {
     uint16_t frag_len;    // valid bytes in data[]
     uint8_t  data[THERMAL_FRAG_BYTES];
 };
+static_assert(sizeof(ThermalFragMsg) == 242,
+              "ThermalFragMsg must stay 242 bytes: a 10-byte header plus THERMAL_FRAG_BYTES, "
+              "sized to one ESP-NOW packet and dispatched on by that length");
+
+// --- WiFi provisioning (the panel's ProvMsg family) ------------------------
+//
+// This node is an ESP-NOW-only device and stays one - see nodeota.cpp for why it joins WiFi
+// for the length of a download and no longer. But it still has to LEARN an SSID and password
+// from somewhere, and there is already a protocol on this air for exactly that: the one the
+// ESP32-CAM uses. Reusing it means the panel needs no new message family to provision a second
+// board, and a grower who typed the credentials once on the settings screen has provisioned
+// every device in the greenhouse.
+//
+// WHY THIS IS A THIRD COPY OF ProvMsg and not a shared header. shared/nodeproto.h's own opening
+// comment answers it: the three families that predate it each exist twice under a "MUST match"
+// promise, and it deliberately leaves them alone because churning a working wire format to tidy
+// it is how a greenhouse stops reporting for an afternoon. Moving ProvMsg into shared/ would
+// mean editing the panel and the CAM to match, which is two firmwares changed for a header
+// move. So this file - which is already the node's copy of ChannelMsg, SensorMsg and
+// ThermalFragMsg for the same reason - gains a fourth.
+//
+// What it does NOT copy is the silence. The static_assert below is the thing the other copies
+// lack: 103 is the length camprov.cpp's on_recv dispatches this family on, and a field added
+// here without one added there turns into a message that is simply never delivered.
+//
+// MUST byte-for-byte match include/camprov.h in the panel project and
+// esp32cam-streamer/src/provision.h in the camera project.
+static const uint32_t PROV_MAGIC   = 0x5346434D;  // 'SFCM' app id
+static const uint8_t  PROV_REQUEST = 1;   // node -> panel: I have no credentials
+static const uint8_t  PROV_REPLY   = 2;   // panel -> node: here they are
+
+// Obfuscation, not encryption, and the panel's own comment on it says so: the access point
+// broadcasts its SSID in the clear, so one captured reply XORed against the known SSID yields
+// this key and with it the password. It is here to keep the credentials out of a casual packet
+// dump, and the real gate is the panel deciding who gets an answer at all.
+static const uint8_t PROV_KEY[16] = {
+    0xA5, 0x5A, 0x37, 0xF1, 0x9C, 0x42, 0xD8, 0x6B,
+    0x13, 0xE0, 0x7A, 0x2F, 0xC4, 0x88, 0x51, 0x9D,
+};
+
+struct __attribute__((packed)) ProvMsg {
+    uint32_t magic;
+    uint8_t  type;      // PROV_REQUEST or PROV_REPLY
+    char     ssid[33];  // REPLY: XOR-obfuscated
+    char     pass[65];  // REPLY: XOR-obfuscated
+};
+static_assert(sizeof(ProvMsg) == 103,
+              "ProvMsg must stay 103 bytes: every receiver of this family dispatches on "
+              "payload length, so a widening here is a message that silently never arrives");

@@ -148,12 +148,12 @@ def test_failure_carries_the_korean_reason():
 def test_a_crash_below_the_endpoint_still_answers():
     """An unexpected exception has to arrive as the contract, not as the poll's.
 
-    main._unhandled answers every unhandled error with a 200 carrying
-    {"rx_id": "error", "next_poll_s": 60} - correct for a telemetry poll, and on
-    this route a body the device parses into nothing at all: no `ok`, no
-    `reason`, so the card goes blank with no way to say why. The route absorbs
-    it instead. The negative control is built in: if the guard is removed this
-    test sees the prescription shape and fails on the key set.
+    main._unhandled now answers a non-poll route with a 500 rather than the poll's
+    200 (see tests/test_nodelog.py), so an escape from this route would be a 500
+    with no `ok` and no `reason` - a blank card and no way to say why. Either way
+    the answer has to be this route's contract, so the route absorbs the exception
+    itself. The negative control is built in: remove the guard and this test sees
+    something that is not the identify shape and fails on the key set.
     """
     body = _identify(RuntimeError("plantnet blew up"))
 

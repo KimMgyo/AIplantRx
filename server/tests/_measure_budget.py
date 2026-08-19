@@ -89,7 +89,8 @@ DISPLAY = schema.Display(
 
 RX = schema.Prescription(
     rx_id="0123456789abcdef", issued_ts=1754300000, next_poll_s=60,
-    want_frame=True, update_mode=True, firmware_pull=True, mode="advisory",
+    want_frame=True, update_mode=True, firmware_pull=True,
+    node_pull_cam=True, node_pull_node=True, mode="advisory",
     control=CONTROL, display=DISPLAY,
 )
 
@@ -142,9 +143,12 @@ print("envelope  %5d" % envelope)
 print("TOTAL     %5d  wire (ensure_ascii=False)" % size(full))
 print("TOTAL     %5d  escaped (ensure_ascii=True)" % size(full, escaped=True))
 # The envelope is rx_id, issued_ts, next_poll_s, want_frame, update_mode,
-# firmware_pull, mode, and the outer braces - nothing that scales with a field
-# budget, so it is a constant and drifts only when the envelope gains a key.
-assert envelope == 144, (envelope, "the response envelope gained or lost a field")
+# firmware_pull, node_pull_cam, node_pull_node, mode, and the outer braces -
+# nothing that scales with a field budget, so it is a constant and drifts only
+# when the envelope gains a key. It has gained two: the pair that arms a node
+# update, +43 bytes on every response forever, which is the price of not needing
+# a second endpoint for them.
+assert envelope == 187, (envelope, "the response envelope gained or lost a field")
 print()
 print("body alone %d B wire, %d B escaped"
       % (size(d["judgments"][0]["body"]), size(d["judgments"][0]["body"], True)))

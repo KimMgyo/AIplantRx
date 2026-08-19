@@ -65,6 +65,7 @@
 #include "ui.h"
 #include "updatemode.h"
 #include "fwpull.h"
+#include "nodeota.h"    // the same server flag, aimed at a board that is not this one
 
 // The request is a few hundred bytes; the reply carries one judgment row, four
 // plan rows, four action rows, the four-row window table and the control half.
@@ -812,7 +813,7 @@ static void service_frame_request(const char *device) {
 // Walk the whole body into the staging copies. False leaves staging garbage and
 // the live prescription untouched, which is the entire point of staging.
 static bool parse_prescription(const char *body, int *next_poll_s, bool *want_frame,
-                               bool *update_mode, bool *firmware_pull) {
+                               bool *update_mode, bool *firmware_pull, bool *node_pull) {
     const char *root = skip_ws(body);
     if (*root != '{') return false;
     if (!val_end(root)) return false;               // unbalanced = cut short
@@ -837,6 +838,17 @@ static bool parse_prescription(const char *body, int *next_poll_s, bool *want_fr
     // the same way, and for the same reason - a server that predates the pull path never sends
     // this key, and the reading of its absence has to be the one that changes nothing.
     *firmware_pull = bool_get(root, "firmware_pull", false);
+    // One step further out: the same operator action, aimed at a board that is not this one.
+    // Indexed by NodeRole rather than named as two more bools because a third node would
+    // otherwise mean a third parameter on a signature that is already long, and because the
+    // dispatch below is then one loop instead of two copies of the same three lines.
+    //
+    // Read on the same side of the `display` gate and defaulted false for the same reason as the
+    // two keys above. What is NOT the same: these do not end in a reboot of this board, so
+    // nothing downstream stands down for them. The panel has to stay awake and polling while a
+    // node updates - it is the only thing watching, and the only screen the grower can read.
+    node_pull[NODE_ROLE_CAM]  = bool_get(root, "node_pull_cam", false);
+    node_pull[NODE_ROLE_NODE] = bool_get(root, "node_pull_node", false);
 
     char mode[12];
     str_get(root, "mode", mode, sizeof(mode));
@@ -1364,7 +1376,9 @@ static void exchange(void) {
     bool want_frame = false;
     bool update_mode = false;
     bool firmware_pull = false;
-    if (!parse_prescription(s_resp, &next_poll_s, &want_frame, &update_mode, &firmware_pull)) {
+    bool node_pull[NODE_ROLE_COUNT] = {false, false, false};
+    if (!parse_prescription(s_resp, &next_poll_s, &want_frame, &update_mode, &firmware_pull,
+                            node_pull)) {
         schedule_fail(next_poll_s, "malformed");
         return;
     }
@@ -1423,6 +1437,23 @@ static void exchange(void) {
         // publish against - it would just leave s_frame_armed set for the few minutes this
         // board has left.
         return;
+    }
+
+    // Reached only when neither arm above was taken, and that ordering is the whole design of
+    // this block. Both of those end in a reboot of this board; the panel is what watches a node
+    // update and shows it on the screen, so arming one on the way out of the door would produce
+    // an update nobody can see the outcome of, on a device the grower cannot reach.
+    //
+    // No `return`. Unlike the two above, a node pull leaves this board's own duties untouched -
+    // it must keep polling, keep publishing frames, and keep drawing, because it is now the only
+    // instrument on a process happening somewhere else.
+    //
+    // nodeota_request() is the one that decides whether anything happens: it refuses a node that
+    // has never reported, one that says it cannot OTA, and a second request while one is running,
+    // writing its reason where the update page can show it. So this loop deliberately does not
+    // pre-screen anything - one place decides, and it is the place that has the state.
+    for (uint8_t role = 0; role < NODE_ROLE_COUNT; role++) {
+        if (node_pull[role]) nodeota_request(role, "서버");
     }
 
     // Arm for the next exchange rather than waiting here: the puller publishes

@@ -30,6 +30,7 @@
 #include "sensor_bh1750.h"
 #include "thermal_mlx.h"
 #include "oled.h"
+#include "nodeagent.h"
 
 static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -86,10 +87,20 @@ static void set_fast_rate(const uint8_t *mac) {
     esp_now_set_peer_rate_config(mac, &rc);
 }
 
-// The S3 answers every telemetry send with the channel it is on. Keep this tiny:
-// it runs in the ESP-NOW receive callback.
+// The S3 answers every telemetry send with the channel it is on, and since nodeagent.cpp arrived
+// it also sends commands and WiFi credentials here. Keep this tiny: it runs in the ESP-NOW
+// receive callback.
+//
+// Dispatch is by payload length, the same rule the panel's single callback uses. Every family on
+// this air has a distinct size - 6 ChannelMsg, 44 StatusMsg, 64 SensorMsg, 103 ProvMsg, 192
+// NodeRepMsg, 232 NodeCmdMsg, 242 ThermalFragMsg - and the two node-protocol structs are
+// static_assert'ed at theirs precisely so that stays true. Anything that is not a ChannelMsg is
+// offered to the agent, which checks its own magic before believing a length.
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    if (len != (int)sizeof(ChannelMsg)) return;
+    if (len != (int)sizeof(ChannelMsg)) {
+        nodeagent_on_espnow(info->src_addr, data, len);
+        return;
+    }
     ChannelMsg c;
     memcpy(&c, data, sizeof(c));
     if (c.magic != SENSOR_MAGIC || c.type != SENSOR_CHANNEL) return;
@@ -172,17 +183,113 @@ static void espnow_init(void) {
     esp_now_register_send_cb(on_sent);
 }
 
+// Set for the length of an OTA download; see nodeagent.h's nodeagent_radio_hold(). Volatile
+// because nodeota.cpp sets it from the loop task while the send callback and the receive callback
+// read the state it protects on the WiFi task.
+static volatile bool s_radio_hold = false;
+
 // Hops the radio, caching the result only on success. Recording a channel the
 // call did not actually reach would poison the cache: every later send would
 // believe it was already there and skip the hop, transmitting on whatever
 // channel the radio really sat on.
 static bool hop_to(uint8_t ch) {
+    // Held: the radio belongs to a WiFi association for the length of an OTA download and must not
+    // move. esp_wifi_set_channel() on an associated station drops the association, so one
+    // telemetry hop mid-transfer would kill the download that hop is interrupting. Reported as
+    // success because the sends that follow are still correct - an associated node sits on the
+    // AP's channel, and the panel, joined to the same AP, is listening there. The callers' sweeps
+    // are suppressed separately: a sweep here would be thirteen copies of one packet on one
+    // channel.
+    if (s_radio_hold) return true;
     if (ch == s_cur_ch) return true;  // no hop, so nothing to drain
     drain_tx();
     if (esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
     s_cur_ch = ch;
     delay(5);  // let the radio settle before keying up
     return true;
+}
+
+// ---- the control plane's radio (nodeagent.h) ---------------------------------------------
+//
+// nodeagent.cpp and nodeota.cpp send through these rather than owning a second copy of the
+// channel cache and the send gate. Two copies would hop the radio out from under each other:
+// s_cur_ch's whole job is that neither sender skips a hop the other made.
+
+bool nodeagent_radio_send(const void *payload, size_t n) {
+    uint8_t ch;
+    bool ok;
+    // Unicast whenever the panel's MAC is known, for the reason the telemetry path unicasts: on
+    // this air an unacknowledged broadcast that collides with the CAM's stream is simply gone, and
+    // a node whose HELLO was dropped reads on the panel exactly like a node that is not powered.
+    // The answer to a command is the worst thing here to lose silently.
+    if (s3_reachable(&ch)) {
+        if (!hop_to(ch)) return false;
+        ok = send_marked(s_s3_mac, payload, n);
+    } else {
+        // No fix on the panel yet, so sweep - the same 1..13 the telemetry and thermal paths use
+        // when they are unlocked, for the same reason.
+        //
+        // This started life as a single broadcast on whatever channel the radio happened to be
+        // parked on, on the theory that the telemetry sweep is what finds the panel anyway and a
+        // second sweep here would only cost hops. Measured on the bench, that is wrong twice over.
+        //
+        // It does not work: the parked channel after a telemetry sweep is 13 and the panel was on
+        // 1, so a hundred consecutive HELLOs landed nowhere and the panel printed "no reports yet"
+        // beside a healthy sensor feed. Discovery cannot be borrowed from another family - the
+        // panel's ChannelMsg reply only locks this node while the panel's own channel is stable,
+        // and a panel whose WiFi is failing to associate (reason=202, which is what put this bug
+        // on the bench) moves channel faster than the 12s TTL.
+        //
+        // And the cost it was avoiding is not there: the thermal path already sweeps 13 channels
+        // with SEVEN fragments each every ~2s while unlocked. One frame per channel every 3s is
+        // 1/91st of the air that path spends and buys the only state in which the control plane is
+        // worth having - the one where the network is what broke.
+        //
+        // Held: hop_to() is a no-op, so a sweep would be thirteen copies on the channel we cannot
+        // leave. Collapsed to one send, exactly as broadcast_thermal does.
+        ok = false;
+        uint8_t last = s_radio_hold ? 1 : 13;
+        for (uint8_t c = 1; c <= last; c++) {
+            if (!hop_to(c)) continue;
+            if (send_marked(BROADCAST, payload, n)) ok = true;
+        }
+    }
+    // Drained here rather than left to the next hop. This is the only sender not followed by more
+    // of its own packets, so nothing else would wait for it, and the next telemetry hop would key
+    // it on the wrong channel or drop it outright.
+    drain_tx();
+    return ok;
+}
+
+void nodeagent_radio_hold(bool held) { s_radio_hold = held; }
+
+void nodeagent_radio_forget_channel(void) { s_cur_ch = 0; }
+
+void nodeagent_radio_rearm(void) {
+    // esp_now_init() on a live stack returns ESP_ERR_ESPNOW_EXIST and changes nothing, and
+    // esp_now_add_peer() on a known peer does the same, so this is safe whether the WiFi driver
+    // was actually stopped or the join simply failed without one.
+    esp_now_init();
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, BROADCAST, 6);
+    peer.channel = 0;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+    set_fast_rate(peer.peer_addr);
+    // The unicast peer too. It is normally added once, in on_recv, on the strength of
+    // s_s3_mac_known - which stays true across a driver restart that took the peer list with it,
+    // so without this the node would unicast to a peer the driver no longer has and every
+    // telemetry send would fail with ESP_ERR_ESPNOW_NOT_FOUND until the TTL expired.
+    if (s_s3_mac_known) {
+        memcpy(peer.peer_addr, s_s3_mac, 6);
+        esp_now_add_peer(&peer);
+        set_fast_rate(peer.peer_addr);
+    }
+    esp_now_register_recv_cb(on_recv);
+    esp_now_register_send_cb(on_sent);
+    s_cur_ch = 0;      // the driver came back up on channel 1 whatever it left on
+    s_tx_done = true;  // any send in flight when it stopped will never get its callback
 }
 
 // Result of the last telemetry attempt, surfaced in the log line.
@@ -230,7 +337,17 @@ static void broadcast_reading(void) {
     // thermal, which sends seven back-to-back on each channel, arrived fine. The
     // burst matches that shape and costs 39 packets per sweep, once every 20s
     // in steady state.
-    if (due_sweep || !s_bcast_unicast) {
+    // While the radio is held for an OTA download there is nowhere to hop to, so a sweep collapses
+    // to exactly what one broadcast on the current channel already does - and that channel is the
+    // AP's, which is where the panel is. The other twelve copies would be airtime taken from the
+    // download they are meant to be reporting on.
+    if (s_radio_hold) {
+        if (!s_bcast_unicast) {
+            if (send_marked(BROADCAST, &m, sizeof(m))) sent++;
+            else failed++;
+            drain_tx();
+        }
+    } else if (due_sweep || !s_bcast_unicast) {
         for (uint8_t c = 1; c <= 13; c++) {
             if (!hop_to(c)) { failed++; continue; }
             for (uint8_t r = 0; r < 3; r++) {
@@ -277,6 +394,10 @@ static void broadcast_thermal(const uint16_t *px, float max_c, uint16_t peak_idx
     } else {
         if (millis() - last_unlocked_ms < UNLOCKED_FRAME_MS) return;
         last_unlocked_ms = millis();
+        // One pass while the radio is held for an OTA download. hop_to() is a no-op then, so these
+        // bounds only decide how many times the frame is repeated, and thirteen copies on the one
+        // channel we cannot leave say nothing the first did not.
+        if (s_radio_hold) last = first;
     }
 
     memcpy(payload, px, THERMAL_PIX_BYTES);
@@ -435,6 +556,9 @@ void setup() {
     }
 
     espnow_init();
+    // After espnow_init(), because its first act is to broadcast a HELLO - the panel cannot offer
+    // an update button for a node it has never heard from.
+    nodeagent_init();
     Serial.println("Setup done. Broadcasting readings every ~2s, thermal as fast as the sensor allows.\n");
 }
 
@@ -489,8 +613,38 @@ static void draw_oled(void) {
     }
 }
 
+// The "state" verb's answer (nodeagent.h). Lives here because this is where the numbers are: a
+// getter per value would be six accessors existing for one debug verb.
+//
+// It is one burst and there is no scrollback on the other end, so it says the things that decide
+// what to do next and nothing else - what the sensors last read, whether the radio is actually
+// keying packets and at whom, and whether the display is there. nlogf_always because somebody
+// asked: refusing to answer "state" on the grounds that streaming is off would be obtuse.
+void nodeagent_state_lines(void) {
+    uint8_t ch;
+    bool locked = s3_channel(&ch);
+    nlogf_always("[state] co2=%.0f temp=%.1f hum=%.0f lux=%.0f thermal=%.1f",
+                 s_co2, s_temp, s_hum, s_lux, s_thermal_max);
+    nlogf_always("[state] link %s ch %s | last tx %u/%u | keyed=%lu lost=%lu",
+                 s_bcast_unicast ? "unicast" : "bcast",
+                 locked ? String(ch).c_str() : "sweeping",
+                 (unsigned)s_bcast_sent, (unsigned)(s_bcast_sent + s_bcast_failed),
+                 (unsigned long)s_tx_keyed, (unsigned long)s_tx_lost);
+    nlogf_always("[state] oled %s, %d px staged", oled_ready() ? "up" : "absent",
+                 oled_pixels_set());
+}
+
 void loop() {
     static uint32_t last_scd = 0, last_bh = 0, last_bcast = 0;
+
+    // First, and before millis() is sampled below: this is where a NODE_UPDATE is executed, and
+    // that call blocks for the length of a download - a minute or so during which this node is an
+    // updater and not a sensor. Everything after it must therefore read a fresh clock, or the
+    // first iteration back would fire every timer at once. Nothing else here blocks for more than
+    // a few milliseconds, so in normal operation this costs one comparison and the telemetry
+    // cadence below is exactly what it was.
+    nodeagent_tick();
+
     uint32_t now = millis();
 
     // 500ms, not 1s: this is one short I2C status read, and during bring-up the
@@ -532,23 +686,26 @@ void loop() {
         if (!oled_ready()) {
             static int tries = 0;
             if (oled_init()) {
-                Serial.printf("[oled] recovered after %d retries\n", tries);
+                nlogf("[oled] recovered after %d retries", tries);
                 tries = 0;
             } else if (tries++ < 3) {
-                Serial.println("[oled] still not answering; will keep retrying");
+                nlogf("[oled] still not answering; will keep retrying");
             }
         }
         draw_oled();
         uint8_t locked;
-        // keyed/lost come from the send callback, i.e. what the radio actually
-        // did. The queued count alone hid a total delivery failure once.
-        Serial.printf("[bcast] co2=%.0fppm temp=%.1fC hum=%.0f%% lux=%.0flx thermal=%.1fC "
-                      "| q %u/%u | keyed=%lu lost=%lu | %s ch %s\n",
-                      s_co2, s_temp, s_hum, s_lux, s_thermal_max,
-                      s_bcast_sent, (unsigned)(s_bcast_sent + s_bcast_failed),
-                      (unsigned long)s_tx_keyed, (unsigned long)s_tx_lost,
-                      s_bcast_unicast ? "unicast" : "bcast",
-                      s3_channel(&locked) ? String(locked).c_str() : "sweeping");
+        // keyed/lost come from the send callback, i.e. what the radio actually did. The queued
+        // count alone hid a total delivery failure once. And nlogf rather than Serial.printf:
+        // identical on the console, and also queued for the panel while somebody has asked for
+        // logs ("log on"). This is the node's one periodic diagnostic and so the one worth having
+        // a remote copy of - it carries the fact a silent node cannot report about itself.
+        nlogf("[bcast] co2=%.0fppm temp=%.1fC hum=%.0f%% lux=%.0flx thermal=%.1fC "
+              "| q %u/%u | keyed=%lu lost=%lu | %s ch %s",
+              s_co2, s_temp, s_hum, s_lux, s_thermal_max,
+              (unsigned)s_bcast_sent, (unsigned)(s_bcast_sent + s_bcast_failed),
+              (unsigned long)s_tx_keyed, (unsigned long)s_tx_lost,
+              s_bcast_unicast ? "unicast" : "bcast",
+              s3_channel(&locked) ? String(locked).c_str() : "sweeping");
     }
 
     // Last in the iteration on purpose: the cheap time-gated sensors above get

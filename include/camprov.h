@@ -26,6 +26,9 @@ struct __attribute__((packed)) ProvMsg {
     char     ssid[33];  // REPLY: XOR-obfuscated
     char     pass[65];  // REPLY: XOR-obfuscated
 };
+static_assert(sizeof(ProvMsg) == 103,
+              "ProvMsg must stay 103 bytes: every receiver of this family dispatches on payload "
+              "length, so a widening here is a message that silently never arrives");
 
 struct __attribute__((packed)) StatusMsg {
     uint32_t magic;
@@ -35,6 +38,8 @@ struct __attribute__((packed)) StatusMsg {
     uint8_t  connected;  // 1 while joined to WiFi
     char     ssid[33];   // plaintext (not a credential, no need to obfuscate)
 };
+static_assert(sizeof(StatusMsg) == 44,
+              "StatusMsg must stay 44 bytes, and distinct from ProvMsg's 103; see above");
 
 // --- Sensor-node telemetry (separate device, separate ESP-NOW message family) ---
 // A standalone ESP32 devkit carrying DHT11/SCD41/BH1750 sensors broadcasts this
@@ -57,6 +62,9 @@ struct __attribute__((packed)) ChannelMsg {
     uint8_t  type;     // SENSOR_CHANNEL
     uint8_t  channel;  // 1..13, our current WiFi channel
 };
+static_assert(sizeof(ChannelMsg) == 6,
+              "ChannelMsg must stay 6 bytes: length is how on_recv tells the SENSOR_MAGIC "
+              "families apart, and the node's copy must agree byte for byte");
 
 // Payload length decides whether this message is delivered at all. Measured on
 // this hardware, same sender, same channel, thousands of broadcasts each:
@@ -142,6 +150,9 @@ struct __attribute__((packed)) ThermalFragMsg {
     uint16_t frag_len;    // valid bytes in data[]
     uint8_t  data[THERMAL_FRAG_BYTES];
 };
+static_assert(sizeof(ThermalFragMsg) == 242,
+              "ThermalFragMsg must stay 242 bytes: a 10-byte header plus THERMAL_FRAG_BYTES, "
+              "sized to one ESP-NOW packet and dispatched on by that length");
 
 void camprov_init(void);  // init ESP-NOW responder; call once after net_init()
 
@@ -153,6 +164,25 @@ void camprov_set_credentials(const char *ssid, const char *pass);
 // on the OLD network's channel. Call just before switching WiFi so the CAM can
 // re-join the S3's new network (ESP-NOW needs a shared channel to reach it).
 void camprov_push_to_cam(const char *ssid, const char *pass);
+
+// The same, to the sensor node. It has never needed WiFi - it broadcasts telemetry
+// over ESP-NOW and nothing else - so it was never provisioned. It needs credentials
+// now because it downloads its own firmware image over HTTP (see nodeota.h), for the
+// duration of that download only.
+//
+// Called beside camprov_push_to_cam so one save on the settings page reaches both
+// boards: two devices that learn the network at different times are two devices to
+// walk to when the router changes.
+void camprov_push_to_node(const char *ssid, const char *pass);
+
+// Resend whatever is already cached to the sensor node, changing nothing. One send,
+// no channel-change hurry behind it - unlike camprov_push_to_node, which fires just
+// before the radio leaves the channel and so repeats.
+//
+// nodeota.cpp calls this on a node update request: a factory-fresh node that has
+// never been provisioned would otherwise fail the download for want of credentials
+// this panel has been holding all along.
+void camprov_reprovision_node(void);
 
 // Latest CAM health, from its ESP-NOW status beacon. `online` is false until a
 // beacon arrives and again if none has come for a while.

@@ -90,9 +90,15 @@ FALLBACKS = [
 ]
 
 # Everything non-ASCII the UI draws outside the Hangul block: degree and its
-# neighbours, the dashes and quotes the server's prose uses, bullet, ellipsis,
-# arrow, and ℃. Every subset AND every fallback gets all of it, so a unit or a
-# quotation mark cannot be the one glyph that changes size in a line.
+# neighbours, the dashes and quotes the server's prose uses, bullet, ellipsis, the
+# right arrow, and ℃. Every subset AND every fallback gets all of it, so a unit or
+# a quotation mark cannot be the one glyph that changes size in a line.
+#
+# U+2190 is deliberately NOT here, and its absence is a decision rather than an
+# oversight: render.py's _SUBS maps ← to "<-", and that mapping is only reachable
+# while the fonts lack the glyph. Carrying it for symmetry with U+2192 - which the
+# server's own prose does use - would silently retire the substitution and put a
+# character no string in this tree asks for onto the panel.
 PUNCTUATION = (0xB0, 0xB1, 0xB7, 0xD7, 0x2013, 0x2014, 0x2018, 0x2019,
                0x201C, 0x201D, 0x2022, 0x2026, 0x2192, 0x2103)
 

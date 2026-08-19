@@ -19,6 +19,8 @@
 #include "plantrx.h"
 #include "sitecfg.h"
 #include "hlog.h"
+#include "nodelog.h"
+#include "nodeota.h"
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -103,8 +105,20 @@ void setup() {
     // anything until asked. The pull is the half that does not need a laptop on the network -
     // see fwpull.cpp - so it has to be running before anybody presses the button that uses it.
     fwpull_init();
+    // Before camprov_init(), not after: its recv callback is what calls nodelog_add(), and a
+    // node that is already broadcasting when this board comes up gets its first line in before
+    // the rest of bring-up finishes. The ring is static so this only has to happen before the
+    // first write, but "before the thing that writes to it" is the ordering that stays true when
+    // the allocation inside it grows.
+    nodelog_init();
     thermal_init();  // MLX90640 frame sink; before camprov_init, which feeds it
     camprov_init();  // ESP-NOW responder: hands WiFi creds to the CAM on request
+    // After camprov_init(), which owns the recv callback that feeds it. Ordering here is
+    // tidiness rather than a constraint - nodeota_init() deliberately does not clear its state
+    // table, so a node already broadcasting when this board comes up keeps the report that
+    // arrived in between - but "after the thing that delivers to it" is the order that stays
+    // true if it ever grows something that does need clearing.
+    nodeota_init();   // remote firmware updates for the CAM and the sensor node
     camnet_init();   // the camera feed: ESP32-CAM MJPEG over WiFi
     // Species ID, button-triggered. The keys are the server's now, so its worker POSTs the
     // CAM still to the address plantrx_init() parses two lines down - which is not an ordering
@@ -169,6 +183,7 @@ void loop() {
     camprov_debug_tick();
     plantrx_debug_tick();
     health_debug_tick();
+    nodeota_debug_tick();
     // The append writes records the LVGL thread reads (and thumbnail buffers its
     // canvases point straight at), so it runs under the same lock ui_init() uses.
     // Skipped in update mode: it walks the judgment log and repaints canvases, and an update
@@ -182,6 +197,16 @@ void loop() {
     // LVGL timer: the UI task keeps drawing while this waits on the socket.
     health_tick();
     updatemode_tick();
+    // Ahead of nodelog_tick() and outside the update-mode guard, like it. No I/O and no
+    // allocation: it ages the online flags, resends a command that was never acknowledged, and
+    // turns a node that stopped reporting mid-download into a readable failure instead of a
+    // frozen bar. The 700ms retry window is only sampled once per loop(), so the resends land
+    // about a second apart in practice - three attempts is the point, not their spacing.
+    nodeota_tick();
+    // Beside the other ticks and outside the update-mode guard below, because it carries its own:
+    // it forwards node log lines over one short POST and stands down in update mode for the same
+    // reason plantrx_poll() does. On a panel with no server configured it returns immediately.
+    nodelog_tick();
     // The poll blocks for a whole HTTP round trip. That is exactly the kind of company an
     // update does not need, so in update mode it does not happen at all.
     if (!updatemode_active()) plantrx_poll();

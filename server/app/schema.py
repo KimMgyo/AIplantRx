@@ -610,6 +610,30 @@ class Prescription(BaseModel):
     # work here: firmware that predates this key sees only update_mode and takes the push path,
     # which is exactly what it should do, because it has no puller to run.
     firmware_pull: bool = False
+    # Pass the update on: tell the ESP32-CAM, or the sensor node, to fetch its own image. One
+    # flag per role rather than one string, because the panel reads them into
+    # `bool node_pull[NODE_ROLE_COUNT]` indexed by role (parse_prescription in src/plantrx.cpp)
+    # and its JSON scanner reads scalars, not a name it would then have to map back to an index.
+    #
+    # NOT a variant of the two fields above, and the panel enforces the difference: it dispatches
+    # nodeota_request() only when neither update_mode nor firmware_pull was set on the same
+    # response. A node update is watched BY the panel - the panel relays the command over
+    # ESP-NOW, receives the node's NODE_PROG reports and draws them - so arming one on a panel
+    # that is about to stand down and reboot would start an update with nobody left watching it,
+    # on a board with no console to ask afterwards. The server keeps its side of that by not
+    # consuming these on a poll that carries an update_mode arming (see main.telemetry), so the
+    # request survives the panel's reboot instead of being spent on a response it will ignore.
+    #
+    # One-shot, like update_mode, and here the clearing is what stands between an operator and a
+    # camera that reboots every minute: these do not stop the panel polling, so a flag that
+    # outlived its delivery would re-arm the node's update on every poll forever. See
+    # store.take_node_pull.
+    #
+    # False by default for the same compatibility reason as the two above, in both directions: a
+    # panel built before these keys existed never looks for them, and a stored prescription that
+    # predates them deserialises to "no node was asked to do anything".
+    node_pull_cam: bool = False
+    node_pull_node: bool = False
     mode: Literal["auto", "advisory"] = "auto"
     control: Control = Control()
     display: Display = Display()
@@ -678,3 +702,88 @@ class FirmwareManifest(BaseModel):
     md5: str
     idf_ver: str
     mtime: int
+
+
+# --------------------------------------------------------------------------
+# Panel -> server: what the nodes said
+# --------------------------------------------------------------------------
+
+# A log line off the wire cannot be longer than this, because shared/nodeproto.h gives
+# NodeRepMsg one `char text[NODEPROTO_TEXT]` at 160 bytes - 159 of content and a NUL - and a
+# node has no way to send more. 200 rather than 160 because the panel is allowed to annotate a
+# line on its way past (a role prefix, a "..." where it dropped some) without that being the
+# thing that rejects a batch, and because a character is not a byte: the cap pydantic enforces
+# counts code points, so a Korean line at the wire limit is 53 characters and an ASCII one is
+# 159. Serial output on both nodes is English by convention, so 159 is the case that binds.
+NODELOG_TEXT_MAX = 200
+
+# Lines per POST. The panel batches whatever it heard since its last post, and a node with
+# verbose logging on can talk faster than the panel posts - so this is the number that decides
+# whether a runaway node fills the volume or gets refused. 64 lines is several seconds of a
+# chatty update at ESP-NOW's realistic rate, and about 13KB at the text cap above, which is a
+# request body the panel can build in one buffer.
+NODELOG_LINES_MAX = 64
+
+
+class NodeLogLine(BaseModel):
+    """One line a node said, plus the panel's note of when it heard it.
+
+    `role` and `text` are the node's, relayed untouched, so a reader can line these up against
+    what the node's own serial console would have shown if anybody could reach it.
+
+    `ms` is NOT the node's clock, and no amount of wanting it to be makes it one: NodeRepMsg has
+    no millisecond field to carry one. Its only node clock is `uptime_s`, in whole seconds, and
+    the log branch discards even that (shared/nodeproto.h:123, src/nodeota.cpp:396). What arrives
+    here is the PANEL's millis() at the moment the line landed over ESP-NOW (src/nodelog.cpp:68,
+    :82). That buys the one thing recv_ts cannot: ordering within a batch at millisecond
+    resolution, since the server stamps a whole batch once. It buys no view of the node's own
+    timeline - a node reboot is invisible in it - and it wraps to 0 after ~49.7 days of PANEL
+    uptime.
+
+    `role` is a plain string and not a Literal, deliberately: nodeproto_role_name() answers "?"
+    for a role byte it does not recognise, and a version-skewed node saying something is exactly
+    the case this whole path exists to make visible. Refusing the batch would throw away the log
+    line that explains the skew.
+    """
+
+    role: str = Field(max_length=16)
+    ms: int = Field(ge=0)
+    text: str = Field(max_length=NODELOG_TEXT_MAX)
+
+
+class NodeLogBatch(BaseModel):
+    """Body of POST /v1/nodelog: what one panel heard from its nodes since it last posted.
+
+    `device` is the panel's STA MAC, the same identity it polls with - not the node's. A node
+    has no identity on this server: it never authenticates, never polls, and its MAC is known
+    only to the panel that unicasts commands back to it. So a row says which panel's greenhouse
+    a line came from and which kind of board said it, and that is enough to read the log.
+
+    Both caps refuse the whole batch rather than trimming it. A batch over the line cap is not a
+    node being chatty - the panel's own buffer is smaller than this - it is a caller that is not
+    the panel, and silently storing the first 64 lines of it would leave a table full of rows
+    nobody can account for.
+    """
+
+    device: str = Field(max_length=64)
+    lines: list[NodeLogLine] = Field(default_factory=list, max_length=NODELOG_LINES_MAX)
+
+
+class NodeLogRow(BaseModel):
+    """One stored line, as GET /v1/nodelog hands it back.
+
+    NodeLogLine plus the two things the server knows and the node does not: which panel
+    forwarded it, and when this server received it. recv_ts is what orders rows across any
+    reboot, on either board, and the read sorts by rowid which follows it. `ms` is the
+    forwarding panel's arrival clock and separates lines inside one batch - it is not the node's
+    clock and says nothing about a node restarting. See NodeLogLine.
+
+    Read by a person with curl, not by a device, which is why nothing here is trimmed for a
+    fixed-size C buffer the way the display half is.
+    """
+
+    device: str
+    role: str
+    ms: int
+    recv_ts: int
+    text: str

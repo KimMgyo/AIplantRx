@@ -54,3 +54,17 @@ uint32_t health_crashes(void);
 // Whether this firmware is still unconfirmed. Worth showing on the panel: a reboot in this
 // state does not keep the image.
 bool health_image_pending(void);
+
+// Where this image is running from, and where a failed probation would send the board back to.
+//
+// Both were already computed at init and thrown away - the boot log printed them and nothing
+// else could ask. The firmware page needs them for the question a grower has before pressing
+// 업데이트: an image that has not proved itself yet is one reboot from being replaced, and a
+// board whose revert address is 0 has nothing to fall back to at all. That last case is not
+// hypothetical - it is every first boot and every board whose NVS was erased.
+//
+// health_revert_addr() is only meaningful while health_image_pending() is true; a confirmed
+// image has no revert target this module tracks, because "good" then names the running image
+// itself. Callers must gate on the pending flag rather than on a non-zero address.
+uint32_t health_slot_addr(void);
+uint32_t health_revert_addr(void);

@@ -4,6 +4,8 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include "provision.h"
+#include "nodeagent.h"
+#include "nodeproto.h"
 
 static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -18,6 +20,16 @@ static void xor_field(char *buf, size_t n) {
 }
 
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    // ONE recv callback exists on this board. esp_now_register_recv_cb() replaces rather than
+    // chains, so every family the CAM listens to is told apart here, by payload length - the same
+    // rule the panel's camprov.cpp uses, and the reason shared/nodeproto.h lists every length
+    // already taken (6/44/64/103/242, plus its own 192 and 232). A second registration anywhere
+    // in this firmware would silently unhook provisioning, and the symptom would read as "the S3
+    // stopped answering", which is the last place anybody would look.
+    if (len == (int)sizeof(NodeCmdMsg)) {
+        nodeagent_on_cmd(info != nullptr ? info->src_addr : nullptr, data, len);
+        return;
+    }
     (void)info;
     if (len != (int)sizeof(ProvMsg)) {
         return;

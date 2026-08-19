@@ -6,6 +6,7 @@
 //   page_monitor.cpp  camera panel, sensor cards, device pill strip
 //   page_control.cpp  3x3 device grid, fan slider, all-stop
 //   page_settings.cpp WiFi card + network list
+//   page_update.cpp   firmware: running image, boot history, the pull button
 //
 // Widget pointers live as statics inside their module; only state and
 // cross-module actions cross this boundary.
@@ -21,7 +22,26 @@
 // Shared state (defined in ui.cpp)
 // ---------------------------------------------------------------------------
 
-enum Page { PAGE_AUTO, PAGE_MONITOR, PAGE_CONTROL, PAGE_SETTINGS };
+// PAGE_UPDATE is the fifth item in the dropdown, and it did not used to be. It was
+// a leaf reached from a card at the bottom of the settings page, on the argument
+// that promoting maintenance to top-level navigation would put the one
+// irreversible action on this panel a single tap from 모니터링.
+//
+// That argument was written when the card WAS the action - it fired the pull
+// itself. The action has since moved onto the page along with its two-tap
+// confirmation (see page_update.cpp), so the menu item reaches a page and nothing
+// else: menu, then the page, then two deliberate taps on a control that names what
+// it is about to replace. Three presses, not one, and the first two are free.
+//
+// What the old arrangement actually cost was discoverability. The way in was one
+// card below three scrolling report cards on a page about WiFi, which is a strange
+// place to keep the answer to "what is this board running".
+//
+// PAGE_COUNT sizes the page array and every loop over it. The literal 4 that used
+// to be written three times in ui.cpp is why this is here: adding a page had to be
+// remembered in each of them, and a forgotten one lays the new page out beside the
+// visible one instead of hiding it (ui.cpp's show_page note says what that costs).
+enum Page { PAGE_AUTO, PAGE_MONITOR, PAGE_CONTROL, PAGE_SETTINGS, PAGE_UPDATE, PAGE_COUNT };
 
 extern Page g_page;
 extern bool g_dark;
@@ -161,6 +181,7 @@ lv_obj_t *make_wifi_bars(lv_obj_t *parent, int strength, lv_color_t on, lv_color
 #define ICON_SETTINGS "\xEE\x85\x94"  // U+E154 settings
 #define ICON_AUTO     "\xEE\x90\x92"  // U+E412 sparkles (AI autonomous control)
 #define ICON_NODE     "\xEE\x90\x83"  // U+E403 circuit-board (sensor devkit node)
+#define ICON_FIRMWARE "\xEE\x93\xA5"  // U+E4E5 hard-drive-download (firmware page)
 
 lv_obj_t *make_badge(lv_obj_t *parent, const char *icon, lv_color_t bg, lv_color_t fg);
 
@@ -213,6 +234,10 @@ void page_control_refresh(void);
 lv_obj_t *page_settings_build(lv_obj_t *parent);
 void page_settings_refresh(void);
 void page_settings_on_show(void);  // starts a WiFi scan; called on page entry
+
+lv_obj_t *page_update_build(lv_obj_t *parent);
+void page_update_refresh(void);
+void page_update_on_show(void);  // paint from live state on entry, not on the next tick
 
 // ---------------------------------------------------------------------------
 // Cross-module actions (ui.cpp)

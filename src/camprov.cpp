@@ -6,6 +6,7 @@
 #include "camprov.h"
 #include "sensornode.h"
 #include "thermal.h"
+#include "nodeota.h"
 #include "hlog.h"
 
 // Latest WiFi creds, mirrored from net.cpp. Read in the ESP-NOW recv callback,
@@ -108,18 +109,29 @@ static void send_channel(const uint8_t *dst) {
 // device that is not the pinned CAM, which is either a second camera nobody
 // mentioned or somebody asking this panel for the greenhouse WiFi password. Zero
 // is the normal reading and any other value is worth a look.
+//
+// The two node-protocol families (nodeproto.h) are counted the same way, and `nrep` is
+// the one to read when the update page shows nothing: a zero there with a healthy
+// `sensor` means the node is alive but its reports are not arriving, which is a
+// different fault from a node that is simply off. `ncmd` should never move. This panel
+// is the only thing that issues a NodeCmdMsg, so hearing one means a second commander
+// is in range - and a NODE_UPDATE names the server the node downloads from, so that is
+// a stranger who can hand this greenhouse's boards any image they like. It is counted
+// into `refused` for exactly that reason.
 static volatile uint32_t s_rx_total = 0, s_rx_sensor = 0, s_rx_thermal = 0;
 static volatile uint32_t s_rx_status = 0, s_rx_prov = 0, s_rx_odd = 0;
+static volatile uint32_t s_rx_nrep = 0, s_rx_ncmd = 0;
 static volatile int s_rx_odd_len = -1;
 void camprov_debug_tick(void) {
     static uint32_t s_print_ms = 0;
     if (millis() - s_print_ms < 4000) return;
     s_print_ms = millis();
-    hlogf("[espnow] rx=%lu sensor=%lu therm=%lu status=%lu prov=%lu "
+    hlogf("[espnow] rx=%lu sensor=%lu therm=%lu status=%lu prov=%lu nrep=%lu ncmd=%lu "
                   "refused=%lu odd=%lu(len=%d)\n",
                   (unsigned long)s_rx_total, (unsigned long)s_rx_sensor,
                   (unsigned long)s_rx_thermal, (unsigned long)s_rx_status,
-                  (unsigned long)s_rx_prov, (unsigned long)s_rx_refused,
+                  (unsigned long)s_rx_prov, (unsigned long)s_rx_nrep,
+                  (unsigned long)s_rx_ncmd, (unsigned long)s_rx_refused,
                   (unsigned long)s_rx_odd, s_rx_odd_len);
 }
 
@@ -195,6 +207,57 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
         return;
     }
 
+    // A report from the CAM or the sensor node about itself: identity, health, a log
+    // line, or where an update has got to. 192 bytes, which nodeproto.h static_asserts
+    // precisely so this comparison keeps meaning what it says.
+    //
+    // NOT pinned to either MAC, and that is deliberate. The pins above protect readings
+    // the panel acts on and credentials it hands out; this family carries neither. What it
+    // does carry is the identity of an unprovisioned board somebody has just powered on,
+    // which is exactly what a grower needs to see on the update page BEFORE it has earned
+    // a pin - and nodeota.cpp keys its own state on the role in the message, so a stranger
+    // can at worst make a row say something wrong, never make this panel install anything
+    // (the panel is what decides to update, and it only ever tells a node to fetch from the
+    // server address it already holds).
+    if (len == (int)sizeof(NodeRepMsg)) {
+        NodeRepMsg m;
+        memcpy(&m, data, sizeof(m));   // via a local: `data` carries no alignment promise
+        if (m.magic != NODE_MAGIC) {
+            // Counted, never dropped in silence. 192 bytes is this family's length and no
+            // other family's, so a wrong magic here is a node built against a different
+            // NODE_MAGIC or a struct that grew on one side only - and both of those look
+            // from the panel like "the update button does nothing", with no trace anywhere
+            // else in the system. Into refused rather than odd because odd means "a length
+            // this air has no family for", which 192 is not.
+            s_rx_refused++;
+            return;
+        }
+        s_rx_nrep++;
+        nodeota_on_recv(&m, info->src_addr);
+        return;
+    }
+
+    // A NodeCmdMsg (232 bytes), which this panel did not send - it is the only thing on
+    // this air that issues them. Dropped, because a panel has no use for a command; but
+    // counted, because a second commander in range can point either node's firmware
+    // download at any server it likes. See the note above the counters.
+    //
+    // The magic is read out of `data` rather than through a 232-byte stack copy of a
+    // struct nothing here goes on to use. This runs on the WiFi task for every packet the
+    // radio delivers, and the four bytes are all that is needed to tell the family apart
+    // from a stranger that happens to be the same length.
+    if (len == (int)sizeof(NodeCmdMsg)) {
+        uint32_t magic = 0;
+        memcpy(&magic, data, sizeof(magic));
+        if (magic != NODE_MAGIC) {
+            s_rx_refused++;
+            return;
+        }
+        s_rx_ncmd++;
+        s_rx_refused++;
+        return;
+    }
+
     // Health beacon from the CAM (distinct size from a provisioning request).
     if (len == (int)sizeof(StatusMsg)) {
         s_rx_status++;
@@ -255,6 +318,27 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     // Who is asking. See the note on s_cam_mac: this is the whole protection the
     // reply has, because its contents cannot be protected without changing the CAM.
     static const uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
+    // The sensor node asks too now, and its request must not be judged against the CAM's
+    // pin. It broadcasts a PROV_REQUEST every ~15s while it holds no credentials - it needs
+    // them only to download its own firmware image, see nodeota.h - and in a live greenhouse
+    // the CAM has long since claimed s_cam_mac, so the block below would refuse the node for
+    // as long as the CAM keeps beaconing and file it under `refused`, where it reads as an
+    // intruder rather than as the board this panel is supposed to be provisioning.
+    //
+    // Admitted against the node's OWN pin, which a PROV_REQUEST cannot establish: only
+    // SensorMsg ever sets s_node_mac (see pin_admits), and the node broadcasts telemetry from
+    // boot without needing WiFi for it, so its pin is already held by the time it first asks.
+    // Nothing new can talk its way into a reply here - the widening is to one MAC that has
+    // already proved itself the telemetry source, not to anyone who sends twelve bytes.
+    //
+    // Returning before the CAM logic also closes a case that predates this: a node request
+    // arriving before the CAM had ever beaconed would have claimed s_cam_mac for the node and
+    // left the real CAM refused until PROV_REPIN_MS ran out.
+    if (memcmp(s_node_mac, zero, 6) != 0 &&
+        memcmp(s_node_mac, info->src_addr, 6) == 0) {
+        send_reply(info->src_addr);
+        return;
+    }
     bool pinned = memcmp(s_cam_mac, zero, 6) != 0;
     bool same   = pinned && memcmp(s_cam_mac, info->src_addr, 6) == 0;
     // Silence measured on s_cam_last_ms, which only a StatusMsg from the pinned
@@ -302,6 +386,32 @@ void camprov_push_to_cam(const char *ssid, const char *pass) {
         send_reply(s_cam_mac);
         delay(30);
     }
+}
+
+void camprov_push_to_node(const char *ssid, const char *pass) {
+    camprov_set_credentials(ssid, pass);   // cache the new creds first
+    static const uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
+    if (memcmp(s_node_mac, zero, 6) == 0) return;  // never heard from the node
+    // Repeated for the same reason as the CAM's push: the caller is about to take the
+    // radio off this channel, and a unicast to a peer that is no longer sharing one
+    // simply never happens. The node parks on the channel send_channel() told it about,
+    // so all three land or none of them do - the repeat buys robustness against a single
+    // lost action frame, not against the channel change itself.
+    for (int i = 0; i < 3; i++) {
+        send_reply(s_node_mac);
+        delay(30);
+    }
+}
+
+void camprov_reprovision_node(void) {
+    static const uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
+    if (memcmp(s_node_mac, zero, 6) == 0) return;
+    // One send and no delay(), unlike the push above: this runs on the press of the
+    // update button, on the LVGL task, with the radio staying exactly where it is. Three
+    // sends 30ms apart would be 90ms of stalled UI bought for nothing - the node is
+    // reachable now or it is not, and it re-solicits on its own every ~15s if it still
+    // has no credentials by the time the download starts.
+    send_reply(s_node_mac);
 }
 
 bool camprov_cam_online(void) {

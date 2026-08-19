@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
-from .schema import Prescription, Telemetry
+from .schema import NodeLogLine, Prescription, Telemetry
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,22 @@ PRUNE_EVERY = 200
 FRAME_KEEP = 8
 
 FRAME_KINDS = ("rgb", "thermal")
+
+# Node log lines are the shortest-lived rows in this file, and they get their own cutoff rather
+# than telemetry's fortnight because they are written at a completely different rate: a node with
+# verbose logging on emits lines as fast as it has something to say, where telemetry is one row
+# per poll. Three days is long enough to read back what a node said during last night's failed
+# update and short enough that a "log on" somebody forgot to turn off cannot quietly fill the
+# volume the database and the firmware images share.
+NODE_LOG_TTL_S = 3 * 24 * 3600
+
+# What GET /v1/nodelog hands back when it is not told, and the most it will hand back when it is
+# asked for more. The ceiling is enforced in recent_node_logs rather than in the route, so a
+# second caller cannot ask for the whole table by skipping the clamp: these rows are read into a
+# JSON array in memory, and "give me everything" against three days of a chatty node is the one
+# request that turns a debugging aid into an outage.
+NODE_LOG_READ_DEFAULT = 200
+NODE_LOG_READ_MAX = 1000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
@@ -134,8 +150,49 @@ CREATE TABLE IF NOT EXISTS device_flags (
     -- update_mode is 0; see take_update_mode for why it is cleared a beat later than its
     -- arming is. Defaulting to 0 is also what makes the migration below correct: an arming
     -- written before this column existed was a push request, and 0 is what a push looks like.
-    firmware_pull INTEGER NOT NULL DEFAULT 0
+    firmware_pull INTEGER NOT NULL DEFAULT 0,
+    -- Arm a firmware update on one of the two nodes, delivered on the panel's next poll and
+    -- cleared as it is delivered, exactly like update_mode above. One column per role rather
+    -- than one column holding a role name, because the two are independently armable and an
+    -- operator updating both boards would otherwise have the second POST overwrite the first.
+    --
+    -- Unlike update_mode these do NOT stand the panel down - it keeps polling on its normal
+    -- cadence - so the take-and-clear in take_node_pull is load-bearing in a way it is not for
+    -- the panel's own flags, where main.cpp stops calling the poll at all. A node pull that
+    -- failed to clear would re-arm the node's update on every single poll, forever.
+    node_pull_cam  INTEGER NOT NULL DEFAULT 0,
+    node_pull_node INTEGER NOT NULL DEFAULT 0
 );
+
+-- One line a node said, as the panel heard it. The two nodes have no console anybody can reach:
+-- the ESP32-CAM's UART is inside a sealed housing on a pole, and the sensor node's is a
+-- DevKit's, on a bench nobody is standing at when the thing misbehaves. So a line travels node
+-- -> panel over ESP-NOW (NodeRepMsg, NODE_LOG) and the panel POSTs batches of them here. Nodes
+-- never talk to this server except to fetch an image.
+--
+-- recv_ts is not optional and is the only column this table can be ordered by. `ms` is NOT the
+-- node's clock - NodeRepMsg has no millisecond field, so the panel stamps its own millis() when
+-- the line arrives over ESP-NOW (src/nodelog.cpp:68). It is stored because it is the only thing
+-- that orders lines *within* one batch, where recv_ts is whole seconds and stamped once for all
+-- of them. It cannot be the sort key: it is one panel's uptime, it wraps at ~49.7 days, and it
+-- says nothing at all about the node reboot that ends every successful update.
+--
+-- `device` is the panel that forwarded the batch, not the node that said it: the node has no
+-- identity on this server (it never authenticates, never polls, and its MAC is known only to
+-- the panel), so `role` is what says which board a line came off.
+CREATE TABLE IF NOT EXISTS node_logs (
+    id      INTEGER PRIMARY KEY,
+    device  TEXT    NOT NULL,
+    role    TEXT    NOT NULL,
+    ms      INTEGER NOT NULL,
+    recv_ts INTEGER NOT NULL,
+    text    TEXT    NOT NULL
+);
+-- Newest-first, optionally for one role, is the only query this table has. id descending IS
+-- newest-first - the rowid is monotonic and recv_ts is not unique across a batch - so the index
+-- exists only to keep the role filter off a full scan.
+CREATE INDEX IF NOT EXISTS ix_node_logs_role_id
+    ON node_logs (role, id);
 """
 
 _TELEMETRY_COLS = (
@@ -200,14 +257,18 @@ _TELEMETRY_ADDED_COLS = (
 )
 
 # Same reconciliation, for the table the operator writes. device_flags shipped with two columns,
-# gained armed_ts, and then gained firmware_pull, so a database sitting at either of the earlier
-# shapes needs the missing ones added rather than silently going without an expiry or without a
-# way to say which kind of update was asked for. Both defaults restate what an older row already
-# meant: 0 for a never-armed expiry, and 0 for "this was a push request", which every arming
-# written before the column existed was.
+# gained armed_ts, then firmware_pull, then the two node_pull flags, so a database sitting at any
+# of the earlier shapes needs the missing ones added rather than silently going without an expiry,
+# without a way to say which kind of update was asked for, or without a way to reach the nodes at
+# all. Every default restates what an older row already meant: 0 for a never-armed expiry, 0 for
+# "this was a push request", which every arming written before that column existed was, and 0 for
+# "no node update was asked for", which is true of every arming written before there were nodes
+# to ask about.
 _DEVICE_FLAGS_ADDED_COLS = (
     ("armed_ts", "INTEGER NOT NULL DEFAULT 0"),
     ("firmware_pull", "INTEGER NOT NULL DEFAULT 0"),
+    ("node_pull_cam", "INTEGER NOT NULL DEFAULT 0"),
+    ("node_pull_node", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Every table with columns added after it was first written, so _migrate walks one list instead of
@@ -758,6 +819,139 @@ def take_update_mode(device: str) -> tuple[bool, bool]:
         return False, False
     return True, bool(row["firmware_pull"])
 
+
+# Which node roles a panel can be told to update. "panel" is deliberately absent: the panel
+# updates itself through update_mode/firmware_pull and fwpull.cpp, and a panel arming a node
+# update against itself would be a device asked to watch its own reboot.
+NODE_PULL_COLS = {"cam": "node_pull_cam", "node": "node_pull_node"}
+
+
+def set_node_pull(device: str, role: str) -> None:
+    """Arm "tell node `role` to update" on this panel's next poll.
+
+    The panel is the only thing on this server's side of the greenhouse that can reach a node -
+    the nodes speak ESP-NOW and have no route to here at all - so an operator arming a node
+    update is really arming a message the panel will pass on. Same rail as set_update_mode for
+    that reason and no other: write a flag, let the next poll carry it, never reach out.
+
+    Re-arming the same role is idempotent rather than cumulative, and arming the other role does
+    not disturb this one - the two are separate columns because "update both boards" is two
+    POSTs and the second must not cancel the first.
+
+    Deliberately does NOT touch update_mode. A node update leaves the panel running: it is the
+    board that relays the command, receives the node's progress reports over ESP-NOW and draws
+    them, so standing it down would blind the operator to the update they just asked for. See
+    take_node_pull for what main.py does when both are armed at once.
+    """
+    col = NODE_PULL_COLS[role]
+    _conn().execute(
+        f"INSERT INTO device_flags (device, {col}) VALUES (?,1)"
+        f" ON CONFLICT(device) DO UPDATE SET {col}=1",
+        (device,),
+    )
+
+
+def take_node_pull(device: str) -> tuple[bool, bool]:
+    """(cam, node) once per arming, (False, False) every time after it.
+
+    One UPDATE per role, each its own one-shot: the WHERE names the value it is about to
+    overwrite, so exactly one caller can see rowcount 1 and every caller after it sees 0. Two
+    polls arriving together is ordinary - the panel retries whenever a response is lost - and
+    this is what stops both of them being handed the same arming.
+
+    Written as rowcount rather than with RETURNING because RETURNING hands back the row as it is
+    AFTER the update, so a statement that cleared the column and returned it would return the
+    zero it had just written. take_update_mode above works around that by clearing one column and
+    returning another; here there is no second column to lean on, and "did this statement change
+    a row" is the whole question anyway.
+
+    The clearing is load-bearing in a way the panel's own flags are not, and this is the note to
+    read before changing anything here. update_mode takes the panel over: main.cpp stops polling,
+    so a flag that failed to clear could only fire once more, after the reboot. A node pull leaves
+    the panel polling on its normal cadence, so a flag that failed to clear would arm the node's
+    update again on every poll for as long as the greenhouse runs - a camera that reboots itself
+    every sixty seconds and no obvious reason why.
+
+    No expiry, unlike take_update_mode, and the difference is the cost of acting late. A stale
+    update_mode takes the only screen in the greenhouse into a five-minute takeover with no exit
+    but a reboot. A stale node pull tells a node to check for an image; if it is already running
+    that image it says so and stops (it compares elf_sha256 before downloading anything), and if
+    it is not, it installs the image an operator published and asked for. The worst case is a
+    camera off the wall for the length of a download, which is the same thing the operator was
+    asking for, just later - not worth a column and a second TTL to prevent.
+    """
+    conn = _conn()
+    cam = conn.execute(
+        "UPDATE device_flags SET node_pull_cam=0 WHERE device=? AND node_pull_cam=1",
+        (device,),
+    ).rowcount == 1
+    node = conn.execute(
+        "UPDATE device_flags SET node_pull_node=0 WHERE device=? AND node_pull_node=1",
+        (device,),
+    ).rowcount == 1
+    return cam, node
+
+
+# --------------------------------------------------------------------------
+# Node logs
+# --------------------------------------------------------------------------
+
+
+def save_node_logs(device: str, lines: list[NodeLogLine], recv_ts: int) -> int:
+    """Store one POSTed batch and say how many rows it became.
+
+    One recv_ts for the whole batch rather than one per row, because that is what is true: the
+    panel buffers lines it heard over ESP-NOW and posts them together, so the server learned all
+    of them at the same instant and stamping each row with its own `time.time()` would invent a
+    resolution the transport does not have. Ordering inside a batch is the insert order, which
+    the rowid preserves.
+
+    executemany rather than a loop of execute: the connection is in autocommit, so a loop would
+    take and release the write lock once per line, and a verbose node's batch is tens of lines.
+    """
+    rows = [(device, ln.role, int(ln.ms), int(recv_ts), ln.text) for ln in lines]
+    if not rows:
+        return 0
+    _conn().executemany(
+        "INSERT INTO node_logs (device, role, ms, recv_ts, text) VALUES (?,?,?,?,?)", rows
+    )
+    _maybe_prune()
+    return len(rows)
+
+
+def recent_node_logs(role: Optional[str] = None, limit: int = NODE_LOG_READ_DEFAULT) -> list[dict]:
+    """The newest rows, newest first, optionally for one role.
+
+    Newest first rather than chronological, unlike telemetry_since: nobody integrates these, they
+    are read by a human who wants to know what a node said most recently, and a reader that has
+    to scroll to the bottom to find it is a reader that will paste a limit of 5000 instead.
+
+    `role` is matched literally and is NOT checked against the three known names, which is the
+    opposite of what the firmware endpoints do with the same word - deliberately. There, an
+    unknown role must be refused because serving the wrong image bricks a board. Here it is a
+    filter over rows that already exist, an unknown one matches nothing, and refusing it would
+    make the one role that matters unqueryable: nodeproto_role_name() answers "?" for a role byte
+    it does not recognise, so "?" is exactly what a version-skewed node's lines are filed under
+    and exactly what somebody debugging that skew needs to ask for.
+
+    The limit is clamped here rather than at the route, so no caller can ask for the whole table.
+    """
+    n = max(1, min(int(limit), NODE_LOG_READ_MAX))
+    conn = _conn()
+    if role is None:
+        rows = conn.execute(
+            "SELECT device, role, ms, recv_ts, text FROM node_logs ORDER BY id DESC LIMIT ?",
+            (n,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT device, role, ms, recv_ts, text FROM node_logs WHERE role=?"
+            " ORDER BY id DESC LIMIT ?",
+            (role, n),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # --------------------------------------------------------------------------
 # Retention
 # --------------------------------------------------------------------------
@@ -779,13 +973,20 @@ def _prune_old(conn: sqlite3.Connection) -> None:
     # Deliberately no VACUUM: it takes an exclusive lock and the freed pages get
     # reused by the next fortnight of telemetry anyway.
     conn.execute("DELETE FROM llm_calls WHERE ts < ?", (cutoff,))
+    # Node logs on their own, much shorter, cutoff - see NODE_LOG_TTL_S. Pruned here rather than
+    # in save_node_logs so that a node which went quiet after filling the table still has its
+    # rows expire: this runs off the shared write counter, which every other table's inserts
+    # turn as well.
+    conn.execute("DELETE FROM node_logs WHERE recv_ts < ?",
+                 (int(time.time()) - NODE_LOG_TTL_S,))
 
 
 def stats() -> dict[str, Any]:
     """Row counts and disk footprint, for a health endpoint or a look around."""
     conn = _conn()
     out: dict[str, Any] = {"path": str(db_path())}
-    for table in ("telemetry", "prescriptions", "frames", "llm_calls", "device_flags"):
+    for table in ("telemetry", "prescriptions", "frames", "llm_calls", "device_flags",
+                  "node_logs"):
         out[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     # The -wal sidecar holds everything written since the last checkpoint, so
     # the main file alone reads as 4KB on a busy database and makes the disk

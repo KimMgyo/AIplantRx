@@ -26,7 +26,7 @@ bool g_fan = false, g_heater = false, g_mist = false;
 bool g_pumpA = false, g_pumpB = false, g_pumpC = false, g_led = false;
 int g_fan_speed = 65;
 
-static lv_obj_t *s_pages[4];
+static lv_obj_t *s_pages[PAGE_COUNT];
 
 // ---------------------------------------------------------------------------
 // Persistence (NVS)
@@ -192,7 +192,7 @@ uint32_t ui_allstop_count(void) { return s_allstops; }
 
 // Visibility only — no page-entry side effects (used by the theme rebuild).
 static void show_page(Page p) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < PAGE_COUNT; i++) {
         lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_clear_flag(s_pages[p], LV_OBJ_FLAG_HIDDEN);
@@ -212,6 +212,14 @@ void ui_set_page(Page p) {
         net_scan_abort();
         if (p == PAGE_MONITOR) {
             page_monitor_on_show();  // paint a frame now, not on the next 33ms tick
+        } else if (p == PAGE_UPDATE) {
+            // The one page whose every row is a fact about this boot rather than a
+            // reading that arrives: nothing here changes while the page is hidden, so
+            // its 1Hz timer skips a hidden page entirely and entry is the only moment
+            // that has to paint. Reached from settings, so the abort above is also what
+            // stops that page's sweep from racing a pull started here - which is the
+            // race settings_timer_cb had to be taught to lose (page_settings.cpp).
+            page_update_on_show();
         }
     }
 }
@@ -317,12 +325,13 @@ static void ui_build(lv_obj_t *scr) {
     s_pages[PAGE_MONITOR] = page_monitor_build(content);
     s_pages[PAGE_CONTROL] = page_control_build(content);
     s_pages[PAGE_SETTINGS] = page_settings_build(content);
+    s_pages[PAGE_UPDATE] = page_update_build(content);
 
     menu_build(scr);  // last: dropdown must draw above page content
 
-    // Exactly one page may be visible. Without this the four pages stay unhidden
-    // and the flex row lays them out side by side, so the three inactive ones sit
-    // off-screen to the right (the monitor page at x=800..1599 on an 800px panel)
+    // Exactly one page may be visible. Without this every page stays unhidden and
+    // the flex row lays them out side by side, so the inactive ones sit off-screen
+    // to the right (the monitor page at x=800..1599 on an 800px panel)
     // instead of being hidden. They still tick: the camera page kept decoding JPEG
     // and upscaling both canvases into pixels LVGL then discarded, because
     // lv_obj_invalidate() drops an invalidation for an off-screen object.
@@ -333,6 +342,7 @@ static void ui_refresh_all(void) {
     page_monitor_refresh_sensors();
     ui_devices_refresh();
     page_settings_refresh();
+    page_update_refresh();
     topbar_refresh();
 }
 

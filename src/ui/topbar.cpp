@@ -14,9 +14,12 @@ static lv_obj_t *w_pill_icon;  // MDI glyph label; text set to the active page
 static lv_obj_t *w_chevron;
 static lv_obj_t *w_menu_backdrop, *w_menu_box;
 static lv_obj_t *w_title_dot;
-static lv_obj_t *w_menu_item_auto, *w_menu_item_monitor, *w_menu_item_control, *w_menu_item_settings;
-static lv_obj_t *w_menu_label_auto, *w_menu_label_monitor, *w_menu_label_control, *w_menu_label_settings;
-static lv_obj_t *w_menu_icon_auto, *w_menu_icon_monitor, *w_menu_icon_control, *w_menu_icon_settings;
+static lv_obj_t *w_menu_item_auto, *w_menu_item_monitor, *w_menu_item_control, *w_menu_item_settings,
+    *w_menu_item_update;
+static lv_obj_t *w_menu_label_auto, *w_menu_label_monitor, *w_menu_label_control, *w_menu_label_settings,
+    *w_menu_label_update;
+static lv_obj_t *w_menu_icon_auto, *w_menu_icon_monitor, *w_menu_icon_control, *w_menu_icon_settings,
+    *w_menu_icon_update;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -36,6 +39,7 @@ static void on_select_auto(lv_event_t *e) { ui_set_page(PAGE_AUTO); }
 static void on_select_monitor(lv_event_t *e) { ui_set_page(PAGE_MONITOR); }
 static void on_select_control(lv_event_t *e) { ui_set_page(PAGE_CONTROL); }
 static void on_select_settings(lv_event_t *e) { ui_set_page(PAGE_SETTINGS); }
+static void on_select_update(lv_event_t *e) { ui_set_page(PAGE_UPDATE); }
 
 // ---------------------------------------------------------------------------
 // Refresh
@@ -55,14 +59,22 @@ void topbar_refresh(void) {
     // for open (user-tuned).
     lv_obj_set_style_translate_y(w_chevron, s_menu_open ? 0 : -3, 0);
 
+    // The pill and the glyph agree on every page, this one included. They used to
+    // disagree here: 펌웨어 in words over the 설정 glyph, because the firmware page
+    // hung off settings and no lucide.ttf in this tree could mint a mark for it.
+    // Both halves of that are gone - the page is its own dropdown entry, and
+    // tools/lucide.ttf regenerates font_icons / font_icons_sm (see their Opts
+    // lines), so U+E4E5 costs one glyph in two fonts and is drawn in two places.
     const char *pill_txt = (g_page == PAGE_AUTO)      ? "AI-RX"
                            : (g_page == PAGE_MONITOR) ? "모니터링"
                            : (g_page == PAGE_CONTROL) ? "컨트롤"
+                           : (g_page == PAGE_UPDATE)  ? "펌웨어"
                                                       : "설정";
     lv_label_set_text(w_pill_label, pill_txt);
     lv_label_set_text(w_pill_icon, (g_page == PAGE_AUTO)      ? ICON_AUTO
                                    : (g_page == PAGE_MONITOR) ? ICON_MONITOR
                                    : (g_page == PAGE_CONTROL) ? ICON_CONTROL
+                                   : (g_page == PAGE_UPDATE)  ? ICON_FIRMWARE
                                                               : ICON_SETTINGS);
 
     // The dot beside the product name is the one global "is the AI driving?"
@@ -96,11 +108,24 @@ void topbar_refresh(void) {
     lv_obj_set_style_text_color(w_menu_label_control, is_ctl ? C_BLUE : C_INACTIVE_MENU, 0);
     lv_obj_set_style_text_color(w_menu_icon_control, is_ctl ? C_BLUE : C_INACTIVE_MENU, 0);
 
+    // Amber twice, and deliberately. The palette's note calls the scheme - green
+    // acts, blue measures, amber configures, red stops - and firmware is the second
+    // thing on this panel that configures rather than reports. The two greens that
+    // note warns about were a real defect because 모니터링 and AI-RX are peers a
+    // grower switches between; 설정 and 펌웨어 are one branch, only ever one of them
+    // is lit, and giving the leaf a fifth hue would have said "new family" about a
+    // page that is the same family.
     bool is_set = (g_page == PAGE_SETTINGS);
     lv_obj_set_style_bg_color(w_menu_item_settings, is_set ? C_AMBER_TINT : C_SCREEN_BG, 0);
     lv_obj_set_style_bg_opa(w_menu_item_settings, is_set ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     lv_obj_set_style_text_color(w_menu_label_settings, is_set ? C_AMBER : C_INACTIVE_MENU, 0);
     lv_obj_set_style_text_color(w_menu_icon_settings, is_set ? C_AMBER : C_INACTIVE_MENU, 0);
+
+    bool is_upd = (g_page == PAGE_UPDATE);
+    lv_obj_set_style_bg_color(w_menu_item_update, is_upd ? C_AMBER_TINT : C_SCREEN_BG, 0);
+    lv_obj_set_style_bg_opa(w_menu_item_update, is_upd ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(w_menu_label_update, is_upd ? C_AMBER : C_INACTIVE_MENU, 0);
+    lv_obj_set_style_text_color(w_menu_icon_update, is_upd ? C_AMBER : C_INACTIVE_MENU, 0);
 }
 
 // ui_set_page() closes the dropdown on page change.
@@ -318,4 +343,12 @@ void menu_build(lv_obj_t *parent) {
 
     w_menu_item_settings = build_menu_item(w_menu_box, &w_menu_icon_settings, &w_menu_label_settings, "설정", ICON_SETTINGS);
     lv_obj_add_event_cb(w_menu_item_settings, on_select_settings, LV_EVENT_CLICKED, NULL);
+
+    // Last, and below 설정 rather than above it: the dropdown reads top to bottom as
+    // how often a grower wants the page, and this is the only entry that is not part
+    // of running a greenhouse. Bottom of the list is also the furthest the layout can
+    // put it from 모니터링, which is the mis-tap the old design note cared about and
+    // the only part of that argument the move does not settle by itself.
+    w_menu_item_update = build_menu_item(w_menu_box, &w_menu_icon_update, &w_menu_label_update, "펌웨어", ICON_FIRMWARE);
+    lv_obj_add_event_cb(w_menu_item_update, on_select_update, LV_EVENT_CLICKED, NULL);
 }
