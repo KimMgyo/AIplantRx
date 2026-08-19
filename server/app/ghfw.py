@@ -255,4 +255,8 @@ def start() -> None:
         return
     interval = max(POLL_S, MIN_POLL_S)
     threading.Thread(target=_loop, args=(interval,), name="ghfw", daemon=True).start()
-    log.info("ghfw: watching %s for %s every %ds", REPO, ASSET_NAME, interval)
+    # Names the three assets it will look for rather than a count, because the one failure this
+    # line is read during is "the release has an asset and the server still says it does not",
+    # and the answer to that is always a spelling.
+    log.info("ghfw: watching %s for %s every %ds", REPO,
+             ", ".join(_asset_name(r) for r in firmware.ROLES), interval)

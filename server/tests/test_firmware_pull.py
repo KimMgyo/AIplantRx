@@ -488,6 +488,90 @@ def test_the_asset_names_are_firmware_pys_own():
     return "asset names are firmware.py's file names, not a second spelling"
 
 
+def _armed_start(poll_s: int):
+    """Run start() with the thread stubbed, and hand back what it would have launched.
+
+    Stubbed rather than real because start() is being called for its own sake here: a live
+    poller would reach GitHub from a unit test, and the thing under test is the handful of lines
+    that run BEFORE the thread does any work.
+    """
+    launched = {}
+
+    class _Thread:
+        def __init__(self, target=None, args=(), name=None, daemon=None):
+            launched.update(target=target, args=args, name=name, daemon=daemon)
+
+        def start(self):
+            launched["started"] = True
+
+    keep = (ghfw.threading.Thread, ghfw.POLL_S)
+    ghfw.threading.Thread = _Thread
+    ghfw.POLL_S = poll_s
+    try:
+        ghfw.start()
+    finally:
+        ghfw.threading.Thread, ghfw.POLL_S = keep
+    return launched
+
+
+def test_start_arms_the_poller_without_raising():
+    """The line that took the whole server down, and why it needed a test of its own.
+
+    start() was left holding a reference to a module constant that had been replaced by
+    _asset_name(role) when the puller grew from one image to three. Nothing here executed it:
+    every other test in this file calls pull_once() or _loop() directly, and the one that
+    mentions POLL_S only reads MIN_POLL_S. So the suite was green, the deployment crash-looped
+    on startup, and the symptom was a 502 with no server-side log anybody was watching.
+
+    A NameError on a path no test walks is what a linter is for, and this project deliberately
+    ships no dev dependencies in the image that serves the greenhouse. So the path gets walked.
+    """
+    launched = _armed_start(600)
+    assert launched.get("started") is True, launched
+    assert launched["target"] is ghfw._loop, launched["target"]
+    assert launched["daemon"] is True, launched
+    # The floor, applied where it is actually applied rather than only asserted about.
+    assert _armed_start(5)["args"] == (ghfw.MIN_POLL_S,), "the interval floor was not applied"
+    assert _armed_start(600)["args"] == (600,), "a legal interval was not passed through"
+    return "start() launches _loop with a floored interval and no NameError"
+
+
+def test_the_apps_startup_hook_runs_with_the_poller_enabled():
+    """The same failure from the outside: whether uvicorn would have come up at all.
+
+    main._startup() is what Dokploy exercises and what was broken. An exception in it is not a
+    degraded feature, it is "Application startup failed. Exiting." and a container that never
+    serves a byte - which is exactly what happened, with the only evidence a 502 nobody was
+    watching a server-side log for.
+
+    Called directly rather than through TestClient's lifespan. The context-manager form runs the
+    same hook but keeps a portal thread and a scheduler alive for the length of the block, which
+    turns a unit test into something that has to be torn down carefully; this is the one function
+    that matters and it takes no arguments. POLL_S is above zero because the disabled branch
+    returns before reaching anything interesting.
+    """
+    launched = {}
+
+    class _Thread:
+        def __init__(self, **kw):
+            launched.update(kw)
+
+        def start(self):
+            launched["started"] = True
+
+    from app import main
+
+    keep = (ghfw.threading.Thread, ghfw.POLL_S)
+    ghfw.threading.Thread = _Thread
+    ghfw.POLL_S = 900
+    try:
+        main._startup()
+    finally:
+        ghfw.threading.Thread, ghfw.POLL_S = keep
+    assert launched.get("started") is True, "startup completed without arming the poller"
+    return "the app's startup hook runs with the poller enabled"
+
+
 if __name__ == "__main__":
     for fn in (test_no_release_leaves_the_images_alone,
                test_release_without_the_asset_is_not_a_publish,
@@ -504,6 +588,8 @@ if __name__ == "__main__":
                test_a_failed_download_does_not_remember_the_etag,
                test_the_loop_survives_a_failing_poll,
                test_the_poll_interval_has_a_floor,
-               test_the_asset_names_are_firmware_pys_own):
+               test_the_asset_names_are_firmware_pys_own,
+               test_start_arms_the_poller_without_raising,
+               test_the_apps_startup_hook_runs_with_the_poller_enabled):
         print("%-52s %s" % (fn.__name__, fn()))
     print("OK")
