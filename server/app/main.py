@@ -48,7 +48,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import brain, derive, firmware, ghfw, plantnet, render, scheduler, store
+from . import admin, brain, derive, firmware, ghfw, plantnet, render, scheduler, store
 from .schema import (Control, Display, FirmwareManifest, FrameAck,
                      Identification, NodeLogBatch, NodeLogRow, Prescription,
                      Telemetry)
@@ -693,6 +693,13 @@ async def telemetry(t: Telemetry) -> Prescription:
     reboot, which is exactly when somebody is in a position to watch it.
     """
     rx = await _prescribe(t)
+    # Stored before any of the one-shot arming below, and outside _prescribe, because it is the
+    # only thing on this route that is a fact rather than a decision: what three boards are
+    # running. Absent on firmware that predates the field, which is why it is a test and not an
+    # assumption - a panel that cannot say leaves the operator page reading 모름 rather than
+    # claiming a version nobody reported.
+    if t.images:
+        store.save_device_fw(t.device, t.images, scheduler.now())
     armed, pull = store.take_update_mode(t.device)
     if armed:
         log.info("update mode: handing the flag to %s (%s)", t.device,
@@ -980,3 +987,10 @@ async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(v1)
+# Mounted after v1 so the auth dependency below is the one already declared on it, and split the
+# way admin.py's two routers are: the state route joins /v1 behind the same bearer as every other
+# data route, and the page joins the app open, because it is a constant with nothing in it. Both
+# decisions are visible here rather than in a decorator in that file, which is where somebody
+# asking "what on this server does not need the secret" will look.
+app.include_router(admin.state_router, prefix="/v1", dependencies=[Depends(auth)])
+app.include_router(admin.page_router)

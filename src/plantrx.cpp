@@ -42,7 +42,9 @@
 // row. The worst any failure does is move RxLink and let the status bar say so.
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_app_desc.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1241,6 +1243,63 @@ static bool build_request(const char *device) {
         badd(&b, ",\"crash_task\":\"%s\"", health_crash_task());
         badd(&b, ",\"crash_pc\":\"%s\"", health_crash_pc());
         badd(&b, ",\"crash_bt\":\"%s\"", health_crash_bt());
+    }
+    bend(&b, '}');
+    badd(&b, ",");
+    // WHAT THREE BOARDS ARE RUNNING, and why this is back after being deleted.
+    //
+    // A bare "fw" string used to sit at the end of this body as an unconditional terminator (see
+    // the note above rx_id). It was removed because nothing read it: a version stamp the server
+    // could not act on is a field that only makes the next reader wonder what it is for. What
+    // changed is that there is now something to act on - server/app/admin.py draws an operator
+    // page that compares each board against the image published for it, and the comparison needs
+    // the left-hand side. This is that, and it is the only way the server can ever have it: the
+    // two nodes have no identity on it, no route to it and no shared secret, and are not getting
+    // any - they are reachable only from here, over ESP-NOW.
+    //
+    // Sixteen hex digits, because that is all a node can say: NodeRepMsg carries elf_sha[8]
+    // (shared/nodeproto.h), so the panel prints its own to the same width and the three rows are
+    // one identity in one format rather than one 64-digit hash beside two 16-digit prefixes.
+    //
+    // A node appears only once it has reported. Absent and "heard from, reporting nothing" are
+    // different answers on an operator's screen, and zeros would claim the second when the truth
+    // is the first. can_ota is each board's own esp_ota_get_next_update_partition() verdict, so a
+    // partition table with no second app slot greys that board's button out for the same reason
+    // the panel's own firmware page greys it - never offer a press whose only outcome is failure.
+    //
+    // The key is "images" and NOT "fw", because that name is spent: the old string version stamp
+    // is still posted by any board that has not been reflashed, the server accepts and ignores it
+    // (server/tests/test_store_species.py pins that), and a dict arriving under the same name
+    // would 422 the poll of every panel still sending the string. See schema.Telemetry.images.
+    badd(&b, "\"images\":{");
+    const esp_app_desc_t *desc = esp_app_get_description();
+    badd(&b, "\"%s\":{", nodeproto_role_name(NODE_ROLE_PANEL));
+    badd(&b, "\"elf\":\"");
+    if (desc != NULL) {
+        for (int i = 0; i < 8; i++) badd(&b, "%02x", desc->app_elf_sha256[i]);
+    }
+    badd(&b, "\",");
+    badd(&b, "\"up_s\":%lu,", (unsigned long)(millis() / 1000));
+    badd(&b, "\"heap\":%lu,", (unsigned long)ESP.getFreeHeap());
+    badd(&b, "\"online\":true,");   // it is the board doing the reporting
+    badd(&b, "\"pending\":%s,", health_image_pending() ? "true" : "false");
+    badd(&b, "\"can_ota\":%s,",
+         esp_ota_get_next_update_partition(NULL) != NULL ? "true" : "false");
+    bend(&b, '}');
+    badd(&b, ",");
+    for (uint8_t role = NODE_ROLE_CAM; role < NODE_ROLE_COUNT; role++) {
+        NodeView v;
+        nodeota_view(role, &v);
+        if (!v.known) continue;
+        badd(&b, "\"%s\":{", nodeproto_role_name(role));
+        badd_str(&b, "elf", v.ver);   // the node authored this; badd_str escapes what it must
+        badd(&b, "\"up_s\":%lu,", (unsigned long)v.uptime_s);
+        badd(&b, "\"heap\":%lu,", (unsigned long)v.free_heap);
+        badd(&b, "\"online\":%s,", v.online ? "true" : "false");
+        badd(&b, "\"pending\":%s,", v.pending ? "true" : "false");
+        badd(&b, "\"can_ota\":%s,", v.can_ota ? "true" : "false");
+        bend(&b, '}');
+        badd(&b, ",");
     }
     bend(&b, '}');
     badd(&b, ",");

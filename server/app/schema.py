@@ -118,6 +118,43 @@ class DeviceSpecies(BaseModel):
     conf_pct: int = 0  # plantid_score() as a whole percent, 0 = not reported
 
 
+class FirmwareState(BaseModel):
+    """What one board is running, as the panel sees it - the operator view's whole input.
+
+    The panel is the only board on this server's side of the greenhouse that can answer this
+    question for all three: it knows its own image out of esp_app_get_description(), and it
+    already holds the CAM's and the sensor node's in the NodeView it built from their ESP-NOW
+    reports (include/nodeota.h) to draw the update page. So the answer arrives on the poll that
+    is already happening, rather than needing the two nodes to acquire an identity, a route and
+    a shared secret on this server - which they have never had and are not getting.
+
+    `elf` is a PREFIX and never the whole hash: NodeRepMsg carries elf_sha[8] (shared/
+    nodeproto.h), so a node can say sixteen hex digits and no more, and the panel prints its own
+    to the same width so the three rows are one identity in one format. The published manifest
+    carries all 64. Anything comparing the two therefore compares on the prefix, and "" - which
+    is what a board that has never reported an image looks like - must never compare equal to
+    anything.
+
+    `online` defaults True because the reporting panel is by definition online; it is the two
+    nodes that can be stale, and NodeView.online is the aged flag that says so.
+
+    `pending` is the bootloader's verdict, not the download's: the image is installed and
+    running but unconfirmed, so a restart takes the board back to the old one. It is the one
+    field that turns "the update worked" into a question worth showing an operator.
+
+    `can_ota` is computed on each board from esp_ota_get_next_update_partition(), so a partition
+    table with no second app slot reports False here for the same reason the panel greys its own
+    button out - the update button must not offer a press whose only outcome is a failure.
+    """
+
+    elf: str = ""          # elf_sha256 prefix, lowercase hex, "" = unknown
+    up_s: int = 0
+    heap: int = 0
+    online: bool = True
+    pending: bool = False  # running an image not yet confirmed
+    can_ota: bool = False
+
+
 class Telemetry(BaseModel):
     device: str = Field(description="STA MAC, e.g. AA:BB:CC:DD:EE:FF")
     # millis(), not a clock. 0 is "not reported" rather than "just booted" - it
@@ -177,6 +214,32 @@ class Telemetry(BaseModel):
     # bands this names, so a device running an older prescription is not
     # credited with holding the current one's.
     rx_id: Optional[str] = None
+    # What each board in this greenhouse is running; see FirmwareState.
+    #
+    # Optional for the same reason `boot` above is: every panel in the field predates this
+    # field, and None is how the server tells "this poll came from a build that cannot report
+    # firmware state" from "it reported, and there is nothing to say". The operator view draws a
+    # device with no fw rows rather than a device claiming three boards at version "", which
+    # would be a lie about a board nobody has heard from.
+    #
+    # Keyed by a plain str and not by Literal["panel", "cam", "node"], which is the same
+    # judgment NodeLogLine.role already makes and for the same reason: nodeproto_role_name()
+    # answers "?" for a role byte it does not recognise, so a version-skewed node reports itself
+    # under a key this server has never heard of - and that skew is precisely what an operator
+    # opening this view is trying to see. A Literal would 422 the whole poll, throwing away the
+    # prescription and the two roles that ARE known in order to reject the one row that explains
+    # the problem.
+    #
+    # NOT called `fw`, and that name is unavailable rather than merely taken. An earlier firmware
+    # put a version STRING there - "smartfarm-s3/1.0" - and it was dropped from this contract
+    # once nothing read it, on the understanding that a board which has not been reflashed keeps
+    # sending it and the server keeps accepting and ignoring it. Pydantic ignores an extra key
+    # and would 422 a str where a dict is declared, so reusing the name would take every
+    # un-reflashed panel's poll down over a field this server never asked it for. That tolerance
+    # is pinned by tests/test_store_species.py; `images` is the name that does not collide with
+    # it, and it says the true thing anyway - which image each board is running, in the same
+    # vocabulary firmware.image_path() already uses for the published one.
+    images: Optional[dict[str, FirmwareState]] = None
 
 
 # --------------------------------------------------------------------------

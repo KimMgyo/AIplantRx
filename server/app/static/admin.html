@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>온실 보드 관리</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 12px;
+  font: 16px/1.5 -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+  background: #f4f5f7; color: #1c1e21;
+}
+/* One column on a phone, two once there is room. The operator reading this is holding a phone
+   an hour from the greenhouse; the desktop case is the luxury one. */
+main { display: grid; gap: 12px; grid-template-columns: 1fr; max-width: 900px; }
+@media (min-width: 720px) { main { grid-template-columns: 1fr 1fr; } }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 20px 0 8px; }
+header { max-width: 900px; margin-bottom: 12px; }
+#bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+#stat { color: #5b6169; }
+#stat.bad { color: #b3261e; font-weight: 600; }
+.card { background: #fff; border-radius: 10px; padding: 12px 14px; box-shadow: 0 1px 3px #0002; }
+.card h3 { font-size: 17px; margin: 0; display: flex; align-items: center; gap: 8px;
+           flex-wrap: wrap; }
+.mac { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; color: #5b6169;
+       word-break: break-all; }
+.rows { margin: 10px 0 0; }
+.row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: 15px; }
+.row dt { color: #5b6169; flex: none; }
+.row dd { margin: 0; text-align: right; font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+          word-break: break-all; }
+.badge { font-size: 13px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+.ok { background: #d7f0d9; color: #14602a; }
+.stale { background: #fde2c4; color: #8a4b06; }
+.warn { background: #fdd; color: #8a1210; }
+.mute { background: #e7e9ec; color: #4a5058; }
+/* 44px is the smallest target a thumb hits reliably, and the button is the reason this page
+   exists - it must not be the thing that is fiddly. */
+button {
+  min-height: 44px; padding: 0 16px; font-size: 16px; font-weight: 600;
+  border: 0; border-radius: 8px; background: #1a63d8; color: #fff;
+}
+button[disabled] { background: #d3d6da; color: #71777f; }
+#forget { min-height: 32px; padding: 0 10px; font-size: 13px; font-weight: 400;
+          background: #e7e9ec; color: #33383d; }
+.act { margin-top: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.why { font-size: 13px; color: #5b6169; margin: 6px 0 0; }
+.note { font-size: 13px; margin: 8px 0 0; padding: 8px 10px; border-radius: 8px;
+        background: #fff5e2; color: #6b4400; }
+ol#logs { list-style: none; margin: 0; padding: 0; max-width: 900px; }
+ol#logs li { background: #fff; border-radius: 8px; padding: 7px 10px; margin-bottom: 6px;
+             font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; word-break: break-word; }
+ol#logs .meta { color: #5b6169; }
+.empty { color: #5b6169; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>온실 보드 관리</h1>
+  <div id="bar"><span id="stat">불러오는 중…</span><button id="forget">토큰 지우기</button></div>
+</header>
+<main id="cards"></main>
+<h2>노드 로그</h2>
+<ol id="logs"></ol>
+<script>
+"use strict";
+var POLL_MS = 5000;
+var KEY = "plantrx_token";
+// The three boards, titled the way the panel's own 업데이트 page titles them (src/ui/page_update.cpp
+// dev_title), so an operator who has read one screen recognises the other.
+var TITLE = { panel: "스크린", cam: "카메라 노드", node: "센서 노드" };
+// Which device_flags column says "an update is armed for this role but the panel has not collected
+// it yet". This is the mapping that makes an armed pull visible: the flag lives on the panel's row
+// for all three boards, because the panel is the only one of them this server can reach.
+var ARMED = { panel: "update_mode", cam: "node_pull_cam", node: "node_pull_node" };
+
+var notes = {};      // "device|role" -> the sentence a press left behind
+var logSig = null;   // identity of the log rows currently in the DOM
+var timer = null;
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                  .replace(/"/g, "&quot;");
+}
+
+function token() {
+  var t = localStorage.getItem(KEY);
+  if (t === null) {
+    // Empty is a legitimate answer and is remembered as one: a development server with
+    // PLANTRX_TOKEN unset accepts any Authorization header (app/main.auth), and asking again on
+    // every poll would make the page unusable there.
+    t = window.prompt("서버 토큰을 입력하세요. 이 브라우저에만 저장됩니다.", "");
+    if (t === null) t = "";
+    localStorage.setItem(KEY, t);
+  }
+  return t;
+}
+
+function fmtUp(s) {
+  if (s < 3600) return Math.floor(s / 60) + "분";
+  if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분";
+  return Math.floor(s / 86400) + "일 " + Math.floor((s % 86400) / 3600) + "시간";
+}
+
+function fmtAge(sec) {
+  if (sec < 0) sec = 0;
+  if (sec < 10) return "방금";
+  if (sec < 60) return sec + "초 전";
+  if (sec < 3600) return Math.floor(sec / 60) + "분 전";
+  if (sec < 86400) return Math.floor(sec / 3600) + "시간 전";
+  return Math.floor(sec / 86400) + "일 전";
+}
+
+// Twelve characters of an elf_sha256, which is what the panel's log lines and this project's
+// firmware log already print. It is enough to tell two builds apart by eye and short enough to sit
+// on a phone line; the full hash is in /v1/firmware/latest for anybody who needs to diff it.
+function shortVer(hex) { return hex ? hex.slice(0, 12) : "모름"; }
+
+function armEndpoint(device, role) {
+  var d = encodeURIComponent(device);
+  // The panel updates itself through update_mode?pull=1 - the endpoint that stands its camera,
+  // poll and radio down first. The nodes are not on IP from here at all, so their update is armed
+  // on the panel's row and carried out over ESP-NOW. Both endpoints already exist; this page must
+  // not invent a third.
+  if (role === "panel") return "/v1/device/" + d + "/update_mode?pull=1";
+  if (role === "cam" || role === "node") {
+    return "/v1/device/" + d + "/node_update?role=" + encodeURIComponent(role);
+  }
+  return null;
+}
+
+function api(path, opts) {
+  var o = opts || {};
+  o.headers = { "Authorization": "Bearer " + token() };
+  return fetch(path, o).then(function (r) {
+    if (r.status === 401) { var e = new Error("unauth"); e.unauth = true; throw e; }
+    if (!r.ok) throw new Error(path + " → " + r.status);
+    return r.json();
+  });
+}
+
+function setStat(text, bad) {
+  var el = document.getElementById("stat");
+  el.textContent = text;
+  el.className = bad ? "bad" : "";
+}
+
+function roleCard(dev, role) {
+  var key = dev.device + "|" + role.role;
+  var url = armEndpoint(dev.device, role.role);
+  var badge = role.current
+    ? '<span class="badge ok">최신</span>'
+    : '<span class="badge stale">업데이트 필요</span>';
+
+  // Greyed for the same two reasons and in the same words the panel's own page uses
+  // (src/ui/page_update.cpp): a board with no second app slot cannot take an image, and a role
+  // with nothing published has nothing to fetch. A live-looking button whose only possible
+  // outcome is a failure message minutes later is the thing both pages refuse to offer.
+  var why = "";
+  if (!url) why = "알 수 없는 역할이라 업데이트할 수 없음";
+  else if (!role.can_ota) why = "설치 영역이 없어 업데이트 불가";
+  else if (!role.published) why = "서버에 게시된 이미지 없음";
+
+  var armed = dev.flags[ARMED[role.role]];
+  var pieces = [
+    '<h3>' + esc(TITLE[role.role] || role.role) + badge +
+      (role.online ? "" : '<span class="badge warn">연결 끊김</span>') +
+      (role.pending ? '<span class="badge stale">검증 전</span>' : "") +
+      (armed ? '<span class="badge mute">요청 대기 중</span>' : "") + '</h3>',
+    '<dl class="rows">',
+    '<div class="row"><dt>현재 버전</dt><dd>' + esc(shortVer(role.running)) + '</dd></div>',
+    '<div class="row"><dt>게시 버전</dt><dd>' + esc(shortVer(role.published)) + '</dd></div>',
+    '<div class="row"><dt>가동</dt><dd>' + esc(fmtUp(role.up_s)) + '</dd></div>',
+    '<div class="row"><dt>남은 메모리</dt><dd>' +
+      esc(Math.floor(role.heap / 1024) + " KB") + '</dd></div>',
+    '<div class="row"><dt>연결</dt><dd>' + (role.online ? "연결됨" : "끊김") + '</dd></div>',
+    '<div class="row"><dt>보고 시각</dt><dd class="age" data-ts="' + role.recv_ts + '"></dd></div>',
+    '</dl>',
+    '<div class="act"><button data-dev="' + esc(dev.device) + '" data-role="' + esc(role.role) +
+      '"' + (why ? " disabled" : "") + '>업데이트</button></div>',
+  ];
+  if (why) pieces.push('<p class="why">' + esc(why) + '</p>');
+  if (armed) {
+    // Said on every render and not only after a press, because the operator who armed this may
+    // well have closed the page and come back. An armed flag with nothing on screen about it is
+    // indistinguishable from a button that did nothing.
+    pieces.push('<p class="note">요청이 걸려 있습니다. 패널이 다음 폴링에서 가져갈 때까지 ' +
+                '아무 일도 일어나지 않습니다.</p>');
+  }
+  if (notes[key]) pieces.push('<p class="note">' + esc(notes[key]) + '</p>');
+  return '<section class="card">' + pieces.join("") + '</section>';
+}
+
+function render(st) {
+  var out = [];
+  st.devices.forEach(function (dev) {
+    var head = '<section class="card"><h3>' +
+      (dev.last_seen ? esc(fmtAge(st.ts - dev.last_seen)) + " 응답"
+                     : "최근 텔레메트리 없음") +
+      '</h3><p class="mac">' + esc(dev.device) + '</p>';
+    if (!dev.roles.length) {
+      head += '<p class="why">이 보드의 펌웨어는 아직 버전을 보고하지 않습니다. ' +
+              '한 번 업데이트하면 이 페이지에 카드가 나타납니다.</p>';
+    }
+    out.push(head + '</section>');
+    dev.roles.forEach(function (role) { out.push(roleCard(dev, role)); });
+  });
+  if (!out.length) out.push('<p class="empty">아직 보고한 보드가 없습니다.</p>');
+  document.getElementById("cards").innerHTML = out.join("");
+
+  // The log list is the one thing not rebuilt on every poll. It is the longest list on the page
+  // and it is usually identical five seconds later, and rebuilding it would drop the operator's
+  // scroll position and their text selection - which on a log pane is the thing they are using it
+  // for. The signature is the row identity, so a new line at the top is what rebuilds it.
+  var sig = st.logs.map(function (r) {
+    return r.recv_ts + "/" + r.ms + "/" + r.role;
+  }).join(",");
+  if (sig !== logSig) {
+    logSig = sig;
+    document.getElementById("logs").innerHTML = st.logs.map(function (r) {
+      return '<li><span class="meta">[' + esc(r.role) + '] <span class="age" data-ts="' +
+        r.recv_ts + '"></span></span> ' + esc(r.text) + '</li>';
+    }).join("");
+  }
+  // Ages are refreshed whether or not anything was rebuilt: they are relative to st.ts, so a pane
+  // that was left alone would otherwise freeze its clock while the numbers beside it moved.
+  var ages = document.querySelectorAll(".age");
+  for (var i = 0; i < ages.length; i++) {
+    ages[i].textContent = fmtAge(st.ts - Number(ages[i].getAttribute("data-ts")));
+  }
+}
+
+function poll() {
+  api("/v1/admin/state").then(function (st) {
+    render(st);
+    setStat("갱신 " + new Date(st.ts * 1000).toLocaleTimeString("ko-KR"), false);
+    schedule();
+  }).catch(function (err) {
+    if (err.unauth) {
+      // Said out loud rather than left as an empty page, which is what this looked like before:
+      // a wrong token and a server that is down are the same blank screen otherwise, and one of
+      // them is fixed by typing.
+      setStat("토큰이 거부되었습니다. 토큰을 지우고 다시 입력하세요.", true);
+      return;   // no reschedule: retrying a rejected token every 5s answers nothing
+    }
+    setStat("서버에 연결할 수 없습니다: " + err.message, true);
+    schedule();
+  });
+}
+
+// setTimeout after each answer rather than setInterval, so a slow link stretches the cadence
+// instead of stacking requests behind each other - on a mobile connection an interval shorter
+// than the round trip queues polls until the page is doing nothing but catching up.
+function schedule() {
+  clearTimeout(timer);
+  timer = setTimeout(poll, POLL_MS);
+}
+
+document.getElementById("forget").addEventListener("click", function () {
+  localStorage.removeItem(KEY);
+  location.reload();
+});
+
+document.getElementById("cards").addEventListener("click", function (ev) {
+  var btn = ev.target.closest("button[data-role]");
+  if (!btn || btn.disabled) return;
+  var dev = btn.getAttribute("data-dev"), role = btn.getAttribute("data-role");
+  btn.disabled = true;
+  api(armEndpoint(dev, role), { method: "POST" }).then(function () {
+    notes[dev + "|" + role] =
+      "업데이트를 요청했습니다. 패널의 다음 폴링(최대 1분)까지는 아무 일도 일어나지 않습니다.";
+    poll();   // immediately, so the armed flag appears in the same breath as the note
+  }).catch(function (err) {
+    notes[dev + "|" + role] = err.unauth
+      ? "토큰이 거부되어 요청하지 못했습니다."
+      : "요청하지 못했습니다: " + err.message;
+    btn.disabled = false;
+    poll();
+  });
+});
+
+poll();
+</script>
+</body>
+</html>

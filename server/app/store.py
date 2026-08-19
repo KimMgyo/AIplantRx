@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
-from .schema import NodeLogLine, Prescription, Telemetry
+from .schema import FirmwareState, NodeLogLine, Prescription, Telemetry
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +193,40 @@ CREATE TABLE IF NOT EXISTS node_logs (
 -- exists only to keep the role filter off a full scan.
 CREATE INDEX IF NOT EXISTS ix_node_logs_role_id
     ON node_logs (role, id);
+
+-- What each board in a greenhouse is running, as of the panel's last poll. One row per device
+-- and role, overwritten in place: this is a snapshot and not a history, so the primary key is
+-- (device, role) and every poll UPSERTs onto it. A board polling every minute for a fortnight
+-- would otherwise be twenty thousand rows saying the same sixteen hex digits, on a table whose
+-- only reader asks "what is it running right now".
+--
+-- Deliberately not columns on `telemetry`, and the reasoning is the reverse of device_flags'.
+-- There, a consumable flag could not live on an append-only history. Here the shape is wrong in
+-- the other direction: the roles are the device's to name (a version-skewed node reports itself
+-- as "?", see schema.NodeLogLine), so a column per role would have to be migrated every time
+-- the greenhouse grew a board, and the operator view wants one row per board rather than one
+-- wide row per poll.
+--
+-- `elf` is a PREFIX of the ELF hash - sixteen hex digits, because that is all NodeRepMsg's
+-- elf_sha[8] can carry - so nothing may compare it for equality against the 64-character hash
+-- in a published manifest. TEXT NOT NULL with "" for "this board has never reported an image",
+-- which must not compare equal to any published version.
+--
+-- recv_ts is the server's receipt clock, the same one telemetry and node_logs are ordered by. It
+-- is what tells a row written an hour ago from one written on the last poll, which is the whole
+-- of "is this device still talking to us" for a board the panel has stopped hearing from.
+CREATE TABLE IF NOT EXISTS device_fw (
+    device   TEXT    NOT NULL,
+    role     TEXT    NOT NULL,
+    elf      TEXT    NOT NULL,
+    up_s     INTEGER NOT NULL,
+    heap     INTEGER NOT NULL,
+    online   INTEGER NOT NULL,
+    pending  INTEGER NOT NULL,
+    can_ota  INTEGER NOT NULL,
+    recv_ts  INTEGER NOT NULL,
+    PRIMARY KEY (device, role)
+);
 """
 
 _TELEMETRY_COLS = (
@@ -273,6 +307,12 @@ _DEVICE_FLAGS_ADDED_COLS = (
 
 # Every table with columns added after it was first written, so _migrate walks one list instead of
 # growing a second copy of the same loop each time this happens again.
+#
+# COLUMNS ONLY. _migrate issues ALTER TABLE ADD COLUMN and nothing else, so a WHOLE new table
+# needs no entry here: _SCHEMA is executescript'd on every connection and its CREATE TABLE IF
+# NOT EXISTS creates it on the databases that predate it. `device_fw` is such a table and is
+# deliberately absent from this list - adding it would need a second kind of loop to say
+# anything at all, and there is nothing for that loop to do.
 _ADDED_COLS = (
     ("telemetry", _TELEMETRY_ADDED_COLS),
     ("device_flags", _DEVICE_FLAGS_ADDED_COLS),
@@ -953,6 +993,157 @@ def recent_node_logs(role: Optional[str] = None, limit: int = NODE_LOG_READ_DEFA
 
 
 # --------------------------------------------------------------------------
+# Firmware state, and the operator's read of the flags
+# --------------------------------------------------------------------------
+
+
+def save_device_fw(device: str, fw: dict[str, FirmwareState], recv_ts: int) -> int:
+    """Overwrite this device's firmware snapshot and say how many rows it touched.
+
+    UPSERT and not INSERT, which is the whole reason (device, role) is the primary key: this is
+    the answer to "what is that board running now", and a panel polling every minute for a
+    fortnight would otherwise leave twenty thousand rows per board saying the same sixteen hex
+    digits. History is what `telemetry` is for, and nothing has ever wanted the history of an ELF
+    hash - a change in it is a board that was updated, which the node logs already narrate.
+
+    Roles the device did not send are left exactly as they were rather than deleted. A panel that
+    reports `panel` and `cam` on one poll and all three on the next has not lost a sensor node in
+    between: nodeota only fills a NodeView it has heard a report for, so an absent role means
+    "nothing new to say about that board", and recv_ts is what tells the reader how old the last
+    thing it said is. Deleting the row instead would make an operator's screen flicker a board in
+    and out of existence on the panel's ESP-NOW luck.
+
+    executemany for the same reason save_node_logs uses it: autocommit means a loop of execute
+    takes and releases the write lock once per role, three times per poll, on the request that is
+    on the 2s cadence's critical path.
+
+    No _maybe_prune(). This table is bounded by boards times roles, not by time, so it has
+    nothing to retain and nothing to drop - and bumping the shared write counter here would make
+    every poll pay towards somebody else's retention scan.
+    """
+    rows = [
+        (device, role, s.elf, int(s.up_s), int(s.heap),
+         1 if s.online else 0, 1 if s.pending else 0, 1 if s.can_ota else 0, int(recv_ts))
+        for role, s in fw.items()
+    ]
+    if not rows:
+        return 0
+    _conn().executemany(
+        "INSERT INTO device_fw"
+        " (device, role, elf, up_s, heap, online, pending, can_ota, recv_ts)"
+        " VALUES (?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(device, role) DO UPDATE SET"
+        " elf=excluded.elf, up_s=excluded.up_s, heap=excluded.heap, online=excluded.online,"
+        " pending=excluded.pending, can_ota=excluded.can_ota, recv_ts=excluded.recv_ts",
+        rows,
+    )
+    return len(rows)
+
+
+def all_device_fw() -> list[dict]:
+    """Every board's snapshot, freshest report first.
+
+    Unlimited and deliberately so, unlike recent_node_logs: this table holds one row per board
+    per role, so "everything" is a handful of rows in a greenhouse and a few dozen across a site.
+    A clamp here would silently hide a board from the one view whose entire job is to show every
+    board.
+
+    The three flags come back as real booleans rather than the 0/1 SQLite stores, for the same
+    reason _row_to_dict restores them: these rows are JSON-dumped straight into an HTTP response,
+    and 0 where the reader expects false is a truthiness bug waiting in whoever renders it.
+    """
+    rows = _conn().execute(
+        "SELECT device, role, elf, up_s, heap, online, pending, can_ota, recv_ts"
+        " FROM device_fw ORDER BY recv_ts DESC, device, role"
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for col in ("online", "pending", "can_ota"):
+            d[col] = bool(d[col])
+        out.append(d)
+    return out
+
+
+def peek_device_flags(device: str) -> dict:
+    """What is armed for this device, WITHOUT consuming any of it.
+
+    This is the read half that take_update_mode and take_node_pull cannot provide, and the
+    distinction is the point of the function existing at all. Those two are one-shot consumers:
+    they clear as they read because that is the only thing standing between a delivered arming
+    and a panel that re-enters update mode on every poll forever, or a camera that reboots itself
+    every sixty seconds. Read the docstrings there before touching either.
+
+    An operator view calling one of them would BE a poll, from the flag's point of view. It would
+    hand the arming to a web page - which cannot reboot into update mode, cannot relay an
+    ESP-NOW command, and cannot do anything with it but draw it - and the device that the
+    operator armed thirty seconds ago would then poll and find nothing waiting. The request would
+    vanish leaving nothing but a checkbox on a screen, and the operator would press the button
+    again, and the race would be exactly as wide the second time.
+
+    So: SELECT only. Every flag defaults False for a device with no row, which is the same answer
+    the take_* functions give and means "nothing has ever been armed for this board".
+
+    `update_mode` is reported as armed regardless of its age, unlike take_update_mode which drops
+    an arming older than UPDATE_MODE_TTL_S. That is honest here and would not be there: the
+    column IS set, an operator looking at the row should see what the row says, and armed_ts is
+    not in the contract for this view precisely because the expiry is the consumer's rule about
+    whether to ACT - not a claim about what is written down.
+    """
+    row = _conn().execute(
+        "SELECT update_mode, firmware_pull, node_pull_cam, node_pull_node"
+        " FROM device_flags WHERE device=?",
+        (device,),
+    ).fetchone()
+    keys = ("update_mode", "firmware_pull", "node_pull_cam", "node_pull_node")
+    if row is None:
+        return {k: False for k in keys}
+    return {k: bool(row[k]) for k in keys}
+
+
+def known_devices() -> list[dict]:
+    """Every device this server has ever heard from, freshest first.
+
+    A UNION over both tables the panel writes, not a GROUP BY over `telemetry` alone, and that is
+    load-bearing rather than thorough: save_telemetry is gated on scheduler.telemetry_is_sane, so
+    a panel whose sensor node is dead answers its poll, reports its firmware and writes no
+    telemetry row at all. Listing from telemetry alone would hide precisely the board an operator
+    is most likely to be looking for - the one that stopped reading its sensors - and the update
+    button they would want to press on it.
+
+    `uptime_ms` therefore comes only from `telemetry` and is 0 for a device that has never
+    written a row there, which is the same "not reported" that field's own default means (see
+    schema.Telemetry.uptime_ms). The board's real uptime is in its device_fw row's up_s, in whole
+    seconds and per role, which is the better number anyway - it survives the sanity gate.
+
+    MAX(id) rather than MAX(recv_ts) picks which row's uptime_ms is reported, and the aliased
+    `newest` no other clause reads is what asks for that pick: SQLite's bare-column rule hands
+    back the row that produced the aggregate, and the rowid is unique where recv_ts is not - two
+    polls landing in the same second would otherwise leave which of them answers undefined. The
+    rowid is monotonic in insert order and recv_ts is stamped at insert, so the newest id is also
+    the newest receipt.
+
+    The outer MAX() over the two arms is a merge and not a comparison of like values: each device
+    contributes at most one row per arm, so MAX(last_seen) is "whichever table heard from it more
+    recently" and MAX(uptime_ms) is the telemetry arm's value against the fw arm's placeholder 0.
+    """
+    rows = _conn().execute(
+        "SELECT device, MAX(last_seen) AS last_seen, MAX(uptime_ms) AS uptime_ms FROM ("
+        "  SELECT device, MAX(id) AS newest, recv_ts AS last_seen, uptime_ms"
+        "    FROM telemetry GROUP BY device"
+        "  UNION ALL"
+        "  SELECT device, 0 AS newest, MAX(recv_ts) AS last_seen, 0 AS uptime_ms"
+        "    FROM device_fw GROUP BY device"
+        ") GROUP BY device ORDER BY last_seen DESC, device"
+    ).fetchall()
+    return [
+        {"device": r["device"], "last_seen": int(r["last_seen"]),
+         "uptime_ms": int(r["uptime_ms"])}
+        for r in rows
+    ]
+
+
+# --------------------------------------------------------------------------
 # Retention
 # --------------------------------------------------------------------------
 
@@ -986,7 +1177,7 @@ def stats() -> dict[str, Any]:
     conn = _conn()
     out: dict[str, Any] = {"path": str(db_path())}
     for table in ("telemetry", "prescriptions", "frames", "llm_calls", "device_flags",
-                  "node_logs"):
+                  "node_logs", "device_fw"):
         out[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     # The -wal sidecar holds everything written since the last checkpoint, so
     # the main file alone reads as 4KB on a busy database and makes the disk
