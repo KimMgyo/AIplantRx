@@ -1,5 +1,5 @@
-# Builds the panel firmware on a cold Linux checkout, and on a tag publishes the
-# image the greenhouse server hands to panels over the air.
+# Builds all three firmwares on a cold Linux checkout, and on a tag publishes the
+# images the greenhouse server hands to boards over the air.
 #
 # WHY THE BUILD IS WORTH HAVING EVEN THOUGH ONE MACHINE ALREADY BUILDS FINE.
 # Everything this firmware depends on came from a warm .pio on one Windows box:
@@ -9,6 +9,16 @@
 # which is the only state anybody else - or this project six months from now -
 # can actually start from. A cold build is the test for all of it at once.
 #
+# That argument turned out to be sharper than it looked for the two node
+# firmwares, which is why they are here now. `platform = espressif32` in
+# sensor_node/ and esp32cam-streamer/ was resolving to Arduino core 3.1.1 on the
+# bench for one reason only: the panel installs pioarduino 53.03.11 under that
+# name, and the nodes were inheriting it. A clean checkout gets the registry's
+# 6.x and core 2.0.17 - so a cold build of either node was, until those two files
+# were pinned, building something nobody had ever run. All three now pin the same
+# toolchain, which is the only way a release can claim the three images agree
+# about shared/nodeproto.h.
+#
 # WHY A RELEASE AND NOT AN ARTIFACT IS WHAT THE SERVER PULLS.
 # Workflow artifacts of a public repository still need a token to download: the
 # actions/artifacts/{id}/zip endpoint is authenticated. Release asset URLs are
@@ -17,11 +27,13 @@
 # at a build of main.
 #
 # WHY NO SECRET IS CONFIGURED HERE, AND WHY THAT IS THE POINT.
-# This repository is public, so everything below is public. The build uses
+# This repository is public, so everything below is public. The panel build uses
 # include/plantrx_config.h.ci - blank on purpose - and the resulting image
 # carries no server address and no bearer token. sitecfg.cpp is what makes a
 # site-less image still work on a provisioned panel: NVS holds the site, the
-# image inherits it. See include/sitecfg.h.
+# image inherits it. See include/sitecfg.h. The two node images never had a site
+# to leak: they are told the URL and the token over ESP-NOW, one download at a
+# time (shared/nodeproto.h, NodeCmdMsg).
 
 name: firmware
 
@@ -40,10 +52,49 @@ on:
 # never ran. Public-repo minutes are free; a wrong green is not.
 
 jobs:
+  # ONE JOB, THREE LEGS. The three builds differ in four values and two steps, and
+  # every one of those is a matrix field or an `if` on the role. Three copies of
+  # this job is how the node builds end up a year behind the panel's - which is
+  # exactly the debt shared/nodeproto.h exists to stop paying on the wire, applied
+  # to the thing that produces the binaries.
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # only used by the release step below, on tags
+    strategy:
+      # A node build failing should not hide the panel's result, or the other way
+      # round: three boards fail for unrelated reasons and all three answers are
+      # wanted in one run.
+      fail-fast: false
+      matrix:
+        include:
+          # `suffix` is the whole naming contract with the server.
+          # server/app/firmware.py owns the file name each role is published under
+          # (_IMAGE_NAME) and ghfw.py reads the asset name off it, so these three
+          # spellings have to match that dict exactly. The panel's is empty because
+          # its name is frozen: an operator, and then a robot, have been dropping
+          # bytes at firmware.bin since before the other two roles existed.
+          - role: panel
+            dir: .
+            env: esp32-s3-touch-lcd-7
+            suffix: ""
+            # Measured, not guessed. An image built from the blank header contains
+            # exactly two http:// strings and both are code: the format string
+            # plantrx.cpp logs its address with, and the literal inside "base URL
+            # is not http://host[:port][/prefix]". The same build with the real
+            # header adds a third, the site itself.
+            allow: "http://%s|http://host"
+          - role: cam
+            dir: esp32cam-streamer
+            env: esp32cam
+            suffix: "-cam"
+            # Empty, and measured empty: this image contains no http:// string at
+            # all. It is handed a URL at runtime and holds it in RAM for the length
+            # of one download, so anything matching here is new and is a leak.
+            allow: ""
+          - role: node
+            dir: sensor_node
+            env: esp32dev
+            suffix: "-node"
+            allow: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -52,24 +103,27 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Keyed on platformio.ini because that file now pins every version this
-      # build resolves - the platform zip, the two framework packages, and all
-      # five libraries. Change any of them and the key changes with it, which is
-      # the property an unpinned lib_deps could not give: a cache hit used to be
-      # able to hand back a display driver from a different day.
+      # Keyed on all three ini files because all three now pin the same toolchain:
+      # change any of them and every leg's packages may move, so they share a key
+      # and the first leg to finish populates it for the rest. libdeps is scoped to
+      # the leg because it is per project directory - and only the panel has any
+      # (both nodes vendor their drivers under lib/).
       - uses: actions/cache@v4
         with:
           path: |
             ~/.platformio
-            .pio/libdeps
-          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
-          restore-keys: pio-${{ runner.os }}-
+            ${{ matrix.dir }}/.pio/libdeps
+          key: pio-${{ runner.os }}-${{ matrix.role }}-${{ hashFiles('platformio.ini', 'sensor_node/platformio.ini', 'esp32cam-streamer/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-${{ matrix.role }}-
 
       - run: pip install --upgrade platformio
 
       # The real header is gitignored and per-greenhouse. This one is committed
-      # and blank; include/plantrx_config.h.ci says why at length.
+      # and blank; include/plantrx_config.h.ci says why at length. Panel only -
+      # neither node reads it, and creating it for them would be a file that has
+      # to stay blank for no reason anybody could find later.
       - name: Install the blank site config
+        if: matrix.role == 'panel'
         run: cp include/plantrx_config.h.ci include/plantrx_config.h
 
       # Before the build, not as part of it. scripts/patch_rgb_bounce.py runs at
@@ -77,119 +131,166 @@ jobs:
       # fetched yet; installing in its own step means the file it patches is
       # already on disk when it looks.
       - name: Install dependencies
-        run: pio pkg install -e esp32-s3-touch-lcd-7
+        working-directory: ${{ matrix.dir }}
+        run: pio pkg install -e ${{ matrix.env }}
 
       # PATCH_RGB_STRICT turns "bounce-buffer patch target not found" from a
-      # warning into a failure. Locally that condition is a first build of a
-      # fresh clone and a warning is right; here it would mean publishing a
-      # WiFi-unstable image that looks identical to a good one.
+      # warning into a failure. Locally that condition is a first build of a fresh
+      # clone and a warning is right; here it would mean publishing a
+      # WiFi-unstable image that looks identical to a good one. Set on every leg
+      # rather than guarded: only the panel declares extra_scripts, so the two
+      # node builds never read it, and an env var that is already correct for a
+      # role the nodes might grow costs nothing.
       - name: Build
+        working-directory: ${{ matrix.dir }}
         env:
           PATCH_RGB_STRICT: "1"
-        run: pio run -e esp32-s3-touch-lcd-7
+        run: pio run -e ${{ matrix.env }}
 
-      # size and md5 of the exact bytes a panel will install. md5 is not decorative:
-      # it is the field the server puts in /v1/firmware/latest and the one
-      # fwpull.cpp hands to Update.setMD5(), so a release whose md5 matches what
-      # the panel reports is proof the two are talking about the same image.
-      # The app-elf sha256 that the device actually compares is deliberately NOT
-      # recomputed here - server/app/firmware.py owns that parse, and a second
-      # copy of those offsets in a YAML file is a contract with two definitions.
-      - name: Describe the image
-        id: img
-        run: |
-          BIN=.pio/build/esp32-s3-touch-lcd-7/firmware.bin
-          SIZE=$(stat -c%s "$BIN")
-          MD5=$(md5sum "$BIN" | cut -d' ' -f1)
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "md5=$MD5" >> "$GITHUB_OUTPUT"
-          {
-            echo "| field | value |"
-            echo "| --- | --- |"
-            echo "| size | $SIZE bytes |"
-            echo "| md5 | \`$MD5\` |"
-            echo "| app slot | 6553600 bytes (default_16MB.csv, ota_0/ota_1) |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # A published image that carries the greenhouse's bearer token would be the
-      # one failure this whole arrangement exists to prevent, and it would be
-      # invisible - a working build, a working panel, and a secret on the open
-      # internet. So it is checked rather than trusted, on the way in and on the
-      # way out.
-      #
-      # The allow-list is measured, not guessed. An image built from the blank
-      # header contains exactly two http:// strings and both are code: the format
-      # string plantrx.cpp logs its address with, and the literal inside "base URL
-      # is not http://host[:port][/prefix]". The same build with the real header
-      # adds a third, the site itself. So anything outside those two is a site
-      # that should not be here.
+      # A published image that carries the greenhouse's bearer token or its server
+      # address would be the one failure this whole arrangement exists to prevent,
+      # and it would be invisible - a working build, a working board, and a secret
+      # on the open internet. So it is checked rather than trusted, on the way in
+      # and on the way out.
       - name: Refuse an image that carries a site
+        working-directory: ${{ matrix.dir }}
+        env:
+          ALLOW: ${{ matrix.allow }}
+          ROLE: ${{ matrix.role }}
         run: |
-          BIN=.pio/build/esp32-s3-touch-lcd-7/firmware.bin
+          BIN=.pio/build/${{ matrix.env }}/firmware.bin
           fail=0
-          # The input: whatever ended up at include/plantrx_config.h.
-          for d in PLANTRX_BASE_URL PLANTRX_TOKEN; do
-            if ! grep -qE "^#define $d \"\"$" include/plantrx_config.h; then
-              echo "::error::$d is not blank in include/plantrx_config.h"
-              fail=1
-            fi
-          done
+          # The input: whatever ended up at include/plantrx_config.h. Panel only,
+          # because it is the only role that has one.
+          if [ "$ROLE" = panel ]; then
+            for d in PLANTRX_BASE_URL PLANTRX_TOKEN; do
+              if ! grep -qE "^#define $d \"\"$" include/plantrx_config.h; then
+                echo "::error::$d is not blank in include/plantrx_config.h"
+                fail=1
+              fi
+            done
+          fi
           # The output: grep -a because firmware.bin is binary, and grep would
           # otherwise print "binary file matches" and exit 0 whatever it found.
-          leaked=$(grep -aoE 'http://[A-Za-z0-9._%-]+(:[0-9]+)?' "$BIN" \
-                   | grep -vxE 'http://%s|http://host' | sort -u)
+          # The `|| true`s are load-bearing under bash -e: a grep that matches
+          # nothing exits 1, which is the PASSING case here.
+          leaked=$(grep -aoE 'http://[A-Za-z0-9._%-]+(:[0-9]+)?' "$BIN" | sort -u || true)
+          if [ -n "$leaked" ] && [ -n "$ALLOW" ]; then
+            leaked=$(printf '%s\n' "$leaked" | grep -vxE "$ALLOW" || true)
+          fi
           if [ -n "$leaked" ]; then
-            echo "::error::the image carries a server address: $leaked"
+            echo "::error::the $ROLE image carries a server address: $leaked"
             fail=1
           fi
           exit $fail
 
+      # Renamed here rather than in the release job, so the artifact of a build of
+      # main carries the same names the release does and there is exactly one place
+      # that knows how a role spells its files.
+      #
+      # size and md5 of the exact bytes a board will install. md5 is not
+      # decorative: it is the field the server puts in /v1/firmware/latest and the
+      # one fwpull.cpp / the nodes' nodeota.cpp hand to Update.setMD5(), so a
+      # release whose md5 matches what a board reports is proof the two are talking
+      # about the same image. The app-elf sha256 that the device actually compares
+      # is deliberately NOT recomputed here - server/app/firmware.py owns that
+      # parse, and a second copy of those offsets in a YAML file is a contract with
+      # two definitions.
+      - name: Name and describe the image
+        working-directory: ${{ matrix.dir }}
+        run: |
+          B=.pio/build/${{ matrix.env }}
+          S='${{ matrix.suffix }}'
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for f in firmware.bin firmware.elf bootloader.bin partitions.bin; do
+            base=${f%.*}; ext=${f##*.}
+            cp "$B/$f" "$GITHUB_WORKSPACE/dist/$base$S.$ext"
+          done
+          BIN="$GITHUB_WORKSPACE/dist/firmware$S.bin"
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| role | ${{ matrix.role }} |"
+            echo "| image | firmware$S.bin |"
+            echo "| size | $(stat -c%s "$BIN") bytes |"
+            echo "| md5 | \`$(md5sum "$BIN" | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ github.sha }}
-          # firmware.bin is what a panel installs. The other three are what a USB
-          # flash of a bare board needs, and firmware.elf is the only way to turn
-          # a backtrace from a released build into line numbers - which this
-          # project has needed more than once; see the addr2line note in
-          # platformio.ini.
-          path: |
-            .pio/build/esp32-s3-touch-lcd-7/firmware.bin
-            .pio/build/esp32-s3-touch-lcd-7/firmware.elf
-            .pio/build/esp32-s3-touch-lcd-7/bootloader.bin
-            .pio/build/esp32-s3-touch-lcd-7/partitions.bin
+          # images-* is the pattern the release job collects on.
+          name: images-${{ matrix.role }}
+          # firmware*.bin is what a board installs. bootloader and partitions are
+          # what a USB flash of a bare board needs - and for the two nodes that is
+          # not a hypothetical: both changed to min_spiffs.csv to get a second app
+          # slot, and a partition table only takes effect on a wired flash. The elf
+          # is the only way to turn a backtrace from a released build into line
+          # numbers, which this project has needed more than once, and the two
+          # boards with no reachable console need it most.
+          path: dist/*
           if-no-files-found: error
 
-      # Tags only. The assets are named without the version in them on purpose:
-      # server/app/ghfw.py looks for the exact name firmware.bin, so the puller
-      # never has to know how this project spells its tags.
-      #
+  # A JOB OF ITS OWN, because the assets come from three. The release step used to
+  # live inside the build and could therefore only ever publish one board's image.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only used by the release step below
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: images-*
+          merge-multiple: true
+          path: dist
+
+      # A release missing one role's image is worse than a failed release: ghfw.py
+      # reports "no firmware-cam.bin" every poll for as long as that tag is
+      # newest, and nothing else says why the camera never updates. Cheaper to
+      # refuse to publish.
+      - name: Refuse a partial release
+        run: |
+          for f in firmware.bin firmware-cam.bin firmware-node.bin; do
+            if [ ! -f "dist/$f" ]; then
+              echo "::error::dist/$f is missing; not publishing a partial release"
+              exit 1
+            fi
+          done
+          ls -l dist
+
       # create-then-upload rather than create alone so that re-running a tag's
       # build replaces the assets instead of failing on a release that exists.
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-          SIZE: ${{ steps.img.outputs.size }}
-          MD5: ${{ steps.img.outputs.md5 }}
         run: |
-          B=.pio/build/esp32-s3-touch-lcd-7
-          set -- \
-            "$B/firmware.bin#firmware.bin" \
-            "$B/firmware.elf#firmware.elf" \
-            "$B/bootloader.bin#bootloader.bin" \
-            "$B/partitions.bin#partitions.bin"
+          TABLE=$(
+            echo "| image | role | size | md5 |"
+            echo "| --- | --- | --- | --- |"
+            for r in "firmware.bin panel" "firmware-cam.bin cam" "firmware-node.bin node"; do
+              set -- $r
+              printf '| `%s` | %s | %s bytes | `%s` |\n' \
+                "$1" "$2" "$(stat -c%s "dist/$1")" "$(md5sum "dist/$1" | cut -d' ' -f1)"
+            done
+          )
           NOTES=$(cat <<EOF
-          firmware.bin — size $SIZE bytes, md5 \`$MD5\`
+          $TABLE
 
-          The server publishes this to panels: it pulls firmware.bin from the newest
-          release and serves it at /v1/firmware/image, and a panel installs it only
-          once somebody arms that panel. Publishing a release does not update
-          anything by itself.
+          The server publishes these: it pulls each image from the newest release and
+          serves it at /v1/firmware/image?role=..., and a board installs it only once
+          somebody arms that board on the panel's 펌웨어 page. Publishing a release
+          does not update anything by itself.
 
-          Built from a blank include/plantrx_config.h, so this image carries no
-          server address and no bearer token. A panel provisioned once over USB
-          keeps both in NVS — see include/sitecfg.h.
+          Built from a blank include/plantrx_config.h, so no image here carries a
+          server address or a bearer token. A panel provisioned once over USB keeps
+          both in NVS and hands them to the two nodes over ESP-NOW for the length of
+          one download — see include/sitecfg.h and shared/nodeproto.h.
+
+          The first flash of a node after its partition table changed must be over
+          USB; bootloader-*.bin and partitions-*.bin are here for that.
           EOF
           )
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$NOTES" "$@" \
-            || gh release upload "$GITHUB_REF_NAME" --clobber "$@"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$NOTES" dist/* \
+            || gh release upload "$GITHUB_REF_NAME" --clobber dist/*

@@ -25,12 +25,29 @@ WHAT A FRESH DEPLOY DOES.
 The first poll happens at startup, not one interval later, so a new box with an empty data volume
 populates itself from the newest release before anybody asks it for a manifest. That is the case
 that used to require someone with scp and the right file.
+
+THREE IMAGES, ONE RELEASE, ONE API CALL.
+The panel was the only role for a while and this module read like it: one asset name, one
+destination. All three firmwares are built and published together now, so a poll fetches the
+release once and then settles each role against it. A role that is absent or refused does not stop
+the other two - the panel is the board a grower is standing in front of, and it should not wait on
+a camera image somebody forgot to tag.
+
+WHY THE DIGEST IS CHECKED BEFORE THE BODY IS FETCHED.
+The release JSON already carries each asset's sha256, so "is this already published" is answerable
+for nothing. It used to be answered AFTER downloading the whole asset and parsing its descriptor,
+which was affordable exactly once - at one image per poll, behind a working ETag. It is not
+affordable at three, and the ETag is held in memory, so any restart loop turns into megabytes an
+hour of no-op traffic against a public asset URL. The descriptor check still runs, on the bytes
+that actually arrive; this only decides whether to ask for them.
 """
 
+import hashlib
 import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 import httpx
 
@@ -42,7 +59,13 @@ log = logging.getLogger(__name__)
 # upstream for this firmware and an unset variable would present as "OTA quietly stopped
 # working". It stays overridable for a fork.
 REPO = os.getenv("PLANTRX_GH_REPO", "KimMgyo/AIplantRx")
-ASSET_NAME = "firmware.bin"
+
+# The asset name for a role IS the file name that role is published under, so this reads it off
+# firmware.py instead of restating it. Two spellings of "firmware-cam.bin" - one here and one in
+# the module that serves it - is a release that uploads an asset nothing ever looks for.
+def _asset_name(role: str) -> str:
+    return firmware.image_path(role).name
+
 
 # 0 disables the loop. The floor exists because this runs unauthenticated: 60 requests an hour
 # per IP is the whole budget, and a mistyped interval of 5 would spend it in five minutes and
@@ -89,15 +112,100 @@ def _release(client: httpx.Client) -> tuple[int, dict, str | None]:
     return r.status_code, r.json(), r.headers.get("ETag")
 
 
+def _local_digest(path: Path) -> str | None:
+    """sha256 of what is already published, in the "sha256:<hex>" spelling GitHub's JSON uses.
+
+    None for a file that is not there, which is a fresh volume and the one case where there is
+    nothing to compare and the download has to happen.
+    """
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return "sha256:" + h.hexdigest()
+
+
+def _pull_role(client: httpx.Client, role: str, rel: dict, tag: str) -> tuple[bool, str]:
+    """Settle one role against one release. Returns (agreed, the phrase for the log line).
+
+    `agreed` is what decides whether the ETag may be kept, and it is False for every outcome the
+    next poll should look at again - including an asset that is simply not on the release. A
+    missing image is not a steady state to be remembered: the workflow re-uploads assets with
+    --clobber, so a release that grows the asset it was missing must not be behind a 304.
+    """
+    name = _asset_name(role)
+    asset = next((a for a in rel.get("assets") or [] if a.get("name") == name), None)
+    if asset is None:
+        return False, f"{role}: no {name}"
+
+    dest = firmware.image_path(role)
+
+    # The whole question, answered for the price of hashing a file this box already has. GitHub
+    # publishes the asset's digest in the release JSON, so agreement needs no body at all.
+    # Absent digest falls through to the download - the field is recent, and a fetch is the
+    # behaviour this module had before it existed.
+    want = asset.get("digest")
+    if want and want == _local_digest(dest):
+        return True, f"{role}: already {want[7:19]}"
+
+    # Downloaded beside the destination and renamed over it, never written to it. os.replace is
+    # atomic within a filesystem, so a device that asks for the image during a pull gets either
+    # the old one whole or the new one whole. Writing in place would let it read a
+    # half-downloaded image, and a half-downloaded image passes the descriptor check - the
+    # descriptor is in the first 288 bytes.
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    # No Authorization on this request even if one is ever added above: the download redirects to
+    # a signed URL on another host, and a bearer token arriving alongside that signature is
+    # rejected by the object store rather than ignored.
+    got = 0
+    try:
+        with client.stream(
+            "GET", asset["browser_download_url"], headers={"User-Agent": _UA}
+        ) as resp:
+            resp.raise_for_status()
+            with part.open("wb") as fh:
+                for chunk in resp.iter_bytes(1 << 16):
+                    fh.write(chunk)
+                    got += len(chunk)
+
+        size = int(asset.get("size") or 0)
+        if size and got != size:
+            return False, f"{role}: got {got} of {size} bytes"
+
+        desc = firmware.describe(part)
+        if desc is None:
+            return False, f"{role}: {name} is not an ESP32 application image"
+
+        # Reached when the digest was absent or disagreed but the image is the same one anyway -
+        # a re-tagged identical build, or a release whose JSON carries no digest.
+        cur = firmware.manifest(role)
+        if cur is not None and cur["elf_sha256"] == desc["elf_sha256"]:
+            return True, f"{role}: already {desc['elf_sha256'][:12]}"
+
+        os.replace(part, dest)
+    finally:
+        # Anything still at .part failed a check or died mid-stream. Leaving it costs megabytes
+        # in the volume and, worse, reads as a publish in progress to whoever looks next.
+        try:
+            os.unlink(part)
+        except FileNotFoundError:
+            pass
+
+    was = cur["elf_sha256"][:12] if cur else "nothing"
+    return True, f"{role}: {desc['elf_sha256'][:12]} ({got} bytes, was {was})"
+
+
 def pull_once() -> str:
-    """One poll. Returns the line that goes in the log, and raises only on a transport failure.
+    """One poll over all three roles. Returns the line that goes in the log.
 
     The return value is a sentence rather than a bool because every outcome here is a thing an
-    operator eventually asks about - why a release did not land, or which one did - and there are
-    six of them.
+    operator eventually asks about - why a release did not land, or which one did.
     """
     global _etag
-    dest = firmware.image_path()
 
     with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as client:
         status, rel, etag = _release(client)
@@ -107,58 +215,18 @@ def pull_once() -> str:
             return f"{REPO} has no published release"
 
         tag = rel.get("tag_name") or "?"
-        asset = next(
-            (a for a in rel.get("assets") or [] if a.get("name") == ASSET_NAME), None
-        )
-        if asset is None:
-            return f"release {tag} carries no {ASSET_NAME}"
+        agreed = True
+        said = []
+        for role in firmware.ROLES:
+            ok, phrase = _pull_role(client, role, rel, tag)
+            agreed = agreed and ok
+            said.append(phrase)
 
-        # Downloaded beside the destination and renamed over it, never written to it. os.replace
-        # is atomic within a filesystem, so a panel that asks for the image during a pull gets
-        # either the old one whole or the new one whole. Writing in place would let it read a
-        # half-downloaded image, and a half-downloaded image passes the descriptor check - the
-        # descriptor is in the first 288 bytes.
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        part = dest.with_name(dest.name + ".part")
-        # No Authorization on this request even if one is ever added above: the download
-        # redirects to a signed URL on another host, and a bearer token arriving alongside that
-        # signature is rejected by the object store rather than ignored.
-        got = 0
-        try:
-            with client.stream(
-                "GET", asset["browser_download_url"], headers={"User-Agent": _UA}
-            ) as resp:
-                resp.raise_for_status()
-                with part.open("wb") as fh:
-                    for chunk in resp.iter_bytes(1 << 16):
-                        fh.write(chunk)
-                        got += len(chunk)
-
-            want = int(asset.get("size") or 0)
-            if want and got != want:
-                return f"refused {tag}: got {got} of {want} bytes"
-
-            desc = firmware.describe(part)
-            if desc is None:
-                return f"refused {tag}: {ASSET_NAME} is not an ESP32 application image"
-
-            cur = firmware.manifest()
-            if cur is not None and cur["elf_sha256"] == desc["elf_sha256"]:
-                _etag = etag
-                return f"already published {desc['elf_sha256'][:12]} ({tag})"
-
-            os.replace(part, dest)
-        finally:
-            # Anything still at .part failed a check or died mid-stream. Leaving it costs 3.5MB
-            # in the volume and, worse, reads as a publish in progress to whoever looks next.
-            try:
-                os.unlink(part)
-            except FileNotFoundError:
-                pass
-
-        _etag = etag
-        was = cur["elf_sha256"][:12] if cur else "nothing"
-        return f"published {tag} {desc['elf_sha256'][:12]} ({got} bytes, was {was})"
+        # Only when every role settled. One unfinished image is a reason to ask again, and asking
+        # again is exactly what an unset ETag buys.
+        if agreed:
+            _etag = etag
+        return f"{tag}: " + "; ".join(said)
 
 
 def _loop(interval: int) -> None:
