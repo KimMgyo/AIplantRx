@@ -265,6 +265,14 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # GH_REPO because this job has no checkout - it downloads artifacts and
+          # nothing else. gh resolves the target repository from the git remote in
+          # the working directory, so without this it fails with "not a git
+          # repository" before it looks at a single asset. The release step used to
+          # live inside the build job and inherited its checkout by accident; naming
+          # the repository is cheaper and more honest than cloning six megabytes of
+          # fonts to tell gh something the runner already knows.
+          GH_REPO: ${{ github.repository }}
         run: |
           TABLE=$(
             echo "| image | role | size | md5 |"
