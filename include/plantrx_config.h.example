@@ -29,6 +29,13 @@
 // cost. See the note at the top of shared/srvurl.h for the measurements.
 //
 // A URL with any other scheme is treated as unconfigured rather than guessed at.
+//
+// ONE-TIME ORDERING WHEN YOU SWITCH AN EXISTING GREENHOUSE FROM http:// TO https://. The two nodes
+// download their own firmware from the URL the PANEL sends them, and a node still running a build
+// whose srvurl_parse() predates https:// will refuse that URL and never finish an update - it
+// cannot reach the server to fetch the image that would teach it how. So the order is: publish the
+// release, update BOTH nodes while the panel is still on http://, and only then flash the panel
+// with https://. New boards are not affected; a firmware that has this file has both schemes.
 #define PLANTRX_BASE_URL "https://plantrx.example.org"
 
 // Shared secret matching PLANTRX_TOKEN in the server's environment. Empty when
