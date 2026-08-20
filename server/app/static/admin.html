@@ -55,6 +55,37 @@ ol#logs li { background: #fff; border-radius: 8px; padding: 7px 10px; margin-bot
              font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; word-break: break-word; }
 ol#logs .meta { color: #5b6169; }
 .empty { color: #5b6169; font-size: 14px; }
+
+/* The console pane, dark regardless of the page's light chrome. This is raw serial output and it
+   is read the way serial output is read everywhere else, light on dark - which also keeps the
+   greenhouse's night shift from holding a lamp. */
+#conbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; max-width: 900px;
+          margin-bottom: 8px; }
+/* 16px for the same reason every other control on this page is 16px: iOS Safari zooms the whole
+   document when a control with smaller text takes focus, and it does not zoom back out. */
+#condev { min-height: 44px; font-size: 16px; max-width: 100%; }
+/* Grey rather than the blue of 업데이트, because these two change what the page shows and not
+   what the greenhouse does - but at the full 44px, since 일시정지 is the button pressed in a
+   hurry with a thumb while something scrolls past. */
+#conpause, #conclear { background: #e7e9ec; color: #33383d; font-weight: 400; }
+#constick { font-size: 13px; font-weight: 600; color: #8a4b06; background: #fde2c4;
+            padding: 4px 8px; border-radius: 999px; }
+#con {
+  margin: 0; max-width: 900px; height: 50vh; overflow-y: auto; padding: 10px;
+  border-radius: 8px; background: #12151a; color: #dfe3e8;
+  font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  /* pre-wrap, not pre: a panic backtrace is a hundred columns wide and a horizontal scrollbar on
+     a phone hides most of it behind a gesture. Wrapped, every byte the board printed is on
+     screen without one. */
+  white-space: pre-wrap; word-break: break-word;
+  /* This pane's scroll position is computed in script on every append and again after every trim.
+     Browser scroll anchoring would also move it, from its own guess about which node to hold
+     still, and the two corrections fight each other - so it is off and the arithmetic in
+     conAppend is the only thing that touches scrollTop. */
+  overflow-anchor: none;
+}
+#constat { max-width: 900px; }
+#constat.bad { color: #b3261e; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -65,10 +96,26 @@ ol#logs .meta { color: #5b6169; }
 <main id="cards"></main>
 <h2>노드 로그</h2>
 <ol id="logs"></ol>
+<h2>보드 콘솔</h2>
+<div id="conbar">
+  <span id="condevbox"></span>
+  <button id="conpause">일시정지</button>
+  <button id="conclear">화면 지우기</button>
+  <span id="constick" hidden>자동 스크롤 멈춤 · 맨 아래로 내리면 다시 따라갑니다</span>
+</div>
+<pre id="con"></pre>
+<!-- The pane starts empty and the "nothing yet" sentence lives in #constat beside it, not inside
+     it. Placeholder text inside #con would be indistinguishable from something the board printed,
+     and the first real chunk would have to know to remove it. -->
+<p id="constat" class="why">콘솔을 불러오는 중…</p>
 <script>
 "use strict";
 var POLL_MS = 5000;
 var KEY = "plantrx_token";
+// One sentence for a rejected token, said by both the cards and the console pane. Two copies of
+// it would drift, and the operator seeing two different explanations of the same 401 would have
+// no way to know it is one problem.
+var UNAUTH = "토큰이 거부되었습니다. 토큰을 지우고 다시 입력하세요.";
 // The three boards, titled the way the panel's own 업데이트 page titles them (src/ui/page_update.cpp
 // dev_title), so an operator who has read one screen recognises the other.
 var TITLE = { panel: "스크린", cam: "카메라 노드", node: "센서 노드" };
@@ -137,7 +184,14 @@ function api(path, opts) {
   o.headers = { "Authorization": "Bearer " + token() };
   return fetch(path, o).then(function (r) {
     if (r.status === 401) { var e = new Error("unauth"); e.unauth = true; throw e; }
-    if (!r.ok) throw new Error(path + " → " + r.status);
+    if (!r.ok) {
+      // The status rides along on the error because one caller has to tell 404 apart from the
+      // rest: a /v1/conlog that is not deployed on this server yet is "no console here", which is
+      // a different sentence from "the server is failing" and must not be shouted every 2s.
+      var e2 = new Error(path + " → " + r.status);
+      e2.status = r.status;
+      throw e2;
+    }
     return r.json();
   });
 }
@@ -231,6 +285,7 @@ function render(st) {
   for (var i = 0; i < ages.length; i++) {
     ages[i].textContent = fmtAge(st.ts - Number(ages[i].getAttribute("data-ts")));
   }
+  conSyncDevices(st);
 }
 
 function poll() {
@@ -243,7 +298,7 @@ function poll() {
       // Said out loud rather than left as an empty page, which is what this looked like before:
       // a wrong token and a server that is down are the same blank screen otherwise, and one of
       // them is fixed by typing.
-      setStat("토큰이 거부되었습니다. 토큰을 지우고 다시 입력하세요.", true);
+      setStat(UNAUTH, true);
       return;   // no reschedule: retrying a rejected token every 5s answers nothing
     }
     setStat("서버에 연결할 수 없습니다: " + err.message, true);
@@ -280,6 +335,208 @@ document.getElementById("cards").addEventListener("click", function (ev) {
     btn.disabled = false;
     poll();
   });
+});
+
+// ---- The raw console --------------------------------------------------------------------------
+//
+// The panel already keeps its whole serial log in a PSRAM ring and already serves it, on TCP/23.
+// That is perfect and unreachable: port 23 exists on the greenhouse LAN, and the operator reading
+// this page is an hour away on a phone. This pane is those same bytes, over the same HTTP and the
+// same bearer as the rest of the page.
+//
+// It tails CHUNKS, not lines. /v1/conlog answers raw slices of the stream, and a slice may begin
+// or end mid-line; they are concatenated exactly as they arrive and nothing here splits, trims or
+// re-joins them. Reassembling lines would produce a pane that reads plausibly and is not what the
+// board printed, and a console that lies about a backtrace is worse than no console.
+var CON_MS = 2000;
+var CON_RETRY_MS = 15000;
+var CON_LIMIT = 64;      // the endpoint's own default, sent explicitly so the cadence math is here
+// The panel emits roughly 15KB a minute, so an unbounded pane is a phone tab that dies after an
+// hour. 240,000 characters is about 16 minutes of that. Past the cap the pane is trimmed back to
+// 180,000 (about 12 minutes) rather than to the cap itself: trimming to exactly the cap would mean
+// rebuilding the whole node on every 2s poll from then on, and this way that rebuild happens about
+// once every four minutes.
+var CON_CAP = 240000;
+var CON_KEEP = 180000;
+// "At the bottom" means within 24px of it, not exactly at it. scrollHeight, scrollTop and
+// clientHeight are fractional on a phone at any zoom but 100%, so an exact comparison is never
+// true there and the pane would refuse to stick for the entire session.
+var CON_STICK_PX = 24;
+
+var conDev = null;     // whose stream is in the pane
+var conDevSig = null;  // identity of the device list the chooser was built from
+var conSince = {};     // device -> highest chunk id already appended, kept per device
+var conText = "";      // the pane's exact bytes, mirrored here so trimming is string work
+var conPaused = false;
+var conStick = true;   // following the tail, until the operator scrolls up
+var conDead = false;   // a 401 stopped the tail for good; only a new token restarts it
+var conTimer = null;
+
+function conSay(text, bad) {
+  var el = document.getElementById("constat");
+  el.textContent = text;
+  el.className = bad ? "why bad" : "why";
+}
+
+// clearTimeout first, always: pause, clear, a device switch and a reply in flight can all want to
+// arm this, and two live timers would double the poll rate for the rest of the session.
+function conSchedule(ms) {
+  clearTimeout(conTimer);
+  conTimer = setTimeout(conPoll, ms);
+}
+
+function conAppend(text) {
+  var el = document.getElementById("con");
+  // A text node rather than textContent +=, which re-serialises and re-lays-out the entire pane on
+  // every poll. Appending below the viewport moves nothing the reader is looking at.
+  el.appendChild(document.createTextNode(text));
+  conText += text;
+  if (conText.length > CON_CAP) {
+    var cut = conText.length - CON_KEEP;
+    // Cut forward to the next newline so the oldest thing on screen is a whole line. Losing the
+    // remains of a line is honest; showing its tail flush left, as though the board printed a line
+    // that started there, is not.
+    var nl = conText.indexOf("\n", cut);
+    conText = conText.slice(nl < 0 ? cut : nl + 1);
+    // Both of these are read BEFORE the replacement, and the scrollTop especially: shrinking the
+    // box makes the browser clamp scrollTop to the new maximum on the spot, so reading it
+    // afterwards gives a number the browser has already corrected once, and subtracting the
+    // removed height from THAT scrolls the reader a second time. Measured: a 32,000px trim moved
+    // the text 13,000px under the eye until this was read up here.
+    var was = el.scrollHeight, top = el.scrollTop;
+    el.textContent = conText;
+    // The trim removed content ABOVE the reader, so everything they are reading slid up by exactly
+    // the height that went away. Give it back, or a reader parked on a backtrace is yanked forward
+    // every time the cap is hit - which is the one thing this pane must never do.
+    if (!conStick) el.scrollTop = Math.max(0, top - (was - el.scrollHeight));
+  }
+  if (conStick) el.scrollTop = el.scrollHeight;
+}
+
+function conSetDevice(dev) {
+  if (dev === conDev) return;
+  conDev = dev;
+  // The pane holds one board's stream. Two consoles interleaved in one <pre> would put the camera
+  // node's lines under the panel's name, so a switch starts from empty. The per-device cursor is
+  // kept, so what arrives next is what that board printed after the last chunk that was shown.
+  conText = "";
+  document.getElementById("con").textContent = "";
+  conStick = true;
+  document.getElementById("constick").hidden = true;
+  conSay("콘솔을 불러오는 중…", false);
+  conSchedule(0);
+}
+
+function conSyncDevices(st) {
+  var list = st.devices.map(function (d) { return d.device; });
+  if (!list.length) {
+    conDev = null;
+    conDevSig = null;
+    document.getElementById("condevbox").innerHTML = "";
+    conSay("보고한 보드가 없어 붙일 콘솔이 없습니다.", false);
+    return;
+  }
+  // A device that stopped being listed keeps its cursor in conSince and loses the pane.
+  if (list.indexOf(conDev) < 0) conSetDevice(list[0]);
+
+  var sig = list.join(",");
+  if (sig === conDevSig) return;   // rebuilt only when the list itself changes: a <select>
+  conDevSig = sig;                 // rebuilt every 5s would close under the operator's thumb
+  // A chooser with one option is furniture - a thumb-width of screen spent offering a choice that
+  // has already been made. Most greenhouses are one panel, so the ordinary page has no chooser and
+  // simply tails it; the select appears the day a second board reports.
+  var box = document.getElementById("condevbox");
+  if (list.length < 2) { box.innerHTML = ""; return; }
+  box.innerHTML = '<select id="condev">' + list.map(function (d) {
+    return '<option value="' + esc(d) + '"' + (d === conDev ? " selected" : "") + '>' +
+           esc(d) + '</option>';
+  }).join("") + '</select>';
+  document.getElementById("condev").addEventListener("change", function () {
+    conSetDevice(this.value);
+  });
+}
+
+function conPoll() {
+  if (conPaused || conDead || !conDev) return;
+  var dev = conDev, since = conSince[dev] || 0;
+  api("/v1/conlog?device=" + encodeURIComponent(dev) + "&since=" + since + "&limit=" + CON_LIMIT)
+    .then(function (r) {
+      // Switched while this was in flight. These bytes are another board's and conSetDevice has
+      // already armed the timer for the new one, so they are dropped rather than interleaved.
+      if (dev !== conDev) return;
+      // Never let the cursor go backwards - not even if the server says so. A since that regressed
+      // would re-request chunks that are already on screen and append them again, and a console
+      // that repeats itself is indistinguishable from a board stuck in a loop.
+      var next = Number(r.next);
+      if (next > since) conSince[dev] = next;
+      var rows = r.rows || [];
+      if (rows.length) {
+        conAppend(rows.map(function (c) { return c.text; }).join(""));
+      }
+      conSay(conText ? "" : "아직 콘솔에 들어온 내용이 없습니다.", false);
+      conSchedule(CON_MS);
+    })
+    .catch(function (err) {
+      if (err.unauth) {
+        // Then stop: re-asking a rejected token every two seconds answers nothing, and 토큰 지우기
+        // reloads the page, which is what restarts this.
+        conDead = true;
+        conSay(UNAUTH, true);
+        return;
+      }
+      // Whatever is in the pane is left exactly as it is. Blanking it would throw away the lines
+      // the operator is in the middle of reading, and those lines are still true - all that has
+      // happened is that no newer ones arrived.
+      //
+      // 404 included, deliberately, at the same slower cadence: a server without the route yet is
+      // an ordinary state of this page and not an error, and backing off to 15s means the pane
+      // picks the console up by itself once the route is deployed, with no reload.
+      if (err.status === 404) {
+        conSay("이 서버에는 아직 콘솔 기록이 없습니다. 15초마다 다시 확인합니다.", false);
+      } else {
+        conSay("콘솔을 가져오지 못했습니다: " + err.message + " · 15초 후 다시 시도합니다.", true);
+      }
+      conSchedule(CON_RETRY_MS);
+    });
+}
+
+document.getElementById("con").addEventListener("scroll", function () {
+  var at = this.scrollHeight - this.scrollTop - this.clientHeight <= CON_STICK_PX;
+  if (at === conStick) return;
+  conStick = at;
+  // Said out loud, because a pane that has quietly stopped following looks exactly like a board
+  // that has stopped printing, and one of those is fixed by scrolling down.
+  document.getElementById("constick").hidden = at;
+});
+
+document.getElementById("conpause").addEventListener("click", function () {
+  conPaused = !conPaused;
+  this.textContent = conPaused ? "계속" : "일시정지";
+  if (conPaused) {
+    // The fetch stops, not just the drawing. The point of the button is a phone that is not
+    // pulling 15KB a minute over a mobile link while nobody is reading it, so it says so rather
+    // than letting the operator assume the board went quiet. The cursor stays where it stopped, so
+    // 계속 resumes from that chunk - 64 chunks a poll means a long pause takes a few polls to
+    // catch up.
+    clearTimeout(conTimer);
+    conSay("가져오기를 멈췄습니다. 보드는 계속 출력하고 있고, 계속을 누르면 멈춘 지점부터 " +
+           "이어서 받습니다.", false);
+    return;
+  }
+  if (conDead) { conSay(UNAUTH, true); return; }   // resuming cannot fix a rejected token
+  conSay("콘솔을 불러오는 중…", false);
+  conSchedule(0);
+});
+
+document.getElementById("conclear").addEventListener("click", function () {
+  conText = "";
+  document.getElementById("con").textContent = "";
+  conStick = true;
+  document.getElementById("constick").hidden = true;
+  // The view only. The cursor is untouched, so this does not re-fetch what was cleared and does
+  // not delete anything on the server: it is a "I am reading from here" button, which is what an
+  // operator wants right before they make the board do something.
+  conSay("화면만 지웠습니다. 지금부터 들어오는 것만 보입니다.", false);
 });
 
 poll();

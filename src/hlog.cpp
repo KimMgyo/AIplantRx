@@ -15,9 +15,14 @@
 //
 // WHY A RING AND NOT A FILE. The interesting output is the most recent output, and a board that
 // is misbehaving may be about to reboot: a file needs flushing, an unmount, and a filesystem
-// that survives the panic, while a ring needs none of those and loses nothing that matters. Its
-// size is the only tuning: 16KB holds several minutes of the periodic status lines and the whole
-// boot sequence, so a client connecting after the fact still sees how the board came up.
+// that survives the panic, while a ring needs none of those and loses nothing that matters.
+//
+// WHY PORT 23 IS NOT ENOUGH, AND WHAT THE SECOND READER IS. `nc <panel> 23` only exists on the
+// LAN, and the greenhouse is an hour away from the laptop that has the toolchain. So the same
+// ring is also pushed to the server, which serves it on the operator page beside the cards - the
+// one place reachable from a phone. The push is a second reader of the same ring with its own
+// cursor, deliberately: the two must never be able to disagree about what the board said, and
+// sharing the ring rather than the socket is what guarantees that.
 //
 // WHY THE UART WRITE STAYS. A serial console is still the only thing that works when WiFi does
 // not, and this file exists precisely because one diagnostic path is not enough.
@@ -27,10 +32,19 @@
 #include <esp_log.h>
 #include <stdarg.h>
 #include "hlog.h"
+#include "net.h"
+#include "plantrx.h"
+#include "sitecfg.h"
 
-// 16KB in PSRAM. Internal RAM is the scarce pool on this board - the RGB framebuffer and LVGL
+// 256KB in PSRAM. Internal RAM is the scarce pool on this board - the RGB framebuffer and LVGL
 // already live there - and a log ring has no latency requirement that would justify spending it.
-static const size_t RING_CAP = 16 * 1024;
+//
+// The size is a retention target, not a guess. Measured: this panel prints about 15KB a minute
+// with the ordinary tags on, so 16KB held barely one minute and a fault that happened while
+// nobody was attached had already scrolled out of the ring before anyone could ask about it.
+// 256KB holds about 17 minutes, which covers the gap between a board misbehaving and somebody
+// opening the page. PSRAM has 1.8MB free with the camera streaming, so the 240KB is affordable.
+static const size_t RING_CAP = 256 * 1024;
 
 // One line's worth. Longer lines are truncated rather than heap-allocated: the longest thing
 // this project prints is plantrx's status line at about 320 characters, and a diagnostic that
@@ -119,6 +133,156 @@ static int log_vprintf(const char *fmt, va_list ap) {
     return n;
 }
 
+// ---- the push to the server ------------------------------------------------------------
+//
+// WHY THE BODY IS RAW BYTES AND NOT JSON. What this ships is a slice of a byte ring, not a list
+// of lines: a slice can begin and end mid-line, and that is a property worth keeping rather than
+// hiding. Escaping 4KB of arbitrary console text into JSON would cost a second buffer and an
+// encode pass on a board whose scarce pool is internal RAM, to describe bytes that need no
+// description. So the chunk goes up as text/plain and the server stores it as it arrived; the
+// page concatenates chunks and never tries to reassemble lines it was not given.
+//
+// THIS IS THE FOURTH PLACE IN THIS FIRMWARE THAT HAND-WRITES AN HTTP HEAD - plantrx.cpp,
+// plantid.cpp and nodelog.cpp are the others, and folding them is a real change that this is not.
+// They differ in path, method and content type, and the last attempt to share a socket layer
+// across them (shared/srvconn.h, for TLS) was reverted whole. shared/srvurl.h is the precedent
+// for how it should be done when someone does it: share the part that is genuinely identical -
+// there, parsing one URL four times - and leave the part that is not.
+
+static const char *CONLOG_PATH = "/v1/conlog";
+static const uint32_t PUSH_CONNECT_MS = 4000;
+static const uint32_t PUSH_REPLY_MS = 4000;
+
+// A gap between pushes, which is batching and not throttling, for the reason nodelog.cpp gives
+// about its own: at 15KB a minute one request per line would spend more time in TCP handshakes
+// than the log is worth. Three seconds is chosen against the page's 2s tail - the operator's view
+// is then at most one push behind, which reads as live without pretending to be a stream.
+static const uint32_t PUSH_GAP_MS = 3000;
+// And after a failure, for nodelog.cpp's reason: a connect to a dead host costs PUSH_CONNECT_MS,
+// and retrying at the success cadence on a panel whose server is down makes the log the reason
+// the log task is busy.
+static const uint32_t PUSH_FAIL_GAP_MS = 20000;
+
+// Staged in PSRAM and not on the stack. This task has 8KB and a WiFiClient connect goes through
+// lwIP inside it; a 4KB frame on top of that is how a log task becomes the thing that panics.
+static const size_t PUSH_CHUNK = 4 * 1024;
+static char *s_push_buf = nullptr;
+static size_t s_push_cursor = 0;
+static uint32_t s_push_next_ms = 0;
+static uint32_t s_push_fails = 0;
+
+// The status line, then the rest of the reply read and thrown away - the same shape and the same
+// reason as nodelog.cpp's: nothing the server says about an accepted chunk is worth parsing, but
+// the socket is still drained before stop(), because a close with bytes outstanding arrives as an
+// RST and uvicorn logs that as a broken pipe for a request it handled perfectly.
+static int push_status(WiFiClient &c, uint32_t start) {
+    char line[128];
+    size_t i = 0;
+    int status = -1;
+    bool have_line = false;
+
+    for (;;) {
+        int a = c.available();
+        if (a > 0) {
+            int ch = c.read();
+            if (ch < 0) continue;
+            if (!have_line) {
+                if (ch == '\n') {
+                    line[i] = '\0';
+                    have_line = true;
+                    // "HTTP/1.1 200 OK" - the code is the token after the first space.
+                    const char *sp = strchr(line, ' ');
+                    status = sp ? atoi(sp + 1) : 0;
+                } else if (ch != '\r' && i + 1 < sizeof(line)) {
+                    line[i++] = (char)ch;
+                }
+            }
+            continue;
+        }
+        if (!c.connected()) break;
+        if (millis() - start > PUSH_REPLY_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return status;
+}
+
+// Takes whatever the ring has beyond the push cursor and POSTs it. The cursor advances only on a
+// 2xx, so a server that is down loses nothing that the ring still holds - and when the ring does
+// overwrite unsent bytes, ring_take() snaps the cursor forward and counts it, which is why the
+// dropped total travels in a header rather than being silently absent.
+static void push_once(void) {
+    if (s_push_buf == nullptr) return;
+    if (!plantrx_srv_host()[0]) return;               // no server configured, nothing to push to
+
+    size_t at = s_push_cursor;
+    size_t n = 0;
+    while (n < PUSH_CHUNK) {
+        size_t got = ring_take(&at, s_push_buf + n, PUSH_CHUNK - n);
+        if (got == 0) break;
+        n += got;
+    }
+    if (n == 0) return;
+
+    WiFiClient c;
+    uint32_t start = millis();
+    if (!c.connect(plantrx_srv_host(), plantrx_srv_port(), PUSH_CONNECT_MS)) {
+        s_push_fails++;
+        s_push_next_ms = millis() + PUSH_FAIL_GAP_MS;
+        return;
+    }
+
+    char device[20];
+    net_mac(device, sizeof(device));
+    const char *tok = sitecfg_token();
+    c.print("POST "); c.print(plantrx_srv_prefix()); c.print(CONLOG_PATH);
+    c.print(" HTTP/1.0\r\n");
+    c.print("Host: "); c.print(plantrx_srv_host()); c.print(":"); c.print(plantrx_srv_port());
+    c.print("\r\n");
+    c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
+    c.print("Content-Type: text/plain\r\n");
+    c.print("Content-Length: "); c.print(n); c.print("\r\n");
+    c.print("X-Device: "); c.print(device); c.print("\r\n");
+    c.print("X-Dropped: "); c.print(s_dropped_clients); c.print("\r\n");
+    if (tok[0]) { c.print("Authorization: Bearer "); c.print(tok); c.print("\r\n"); }
+    c.print("Connection: close\r\n\r\n");
+    // No flush(), for the reason nodelog.cpp and fwpull.cpp both spell out: NetworkClient
+    // implements it as clear(), which empties the RX buffer this request is about to be judged by.
+
+    size_t sent = 0;
+    while (sent < n) {
+        size_t take = n - sent;
+        if (take > 1460) take = 1460;                 // one MSS, as the sibling POSTs send
+        size_t w = c.write((const uint8_t *)s_push_buf + sent, take);
+        if (w == 0) break;
+        sent += w;
+    }
+
+    int status = (sent == n) ? push_status(c, start) : -1;
+    c.stop();
+
+    if (status >= 200 && status < 300) {
+        s_push_cursor = at;                           // only now: an unacknowledged chunk is resent
+        s_push_fails = 0;
+        s_push_next_ms = millis() + PUSH_GAP_MS;
+        // Proof this panel's LAN uplink is alive, which net.h asks any successful exchange with
+        // any peer to report. Pointedly not the failure half - net_note_uplink_fail() is the
+        // server poll's vote alone, and a log push losing a race is not evidence the radio needs
+        // cycling. Same division nodelog.cpp draws, for the same reason.
+        net_note_uplink();
+        return;
+    }
+
+    // Said once per streak and not once per failure: this line goes into the ring it is about, so
+    // a server that is down for an hour would otherwise fill the log with the news that the log
+    // cannot be sent, and push the actual fault out the far end.
+    if (s_push_fails == 0) {
+        hlogf("[hlog] push failed, status=%d after %lums; retrying every %lus\n", status,
+              (unsigned long)(millis() - start), (unsigned long)(PUSH_FAIL_GAP_MS / 1000));
+    }
+    s_push_fails++;
+    s_push_next_ms = millis() + PUSH_FAIL_GAP_MS;
+}
+
 // ---- the listener ----------------------------------------------------------------------
 //
 // One client at a time, and the newest connection wins. Two people reading the same log is not
@@ -169,9 +333,17 @@ static void hlog_task(void *arg) {
             if (n > 0 && client.write((const uint8_t *)out, n) != n) client.stop();
         }
 
-        // 50ms. Fast enough that a line appears as it is printed and slow enough to stay out of
-        // the way: this board has already been reset once by a task that polled at 1ms and
-        // starved the idle task the watchdog watches (see camnet.cpp).
+        // The second reader, on its own cursor and its own clock. Placed here rather than in
+        // loop() because loop() runs the UI: a POST that stalls for PUSH_CONNECT_MS in there is
+        // four seconds of frozen touch screen, and this task already exists and already reads
+        // this ring for the socket above.
+        if ((int32_t)(millis() - s_push_next_ms) >= 0) push_once();
+
+        // 20ms with a client attached. Fast enough that a line appears as it is printed and slow
+        // enough to stay out of the way: this board has already been reset once by a task that
+        // polled at 1ms and starved the idle task the watchdog watches (see camnet.cpp). 200ms
+        // idle is still well inside PUSH_GAP_MS, so the push cadence is set by its own timer and
+        // not by which branch this lands in.
         vTaskDelay(pdMS_TO_TICKS(client ? 20 : 200));
     }
 }
@@ -186,11 +358,23 @@ void hlog_init(void) {
         return;
     }
 
+    // The push stages here rather than on the task stack, and a failure to get it costs the
+    // server copy only: the ring, the UART and port 23 all still work, so the board is degraded
+    // to what it was before the push existed rather than broken.
+    s_push_buf = (char *)heap_caps_malloc(PUSH_CHUNK, MALLOC_CAP_SPIRAM);
+    if (s_push_buf == nullptr) {
+        Serial.println("[hlog] PSRAM alloc failed for the push buffer; tcp/23 and UART only");
+    }
+
     esp_log_set_vprintf(log_vprintf);
 
     // Priority 1 and core 0: below everything that matters, beside the other network tasks.
     // A log reader must never be the reason a frame is dropped or an update stalls.
-    xTaskCreatePinnedToCore(hlog_task, "hlog", 4096, nullptr, 1, nullptr, 0);
+    //
+    // 8KB and not the 4KB this shipped with. The push opens a WiFiClient from inside this task
+    // and a connect goes through lwIP on the caller's stack; 4KB was sized for a task that only
+    // ever did a memcpy and a socket write on an already-open connection.
+    xTaskCreatePinnedToCore(hlog_task, "hlog", 8192, nullptr, 1, nullptr, 0);
 }
 
 uint32_t hlog_overruns(void) { return s_dropped_clients; }

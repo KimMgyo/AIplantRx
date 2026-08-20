@@ -952,6 +952,63 @@ def read_nodelog(role: Optional[str] = None,
     return [NodeLogRow(**r) for r in store.recent_node_logs(role, limit)]
 
 
+@v1.post("/conlog", dependencies=[Depends(auth)])
+async def post_conlog(request: Request,
+                      x_device: str = Header(default=""),
+                      x_dropped: int = Header(default=0)) -> dict:
+    """The panel's raw console, on its way to the one screen a phone can reach.
+
+    WHY THE BODY IS NOT A MODEL. Every other write on /v1 takes a pydantic body because every
+    other write carries fields with meanings. This one carries a slice of a byte ring: it has no
+    fields, it may begin and end mid-line, and validating it could only mean asserting it is text.
+    So the device and the drop count travel in headers - where the firmware can write them with
+    two c.print() calls and no encoder - and the body is read as bytes and decoded permissively.
+
+    Decoded with errors="replace" and not strict. The board is a C program printing into a ring
+    with a per-line truncation; a line clipped mid-UTF-8 sequence is a thing that happens, and
+    refusing the chunk would lose the 4KB around it to punish one byte. A replacement character in
+    a console view is self-explanatory. A 422 for a log push is not.
+
+    An empty body is accepted and stored as nothing. The firmware does not send one, but a proxy
+    retrying a request whose body it already forwarded should not read as an error.
+
+    Behind the same bearer as the rest of /v1, for the reason post_nodelog gives about its own
+    table: this is what an operator reads to find out what the panel did, and anyone who can write
+    into it can put words in the board's mouth.
+    """
+    raw = await request.body()
+    device = x_device.strip()
+    if not device:
+        # Refused rather than filed under "": a chunk with no device is unreadable by the page,
+        # which asks per device, so storing it would be storing something nobody can ever see.
+        raise HTTPException(status_code=400, detail="X-Device required")
+    n = store.save_console(device, raw.decode("utf-8", "replace"), x_dropped, scheduler.now())
+    return {"ok": True, "stored": n}
+
+
+@v1.get("/conlog", dependencies=[Depends(auth)])
+def read_conlog(device: str, since: int = 0,
+                limit: int = store.CONSOLE_READ_DEFAULT) -> dict:
+    """Console chunks after a cursor, for one device, oldest first.
+
+    The cursor is a row id and the answer carries the next one, so a page tails this by handing
+    back what it was last given. `next` is the `since` it was called with when there is nothing
+    new - never 0 - because a caller that stores the answer unconditionally would otherwise rewind
+    to the start of the table on the first quiet poll. See store.read_console.
+
+    No response_model, deliberately, and it is the only /v1 GET without one. A model here would
+    validate two integers and a string that is by definition unvalidatable, and it would have to
+    be written to allow anything, which is a model that documents nothing while claiming to.
+
+    `device` is required and not defaulted to "the only panel", even though there is one panel
+    today. The state route already hands the page a device list; a default here would be a second
+    place that decides which board is interesting, and the two would disagree the day a greenhouse
+    gets a second panel.
+    """
+    rows, nxt = store.read_console(device, since, limit)
+    return {"rows": rows, "next": nxt}
+
+
 # The only route where a server-side bug must still read as an ordinary answer, and the reason the
 # body below is shaped the way it is: `{rx_id, next_poll_s}` IS a Prescription (schema.py:578-584),
 # which means something to exactly one caller. Built from the router's own prefix so it cannot

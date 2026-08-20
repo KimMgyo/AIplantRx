@@ -60,6 +60,22 @@ NODE_LOG_TTL_S = 3 * 24 * 3600
 NODE_LOG_READ_DEFAULT = 200
 NODE_LOG_READ_MAX = 1000
 
+# The panel's raw console, which is a different kind of volume from every other table here: the
+# board prints about 15KB a minute with the ordinary tags on, so a day is roughly 20MB and three
+# days would be 60MB on a volume shared with the firmware images. Six hours is the compromise,
+# and it is chosen against what this is FOR - somebody notices the greenhouse is misbehaving and
+# opens the page, which happens in minutes or hours, not days. The board's own 256KB ring already
+# holds the last ~17 minutes, so anything shorter than a few hours here would add nothing to it.
+CONSOLE_TTL_S = 6 * 3600
+
+# What GET /v1/conlog hands back when it is not told, and the most it will hand back when it is
+# asked for more, clamped in read_console for the reason recent_node_logs gives: these are 4KB
+# chunks, so "give me everything" is a hundred megabytes assembled in memory, and the clamp has to
+# sit where no second caller can skip it. 64 chunks is 256KB, which is the whole board ring - a
+# page opening cold gets everything the board itself could have shown it, in one request.
+CONSOLE_READ_DEFAULT = 64
+CONSOLE_READ_MAX = 128
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
     id            INTEGER PRIMARY KEY,
@@ -227,6 +243,29 @@ CREATE TABLE IF NOT EXISTS device_fw (
     recv_ts  INTEGER NOT NULL,
     PRIMARY KEY (device, role)
 );
+
+-- The panel's console, stored as the chunks it arrived in rather than as lines. A chunk is a
+-- slice of the board's byte ring and may begin or end mid-line; splitting it here would mean
+-- guessing where a line ended on evidence the transport does not carry, and a console view that
+-- guesses wrong is a console view that misquotes a stack trace. So the bytes are kept verbatim
+-- and the reader concatenates them.
+--
+-- `dropped` is the board's running total of times a reader fell a whole ring behind and was
+-- snapped forward - the count of gaps, not their size. It travels with every chunk because the
+-- alternative is a page that cannot tell "the board went quiet" from "the board said more than
+-- the link could carry".
+CREATE TABLE IF NOT EXISTS device_console (
+    id      INTEGER PRIMARY KEY,
+    device  TEXT    NOT NULL,
+    recv_ts INTEGER NOT NULL,
+    dropped INTEGER NOT NULL DEFAULT 0,
+    text    TEXT    NOT NULL
+);
+-- Ascending from a cursor, for one device, is the only query this table has: a page tails it by
+-- remembering the last id it saw. id ascending IS chronological here - one writer, one connection,
+-- monotonic rowid - which is why the cursor can be an id and does not need a timestamp.
+CREATE INDEX IF NOT EXISTS ix_device_console_device_id
+    ON device_console (device, id);
 """
 
 _TELEMETRY_COLS = (
@@ -993,6 +1032,58 @@ def recent_node_logs(role: Optional[str] = None, limit: int = NODE_LOG_READ_DEFA
 
 
 # --------------------------------------------------------------------------
+# The panel's raw console
+# --------------------------------------------------------------------------
+
+
+def save_console(device: str, text: str, dropped: int, recv_ts: int) -> int:
+    """Store one chunk as it arrived and say how many bytes it was.
+
+    One row per POST and no attempt to coalesce with the previous one. Appending to a held row
+    would look tidier and is the wrong shape: the reader's cursor is a row id, so growing a row
+    the reader has already passed would hide bytes behind a cursor that has moved beyond them.
+
+    An empty chunk is not stored. The firmware does not send one - push_once() returns early when
+    the ring has nothing beyond its cursor - but a row that says nothing would still advance the
+    reader's cursor and cost a round trip to discover it was empty.
+    """
+    if not text:
+        return 0
+    _conn().execute(
+        "INSERT INTO device_console (device, recv_ts, dropped, text) VALUES (?,?,?,?)",
+        (device, int(recv_ts), int(dropped), text),
+    )
+    _maybe_prune()
+    return len(text)
+
+
+def read_console(device: str, since: int = 0,
+                 limit: int = CONSOLE_READ_DEFAULT) -> tuple[list[dict], int]:
+    """Chunks after `since` for one device, oldest first, and the cursor to ask with next.
+
+    Oldest first, which is the opposite of recent_node_logs and for the opposite reason: these
+    chunks are a byte stream and concatenating them out of order does not produce a shorter
+    console, it produces a wrong one.
+
+    The returned cursor is the highest id in this answer, or `since` unchanged when there was
+    nothing new. Handing back `since` rather than 0 or None matters: a caller that stores whatever
+    it is given would otherwise rewind to the beginning of the table on the first quiet poll and
+    replay six hours of console into the page.
+
+    An unknown device is not an error and answers with nothing. The device string comes from a
+    page that got it from this same database, so a mismatch means the board has not posted yet -
+    which is a state to render, not a 404 to handle.
+    """
+    n = max(1, min(int(limit), CONSOLE_READ_MAX))
+    rows = _conn().execute(
+        "SELECT id, recv_ts, dropped, text FROM device_console"
+        " WHERE device=? AND id>? ORDER BY id ASC LIMIT ?",
+        (device, int(since), n),
+    ).fetchall()
+    out = [dict(r) for r in rows]
+    return out, (out[-1]["id"] if out else int(since))
+
+# --------------------------------------------------------------------------
 # Firmware state, and the operator's read of the flags
 # --------------------------------------------------------------------------
 
@@ -1170,6 +1261,12 @@ def _prune_old(conn: sqlite3.Connection) -> None:
     # turn as well.
     conn.execute("DELETE FROM node_logs WHERE recv_ts < ?",
                  (int(time.time()) - NODE_LOG_TTL_S,))
+    # The console on its shortest cutoff of all - see CONSOLE_TTL_S. This is the table that grows
+    # fastest by an order of magnitude, so it is also the one where relying on the shared write
+    # counter matters most: its own inserts turn that counter several times a minute, which is
+    # what keeps six hours from becoming six hours plus however long the panel has been quiet.
+    conn.execute("DELETE FROM device_console WHERE recv_ts < ?",
+                 (int(time.time()) - CONSOLE_TTL_S,))
 
 
 def stats() -> dict[str, Any]:
@@ -1177,7 +1274,7 @@ def stats() -> dict[str, Any]:
     conn = _conn()
     out: dict[str, Any] = {"path": str(db_path())}
     for table in ("telemetry", "prescriptions", "frames", "llm_calls", "device_flags",
-                  "node_logs", "device_fw"):
+                  "node_logs", "device_fw", "device_console"):
         out[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     # The -wal sidecar holds everything written since the last checkpoint, so
     # the main file alone reads as 4KB on a busy database and makes the disk
