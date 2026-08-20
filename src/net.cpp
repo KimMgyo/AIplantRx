@@ -160,23 +160,29 @@ static void begin_target(const char *ssid, const char *pass) {
 // not advertise PMF in its RSN capabilities cannot be taken up on WPA3. Against a transition-mode
 // AP that means WPA2-PSK, no SAE exchange, and no derivation loop to sit in.
 //
-// WHAT THIS COSTS, BOTH HALVES MEASURED.
+// WHAT THIS COSTS.
 //
 // On the air: WPA2 rather than WPA3, and no PMF, so deauthentication frames are unprotected
 // again. Weighed against a bearer token that already crosses the public internet as cleartext on
 // port 80 (see the HTTPS attempt that was abandoned), the marginal exposure is small.
 //
-// On the clock: the join got five times slower. With WPA3 this AP refused once with AUTH_FAIL(202)
-// and was online after 9.4s; declining PMF it refuses repeatedly with AUTH_EXPIRE(2) and is online
-// after 50s on the fifth try. The retry ladder below is what carries it, unchanged - the AP simply
-// needs more attempts to settle on WPA2. Once per boot on a board that boots rarely, and bounded,
-// but it is a real regression to weigh against a crash that is not yet proven fixed.
+// On the clock: unclear, and stated that way rather than guessed. Sixteen boots after this change
+// came online in 9-27s - the documented AUTH_FAIL(202) refusal first, then one to four
+// AUTH_EXPIRE(2) retries, carried by the ladder below unchanged. There is exactly one measurement
+// from before it, at 9.4s, which is not enough to say whether WPA2 is slower at all. An earlier
+// note here claimed 50s and a five-fold regression; that was one sample taken immediately after
+// the failed hash-to-element experiment, when the AP still had state from it, and repeating the
+// measurement did not reproduce it.
 //
-// STILL A HYPOTHESIS. The evidence is one backtrace and a counter that climbs; what settles it is
-// health.cpp's crash count staying still across several boots. Applied through a helper because
-// there are two connect paths and only one of them used to set any of this: connect_blind() left
-// the driver at its defaults, so a fallback association would have run the old policy and muddied
-// exactly this observation.
+// WHAT IS MEASURED ABOUT THE CRASH. Sixteen boots, no ESP_RST_TASK_WDT among them, and
+// health.cpp's counter flat across the six that were watched to settle. That is supportive and it
+// is not proof: the crash was intermittent before this too. Three counter increments DID appear
+// in a first run that reset the board every ~12s, which resets it mid-WiFi-bringup - a pattern
+// this board never sees in service, and the reason that run is not evidence either way.
+//
+// Applied through a helper because there are two connect paths and only one of them used to set
+// any of this: connect_blind() left the driver at its defaults, so a fallback association would
+// have run the old policy and muddied exactly this observation.
 static void apply_security_policy(void) {
     wifi_config_t conf = {};
     if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return;
