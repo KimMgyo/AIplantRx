@@ -35,8 +35,9 @@ WHAT IS IN THE CHARSET
                      stop being 12px holes in a 14px string for the same reason
                      the Hangul did
   Hangul             every U+AC00-D7A3 syllable appearing in a string literal
-                     anywhere in src/ or include/ (fonts excluded), and in
-                     server/app/*.py
+                     anywhere in src/ or include/ (fonts excluded), in the two
+                     node firmwares under sensor_node/ and esp32cam-streamer/,
+                     and in server/app/*.py
 
 The server half is not optional. Half the Korean on the panel is minted server
 side, and only half of THAT is model prose: render.py and schema.py name the
@@ -124,13 +125,23 @@ def _read(path):
 def hangul():
     """Every Hangul syllable either program can name in advance, in code order.
 
-    Both literal grammars, because both halves reach the same screen: C string
-    literals under src/ and include/, and Python ones - including the triple
-    quoted prompt blocks - under server/app/.
+    Three sources, because all three reach the same screen. C string literals under src/ and
+    include/ are the panel's own. Python ones under server/app/ - including the triple quoted
+    prompt blocks - are minted server side and arrive over the poll.
+
+    And the two OTHER firmwares, which is the least obvious of the three and was found by a
+    comment. The sensor node and the camera report their own progress in Korean over ESP-NOW
+    ("펌웨어 내려받는 중", sensor_node/src/nodeota.cpp) and the PANEL is what draws it: those
+    boards have no screen at all. Deriving from the panel and the server alone left 려 out, so
+    every update a node performed drew that syllable of its own status line a size smaller than
+    the rest - the same bug as the server half, arriving over a different wire.
     """
     found = set()
     for src, pat in ((os.path.join(ROOT, "src"), _LITERAL),
                      (os.path.join(ROOT, "include"), _LITERAL),
+                     (os.path.join(ROOT, "sensor_node", "src"), _LITERAL),
+                     (os.path.join(ROOT, "sensor_node", "include"), _LITERAL),
+                     (os.path.join(ROOT, "esp32cam-streamer", "src"), _LITERAL),
                      (os.path.join(ROOT, "server", "app"), _PY_LITERAL)):
         for dirpath, dirnames, filenames in os.walk(src):
             dirnames[:] = [d for d in dirnames if d not in ("fonts", "__pycache__")]
