@@ -173,6 +173,50 @@ def test_the_read_limit_is_clamped_in_the_store():
     return "limit is clamped to CONSOLE_READ_MAX and floored at one, in the store"
 
 
+def test_tail_returns_the_newest_chunks_still_ascending():
+    """The cold-open question, which reading forward from 0 answers with the wrong end.
+
+    Both halves are asserted because getting one right is easy: `tail` has to hand back the
+    NEWEST chunks, and it has to hand them back in stream order anyway - newest-first would be a
+    console that reads bottom to top inside the page's very first paint.
+    """
+    for i in range(12):
+        assert _post("chunk-%02d\n" % i).status_code == 200
+
+    d = _get(tail=1, limit=4).json()
+    texts = [r["text"] for r in d["rows"]]
+    assert len(texts) == 4, texts
+    assert texts == sorted(texts), "tail came back newest-first: %r" % texts
+    assert texts[-1] == "chunk-11\n", texts[-1]
+    assert texts[0] == "chunk-08\n", texts[0]
+    assert d["next"] == max(r["id"] for r in d["rows"])
+
+    # And the handover: the cursor from a tail read is a cursor, so the next poll drops tail and
+    # follows forward without a gap and without a repeat.
+    _post("after-the-tail\n")
+    nxt = _get(since=d["next"]).json()
+    assert [r["text"] for r in nxt["rows"]] == ["after-the-tail\n"], nxt["rows"]
+    return "tail hands back the newest chunks in stream order, and its cursor follows forward"
+
+
+def test_tail_ignores_since_rather_than_combining_with_it():
+    """Two different questions. A caller that passed both does not know which it asked."""
+    everything = _get(limit=store.CONSOLE_READ_MAX).json()["rows"]
+    newest_id = max(r["id"] for r in everything)
+    d = _get(since=newest_id, tail=1, limit=3).json()
+    assert len(d["rows"]) == 3, "since suppressed the tail: %r" % d["rows"]
+    assert d["rows"][-1]["id"] == newest_id
+    return "tail=1 answers the newest N even when since is already at the end"
+
+
+def test_tail_on_an_empty_device_is_still_empty():
+    """C, through the other branch: the tail query has its own SQL and its own way to be wrong."""
+    d = _get(device="AA:BB:CC:DD:EE:FF", tail=1)
+    assert d.status_code == 200, d.text
+    assert d.json() == {"rows": [], "next": 0}, d.text
+    return "an unposted device tails to nothing rather than raising"
+
+
 def test_both_routes_need_the_bearer():
     """F. DEVICE_TOKEN is a module global and is put back in a finally, for the reason
     test_nodelog.py gives about its own auth test: the other files in this directory
@@ -218,6 +262,9 @@ if __name__ == "__main__":
                test_text_clipped_mid_utf8_is_accepted,
                test_an_empty_body_stores_nothing_and_is_not_an_error,
                test_the_read_limit_is_clamped_in_the_store,
+               test_tail_returns_the_newest_chunks_still_ascending,
+               test_tail_ignores_since_rather_than_combining_with_it,
+               test_tail_on_an_empty_device_is_still_empty,
                test_both_routes_need_the_bearer,
                test_the_prune_bounds_the_table):
         print("%-52s %s" % (fn.__name__, fn()))

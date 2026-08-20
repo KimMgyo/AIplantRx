@@ -1057,9 +1057,9 @@ def save_console(device: str, text: str, dropped: int, recv_ts: int) -> int:
     return len(text)
 
 
-def read_console(device: str, since: int = 0,
-                 limit: int = CONSOLE_READ_DEFAULT) -> tuple[list[dict], int]:
-    """Chunks after `since` for one device, oldest first, and the cursor to ask with next.
+def read_console(device: str, since: int = 0, limit: int = CONSOLE_READ_DEFAULT,
+                 tail: bool = False) -> tuple[list[dict], int]:
+    """Chunks for one device, oldest first, and the cursor to ask with next.
 
     Oldest first, which is the opposite of recent_node_logs and for the opposite reason: these
     chunks are a byte stream and concatenating them out of order does not produce a shorter
@@ -1070,17 +1070,41 @@ def read_console(device: str, since: int = 0,
     it is given would otherwise rewind to the beginning of the table on the first quiet poll and
     replay six hours of console into the page.
 
+    `tail` is what a console view opens with, and it exists because measuring the alternative was
+    embarrassing. Reading forward from 0 hands back the OLDEST chunks first, so a page that starts
+    there shows console from hours ago and walks toward the present a page per poll: 372 chunks
+    after twenty-five minutes of pushing already took seven polls, and six hours of retention is
+    roughly 8MB and three minutes of crawling before anything live appears - on a phone. With
+    `tail` the newest `limit` chunks come back instead, still ascending, which is exactly what the
+    board's own TCP/23 listener does when a client connects: hand over the ring, not the history
+    of the world.
+
+    `tail` ignores `since` rather than combining with it. "The newest N" and "everything after
+    my cursor" are different questions and a call that asked both would be a caller that does not
+    know which one it wanted.
+
     An unknown device is not an error and answers with nothing. The device string comes from a
     page that got it from this same database, so a mismatch means the board has not posted yet -
     which is a state to render, not a 404 to handle.
     """
     n = max(1, min(int(limit), CONSOLE_READ_MAX))
-    rows = _conn().execute(
-        "SELECT id, recv_ts, dropped, text FROM device_console"
-        " WHERE device=? AND id>? ORDER BY id ASC LIMIT ?",
-        (device, int(since), n),
-    ).fetchall()
-    out = [dict(r) for r in rows]
+    conn = _conn()
+    if tail:
+        # Newest n by id descending, then reversed: SQLite has no way to take the last n rows of
+        # an ascending scan without reading all of them, and the index is on (device, id).
+        rows = conn.execute(
+            "SELECT id, recv_ts, dropped, text FROM device_console"
+            " WHERE device=? ORDER BY id DESC LIMIT ?",
+            (device, n),
+        ).fetchall()
+        out = [dict(r) for r in reversed(rows)]
+    else:
+        rows = conn.execute(
+            "SELECT id, recv_ts, dropped, text FROM device_console"
+            " WHERE device=? AND id>? ORDER BY id ASC LIMIT ?",
+            (device, int(since), n),
+        ).fetchall()
+        out = [dict(r) for r in rows]
     return out, (out[-1]["id"] if out else int(since))
 
 # --------------------------------------------------------------------------

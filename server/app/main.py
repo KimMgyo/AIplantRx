@@ -988,13 +988,18 @@ async def post_conlog(request: Request,
 
 @v1.get("/conlog", dependencies=[Depends(auth)])
 def read_conlog(device: str, since: int = 0,
-                limit: int = store.CONSOLE_READ_DEFAULT) -> dict:
-    """Console chunks after a cursor, for one device, oldest first.
+                limit: int = store.CONSOLE_READ_DEFAULT, tail: bool = False) -> dict:
+    """Console chunks for one device, oldest first.
 
-    The cursor is a row id and the answer carries the next one, so a page tails this by handing
-    back what it was last given. `next` is the `since` it was called with when there is nothing
-    new - never 0 - because a caller that stores the answer unconditionally would otherwise rewind
-    to the start of the table on the first quiet poll. See store.read_console.
+    Two questions, and `tail` says which. Without it: everything after `since`, which is how a
+    page follows a board it is already watching. With it: the newest `limit` chunks regardless of
+    `since`, which is how a page OPENS - reading forward from 0 would show console from hours ago
+    and crawl toward the present one page per poll. See store.read_console for the measurement.
+
+    The cursor comes back either way, so the caller stores `next` and drops `tail` from then on.
+    `next` is the `since` it was called with when there is nothing new - never 0 - because a
+    caller that stores the answer unconditionally would otherwise rewind to the start of the table
+    on the first quiet poll.
 
     No response_model, deliberately, and it is the only /v1 GET without one. A model here would
     validate two integers and a string that is by definition unvalidatable, and it would have to
@@ -1005,7 +1010,7 @@ def read_conlog(device: str, since: int = 0,
     place that decides which board is interesting, and the two would disagree the day a greenhouse
     gets a second panel.
     """
-    rows, nxt = store.read_console(device, since, limit)
+    rows, nxt = store.read_console(device, since, limit, tail)
     return {"rows": rows, "next": nxt}
 
 

@@ -459,7 +459,15 @@ function conSyncDevices(st) {
 function conPoll() {
   if (conPaused || conDead || !conDev) return;
   var dev = conDev, since = conSince[dev] || 0;
-  api("/v1/conlog?device=" + encodeURIComponent(dev) + "&since=" + since + "&limit=" + CON_LIMIT)
+  // No cursor yet means this pane is opening on this board, and opening asks for the TAIL. The
+  // alternative reads forward from the oldest chunk the server still holds, which is where six
+  // hours of retention lives: measured at 372 chunks after twenty-five minutes, a cold open spent
+  // seven polls walking through console from before the operator arrived. tail=1 hands back the
+  // newest CON_LIMIT chunks instead, which is what the board's own tcp/23 listener does for a
+  // connecting client. Every poll after this one has a cursor and follows it forward.
+  var q = "/v1/conlog?device=" + encodeURIComponent(dev) + "&limit=" + CON_LIMIT +
+          (since ? "&since=" + since : "&tail=1");
+  api(q)
     .then(function (r) {
       // Switched while this was in flight. These bytes are another board's and conSetDevice has
       // already armed the timer for the new one, so they are dropped rather than interleaved.
