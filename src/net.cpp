@@ -143,12 +143,32 @@ static void begin_target(const char *ssid, const char *pass) {
 //   #24 wifi_sta_connect_internal_process
 //
 // with the program counters landing in esp_random() (hw_random.c:84) and mbedtls_mpi_div_mpi()
-// (bignum.c:1436). sae_derive_pwe_ecc IS the hunting-and-pecking derivation. Nothing in it is
-// broken: the WiFi task holds CPU 0 long enough inside the loop that the idle task on that core
-// misses its watchdog deadline, and the panic reboots the panel. It compounds, which is the part
-// that matters - the note further down records that this AP refuses the first association of
-// every boot, so every boot runs the derivation at least twice, and a watchdog reset is a boot.
-// health.cpp's cumulative counter moved 145 -> 150 across one evening.
+// (bignum.c:1436). sae_derive_pwe_ecc IS the hunting-and-pecking derivation, and this file used to
+// claim the mechanism: that esp_random() is slow enough for the loop to hold CPU 0 past the
+// watchdog deadline. THAT CLAIM WAS MEASURED AND IT IS WRONG.
+//
+// esp_random() on this board costs 22.288 us a draw, and it is meant to. hw_random.c sets
+// APB_CYCLE_WAIT_NUM to 1778 for the S3 because ~45 kHz is the fastest sampling rate Espressif
+// has validated for the hardware entropy source, and 1778 cycles at an 80 MHz APB clock is
+// 22.225 us - a 0.3% match to the measurement, so this is the designed rate limit and not a
+// degraded part. It is a busy-wait, so it does burn CPU at the caller's priority. But a 256-bit
+// draw is eight words, 178 us, and dragonfly_min_pwe_loop_iter() asks for 40 iterations: 7.1 ms
+// of it per derivation, against a 5-second watchdog. Three orders of magnitude short.
+//
+// The RNG's quality was measured too, and it is fine: bit balance 0.5018, chi-square 271 against
+// 255 degrees of freedom, no repeated or degenerate words in 4KB, with the radio off and again
+// with WiFi associated.
+//
+// So the coredump located the crash and did not explain it. A tight busy-wait is a PC magnet -
+// any sample of a thread that passes through esp_random() is likely to land there - and reading
+// duration out of one sampled program counter is how a bystander becomes a suspect.
+//
+// WHAT IS ACTUALLY KNOWN, kept separate from what was inferred: the resets happened inside an
+// association, they stopped when WPA3 stopped being negotiated, and health.cpp's cumulative
+// counter moved 145 -> 150 across one evening and has been flat at 153 since. It compounds,
+// because the note further down records that this AP refuses the first association of every boot,
+// so every boot runs the derivation at least twice and a watchdog reset is a boot. The mechanism
+// is unexplained. Declining WPA3 removes the symptom and is not a diagnosis.
 //
 // ASKING FOR HASH-TO-ELEMENT WAS TRIED FIRST AND THIS AP CANNOT DO IT. With
 // WPA3_SAE_PWE_HASH_TO_ELEMENT the association stops at reason 210,

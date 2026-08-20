@@ -24,6 +24,21 @@
 // with a bearer token in it as cleartext, which the far end would drop on the floor. The failure
 // would read as "the server stopped answering". So a URL somebody types with the wrong scheme on
 // the settings page fails loudly at the parse instead of quietly on the wire.
+//
+// AND THE REASON TLS WAS ABANDONED IS NOW KNOWN TO BE WRONG, which matters because it is the only
+// thing standing between a bearer token and the public internet. The TLS client was dropped on
+// the reading that mbedtls could not seed its CTR_DRBG - "the entropy source failed" - which
+// pointed at this board's hardware RNG. Measured directly since: mbedtls_ctr_drbg_seed() succeeds
+// here in 1.7 ms with the radio off and 2.0 ms with WiFi associated, mbedtls_entropy_func()
+// returns real bytes both times, and esp_random() passes a bit-balance and chi-square check. The
+// numeric code recorded next to that failure, 0x0032, is MBEDTLS_ERR_DES_INVALID_INPUT_LENGTH,
+// which cannot be what a handshake returned - so a real symptom and an unrelated number were read
+// as one diagnosis.
+//
+// The observed facts are unchanged and still unexplained: the handshake reported success and the
+// first write put zero bytes on the wire. Entropy is not the reason. Whoever picks HTTPS back up
+// starts from that, and from the fact that the server already serves it - https://<host>/health
+// answers 200 today - so this is a client-side problem with a known-good far end.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
