@@ -351,6 +351,11 @@ document.getElementById("cards").addEventListener("click", function (ev) {
 var CON_MS = 2000;
 var CON_RETRY_MS = 15000;
 var CON_LIMIT = 64;      // the endpoint's own default, sent explicitly so the cadence math is here
+// The opening request asks for more rows, because it is bounded by BYTES on the server side
+// (CONSOLE_TAIL_BYTES, 256KB - the board's own ring) and a 64-row ceiling would cut that short
+// whenever the panel is quiet: a chunk is whatever the ring held when the push fired, about 790
+// bytes on an idle board, so 64 of them is 50KB and three minutes rather than seventeen.
+var CON_TAIL_LIMIT = 320;
 // The panel emits roughly 15KB a minute, so an unbounded pane is a phone tab that dies after an
 // hour. 240,000 characters is about 16 minutes of that. Past the cap the pane is trimmed back to
 // 180,000 (about 12 minutes) rather than to the cap itself: trimming to exactly the cap would mean
@@ -463,10 +468,11 @@ function conPoll() {
   // alternative reads forward from the oldest chunk the server still holds, which is where six
   // hours of retention lives: measured at 372 chunks after twenty-five minutes, a cold open spent
   // seven polls walking through console from before the operator arrived. tail=1 hands back the
-  // newest CON_LIMIT chunks instead, which is what the board's own tcp/23 listener does for a
-  // connecting client. Every poll after this one has a cursor and follows it forward.
-  var q = "/v1/conlog?device=" + encodeURIComponent(dev) + "&limit=" + CON_LIMIT +
-          (since ? "&since=" + since : "&tail=1");
+  // newest 256KB instead - the board's own ring - which is what its tcp/23 listener does for a
+  // connecting client. Every poll after this one has a cursor and follows it forward at CON_LIMIT.
+  var q = "/v1/conlog?device=" + encodeURIComponent(dev) +
+          (since ? "&since=" + since + "&limit=" + CON_LIMIT
+                 : "&tail=1&limit=" + CON_TAIL_LIMIT);
   api(q)
     .then(function (r) {
       // Switched while this was in flight. These bytes are another board's and conSetDevice has

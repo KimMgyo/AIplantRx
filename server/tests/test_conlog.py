@@ -209,6 +209,40 @@ def test_tail_ignores_since_rather_than_combining_with_it():
     return "tail=1 answers the newest N even when since is already at the end"
 
 
+def test_the_tail_is_bounded_in_bytes_and_not_in_chunks():
+    """The bound that matters, and the one the first version of this got wrong.
+
+    A chunk is whatever the ring held when the push fired, so its size follows the board's log
+    rate: reasoning "64 chunks is 256KB" and measuring 50KB is what this pins. Written with
+    deliberately small chunks, because that is the case a chunk-counted tail under-serves - the
+    quiet board, which is also the board somebody is squinting at to find out why it is quiet.
+    """
+    small = "x" * 100 + "\n"
+    per = len(small)
+    want = store.CONSOLE_TAIL_BYTES // per + 40          # more than the budget can hold
+    for _ in range(want):
+        assert _post(small).status_code == 200
+
+    rows, _ = store.read_console(DEV, tail=True, limit=store.CONSOLE_READ_MAX)
+    got = sum(len(r["text"]) for r in rows)
+    assert len(rows) == store.CONSOLE_READ_MAX, (
+        "the row ceiling stopped it before the byte budget: %d rows" % len(rows))
+    assert got == store.CONSOLE_READ_MAX * per, got
+
+    # And with room to spare on rows, the byte budget is what ends it: ask for enough rows that
+    # the budget has to be the thing that stops the walk.
+    store.CONSOLE_READ_MAX, was = 10 ** 6, store.CONSOLE_READ_MAX
+    try:
+        rows, _ = store.read_console(DEV, tail=True, limit=10 ** 6)
+    finally:
+        store.CONSOLE_READ_MAX = was
+    got = sum(len(r["text"]) for r in rows)
+    assert got >= store.CONSOLE_TAIL_BYTES, "the tail stopped short of the budget: %d" % got
+    assert got < store.CONSOLE_TAIL_BYTES + per, "the tail overshot by more than one chunk: %d" % got
+    assert rows == sorted(rows, key=lambda r: r["id"]), "byte-bounded tail lost its order"
+    return "the tail fills a byte budget, includes the chunk that crosses it, stays ascending"
+
+
 def test_tail_on_an_empty_device_is_still_empty():
     """C, through the other branch: the tail query has its own SQL and its own way to be wrong."""
     d = _get(device="AA:BB:CC:DD:EE:FF", tail=1)
@@ -244,12 +278,18 @@ def test_the_prune_bounds_the_table():
     store._conn().execute(
         "INSERT INTO device_console (device, recv_ts, dropped, text) VALUES (?,?,?,?)",
         (DEV, old, 0, "[hlog] this is older than the ttl\n"))
-    assert any("older than the ttl" in r["text"]
-               for r in store.read_console(DEV, 0, store.CONSOLE_READ_MAX)[0])
+    # Read with tail rather than from 0: the row just inserted has the OLDEST recv_ts and the
+    # NEWEST id, and by this point the table has thousands of chunks in it, so a forward read from
+    # zero would return the oldest page and never see it. Coupling a prune assertion to how many
+    # rows earlier tests happened to write is how a suite starts passing for the wrong reason.
+    def _present():
+        rows, _ = store.read_console(DEV, tail=True, limit=8)
+        return any("older than the ttl" in r["text"] for r in rows)
+
+    assert _present()
     store._prune_old(store._conn())
-    assert not any("older than the ttl" in r["text"]
-                   for r in store.read_console(DEV, 0, store.CONSOLE_READ_MAX)[0])
-    assert store.read_console(DEV, 0, store.CONSOLE_READ_MAX)[0], "the prune took everything"
+    assert not _present()
+    assert store.read_console(DEV, tail=True, limit=8)[0], "the prune took everything"
     return "rows past CONSOLE_TTL_S go and newer ones stay"
 
 
@@ -265,6 +305,9 @@ if __name__ == "__main__":
                test_tail_returns_the_newest_chunks_still_ascending,
                test_tail_ignores_since_rather_than_combining_with_it,
                test_tail_on_an_empty_device_is_still_empty,
+               # Last of the tail group on purpose: it writes thousands of chunks, and the two
+               # above assert against specific ones being newest.
+               test_the_tail_is_bounded_in_bytes_and_not_in_chunks,
                test_both_routes_need_the_bearer,
                test_the_prune_bounds_the_table):
         print("%-52s %s" % (fn.__name__, fn()))

@@ -69,12 +69,20 @@ NODE_LOG_READ_MAX = 1000
 CONSOLE_TTL_S = 6 * 3600
 
 # What GET /v1/conlog hands back when it is not told, and the most it will hand back when it is
-# asked for more, clamped in read_console for the reason recent_node_logs gives: these are 4KB
-# chunks, so "give me everything" is a hundred megabytes assembled in memory, and the clamp has to
-# sit where no second caller can skip it. 64 chunks is 256KB, which is the whole board ring - a
-# page opening cold gets everything the board itself could have shown it, in one request.
+# asked for more, clamped in read_console for the reason recent_node_logs gives: the clamp has to
+# sit where no second caller can skip it.
 CONSOLE_READ_DEFAULT = 64
-CONSOLE_READ_MAX = 128
+CONSOLE_READ_MAX = 320
+
+# And the bound that actually matters, because the chunk count is not one. A chunk is however much
+# the ring held when the push timer fired, so its size follows the board's log RATE and not any
+# constant here: PUSH_CHUNK caps it at 4KB, but a quiet panel pushing every 3s at ~250 B/s sends
+# about 790 bytes. The first version of this reasoned "64 chunks is 256KB, the whole board ring"
+# and measured 50KB - three and a half minutes, a fifth of what the comment claimed - because it
+# assumed full chunks. Bounding the tail by bytes is invariant to that, and 256KB is chosen to
+# match the two numbers it should agree with: hlog.cpp's ring, so the page opens on what the board
+# itself could have shown, and the pane's own DOM cap, beyond which the page discards anyway.
+CONSOLE_TAIL_BYTES = 256 * 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
@@ -1075,9 +1083,11 @@ def read_console(device: str, since: int = 0, limit: int = CONSOLE_READ_DEFAULT,
     there shows console from hours ago and walks toward the present a page per poll: 372 chunks
     after twenty-five minutes of pushing already took seven polls, and six hours of retention is
     roughly 8MB and three minutes of crawling before anything live appears - on a phone. With
-    `tail` the newest `limit` chunks come back instead, still ascending, which is exactly what the
-    board's own TCP/23 listener does when a client connects: hand over the ring, not the history
-    of the world.
+    `tail` the newest CONSOLE_TAIL_BYTES worth comes back instead, still ascending, which is
+    exactly what the board's own TCP/23 listener does when a client connects: hand over the ring,
+    not the history of the world. Bounded in bytes and not in chunks because a chunk's size
+    follows the board's log rate - see CONSOLE_TAIL_BYTES for the measurement that made that
+    obvious - so `limit` is a ceiling on rows and the byte budget is what ends a default tail.
 
     `tail` ignores `since` rather than combining with it. "The newest N" and "everything after
     my cursor" are different questions and a call that asked both would be a caller that does not
@@ -1090,14 +1100,28 @@ def read_console(device: str, since: int = 0, limit: int = CONSOLE_READ_DEFAULT,
     n = max(1, min(int(limit), CONSOLE_READ_MAX))
     conn = _conn()
     if tail:
-        # Newest n by id descending, then reversed: SQLite has no way to take the last n rows of
-        # an ascending scan without reading all of them, and the index is on (device, id).
+        # Newest first, then reversed: SQLite cannot take the last n rows of an ascending scan
+        # without reading all of them, and the index is on (device, id).
+        #
+        # Stopped on bytes rather than on `limit`, for the reason CONSOLE_TAIL_BYTES gives - the
+        # chunk count is not a bound on anything the caller cares about. `limit` is still the
+        # ceiling, so a caller that wants a small tail gets one, but the byte budget is what
+        # decides where a default-sized tail ends. The row that crosses the budget is INCLUDED:
+        # dropping it would cut a chunk out of the middle of the stream, and the whole contract
+        # here is that chunks concatenate.
         rows = conn.execute(
             "SELECT id, recv_ts, dropped, text FROM device_console"
             " WHERE device=? ORDER BY id DESC LIMIT ?",
             (device, n),
         ).fetchall()
-        out = [dict(r) for r in reversed(rows)]
+        newest: list[dict] = []
+        budget = CONSOLE_TAIL_BYTES
+        for r in rows:
+            newest.append(dict(r))
+            budget -= len(r["text"])
+            if budget <= 0:
+                break
+        out = list(reversed(newest))
     else:
         rows = conn.execute(
             "SELECT id, recv_ts, dropped, text FROM device_console"
