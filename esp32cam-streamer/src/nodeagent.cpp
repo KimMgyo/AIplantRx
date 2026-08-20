@@ -261,6 +261,9 @@ static void fill_report(NodeRepMsg *r, uint8_t kind) {
     r->phase = (kind == NODE_PROG) ? s_phase : NODE_PH_IDLE;
     r->pct   = (kind == NODE_PROG) ? s_pct   : NODE_PCT_NONE;
     r->flags = current_flags();
+    // Why this boot happened, beside how long it has lasted. Sent on every frame and not only on
+    // HELLO, so a panel that missed the HELLO still learns it. See NodeRepMsg.reset_reason.
+    r->reset_reason = (uint8_t)esp_reset_reason();
 
     if (WiFi.status() == WL_CONNECTED) {
         IPAddress ip = WiFi.localIP();

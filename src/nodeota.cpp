@@ -42,6 +42,7 @@
 #include "nodeota.h"
 #include "camprov.h"
 #include "nodelog.h"
+#include "health.h"   // health_reset_name_of() for the reason a node sends over the wire
 #include "sitecfg.h"
 #include "hlog.h"
 
@@ -93,6 +94,7 @@ struct NodeState {
     uint8_t  ip[4];
     uint32_t uptime_s;
     uint32_t free_heap;
+    uint8_t  reset_reason;   // as sent; 0 = unknown, which is also what a pre-field board sends
     uint8_t  elf_sha[8];
     char     ver[17];        // elf_sha as lowercase hex, written only when elf_sha changes
 
@@ -338,6 +340,7 @@ void nodeota_on_recv(const NodeRepMsg *m, const uint8_t *mac) {
     st.ip[3]     = m->ip[3];
     st.uptime_s  = m->uptime_s;
     st.free_heap = m->free_heap;
+    st.reset_reason = m->reset_reason;
     // Rewritten only when the image actually changed. It is 17 bytes read from another task, and
     // re-encoding the same hash every 3s would be 17 bytes of tearing window every 3s in
     // exchange for nothing.
@@ -672,13 +675,18 @@ void nodeota_debug_tick(void) {
         if (st.flags & NODEF_CAN_OTA) fl[n++] = 'O';
         if (st.flags & NODEF_VERBOSE) fl[n++] = 'V';
         fl[n] = '\0';
+        // reset= sits beside up=, because those two answer one question together and neither
+        // answers it alone: uptime says a board restarted, the reason says whether somebody
+        // pulled its power or its watchdog fired. Reading only the first is how a power cut gets
+        // diagnosed as a firmware bug.
         hlogf("[nodeota] %-4s %s age=%lums ph=%s pct=%d ip=%u.%u.%u.%u heap=%lu up=%lus "
-              "ver=%s flags=%s%s\n",
+              "reset=%s ver=%s flags=%s%s\n",
               name, node_online(st, now) ? "ONLINE" : "STALE",
               (unsigned long)(now - st.last_ms), phase_name(st.phase),
               (st.phase == NODE_PH_DL && st.pct <= 100) ? (int)st.pct : -1,
               st.ip[0], st.ip[1], st.ip[2], st.ip[3],
               (unsigned long)st.free_heap, (unsigned long)st.uptime_s,
+              health_reset_name_of(st.reset_reason),
               st.ver[0] ? st.ver : "-", fl[0] ? fl : "-",
               st.cmd_left > 0 ? " (cmd retrying)" : "");
     }

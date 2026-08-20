@@ -4,6 +4,7 @@
 #include <esp_app_desc.h>
 #include <esp_now.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>   // esp_reset_reason(), reported in NodeRepMsg.reset_reason
 #include <esp_timer.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -112,6 +113,10 @@ static void fill_common(NodeRepMsg *m, uint8_t kind) {
     m->phase = NODE_PH_IDLE;
     m->pct = NODE_PCT_NONE;
     m->flags = flags_now();
+    // Why this boot happened, beside how long it has lasted. Cheap to read - the IDF caches it
+    // from the reset registers at startup - and sent on every frame rather than only on HELLO, so
+    // a panel that missed the HELLO still learns it. See NodeRepMsg.reset_reason.
+    m->reset_reason = (uint8_t)esp_reset_reason();
     IPAddress ip = WiFi.localIP();
     m->ip[0] = ip[0];
     m->ip[1] = ip[1];

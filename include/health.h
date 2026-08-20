@@ -46,6 +46,12 @@ void health_crash_reported(void);
 // because this goes on the wire for a human to read.
 const char *health_reset_name(void);
 
+// The same map for a reason that arrived from somewhere else - the two console-less boards send
+// theirs in NodeRepMsg.reset_reason, and duplicating the switch on the receiving side would be a
+// second place to forget a case. Unknown values, including the 0 an un-reflashed board sends,
+// read as "unknown".
+const char *health_reset_name_of(uint8_t reason);
+
 // Crashes since the device was first flashed, across power cycles. A number that climbs while
 // telemetry keeps arriving is a board in a crash loop that still manages to report - which is
 // exactly the state that was invisible before this existed.

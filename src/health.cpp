@@ -412,8 +412,12 @@ uint32_t health_revert_addr(void) { return s_good; }
 // Short, stable, wire-friendly names. Not esp_reset_reason()'s enum number: a server log
 // reading "reset=7" sends the reader to a header file, and the whole point of this field is
 // that somebody looking at telemetry learns something immediately.
-const char *health_reset_name(void) {
-    switch (s_reason) {
+//
+// Takes the value rather than reading s_reason, because the two boards with no console send
+// theirs over ESP-NOW as a byte (NodeRepMsg.reset_reason) and a second copy of this switch on
+// the receiving side would be a second place to forget a case.
+const char *health_reset_name_of(uint8_t reason) {
+    switch ((esp_reset_reason_t)reason) {
     case ESP_RST_POWERON:   return "power";
     case ESP_RST_EXT:       return "ext";
     case ESP_RST_SW:        return "sw";
@@ -427,3 +431,5 @@ const char *health_reset_name(void) {
     default:                return "unknown";
     }
 }
+
+const char *health_reset_name(void) { return health_reset_name_of((uint8_t)s_reason); }

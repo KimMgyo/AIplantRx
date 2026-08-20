@@ -119,7 +119,19 @@ struct __attribute__((packed)) NodeRepMsg {
     uint8_t  phase;        // NodePhase; NODE_PH_IDLE on HELLO and LOG
     uint8_t  pct;          // 0..100 during NODE_PH_DL, else NODE_PCT_NONE
     uint8_t  flags;        // NODEF_*
-    uint8_t  reserved;     // keeps ip[4] and the two uint32s naturally aligned on the receiver
+    // WHY A BOARD'S RESET CAUSE IS ON THE WIRE, IN THE BYTE THAT USED TO BE PADDING.
+    // uptime_s below can only say a node restarted, never why, and the two boards this protocol
+    // serves are the two nobody can attach a console to. That gap is not theoretical: a node
+    // going quiet after somebody pulled its power and a node going quiet from a watchdog reset
+    // look identical from here, and a reader with only uptime_s to go on will supply the missing
+    // half themselves - which is exactly how a power cut got diagnosed as a WPA3 bug once.
+    //
+    // esp_reset_reason()'s enum, not a string, because one byte was already sitting here for
+    // alignment and 192 must not move (see the assert below). It stays compatible for free:
+    // ESP_RST_UNKNOWN is 0 and nothing ever wrote this field, so a board that has not been
+    // reflashed reports "unknown", which is true rather than misleading. The panel turns it into
+    // a name with health_reset_name_of().
+    uint8_t  reset_reason; // esp_reset_reason_t; 0 = ESP_RST_UNKNOWN, incl. senders predating it
     uint8_t  ip[4];        // STA IPv4; 0.0.0.0 when not joined
     uint32_t uptime_s;     // since boot. A number that keeps resetting is a node in a crash loop
     uint32_t free_heap;    // bytes. The one figure that predicts a node about to stop talking
