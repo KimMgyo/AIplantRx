@@ -396,18 +396,44 @@ void nodeota_on_recv(const NodeRepMsg *m, const uint8_t *mac) {
         nodelog_add(m->role, st.log);
         break;
 
-    case NODE_PROG:
+    case NODE_PROG: {
         s_rx_prog++;
+        // THE UPDATE'S OWN NARRATIVE, INTO THE LOG RING AS WELL AS ONTO THE CARD.
+        //
+        // A node emits nothing on NODE_LOG unless somebody turned its stream on, and the control
+        // that did that was removed when the firmware page became three identical cards. So the
+        // one sequence the log table exists for - what a board said either side of an update -
+        // was the one sequence never reaching it, while every word of it was already arriving
+        // here on this branch. The node needs no change for this; both of them are already
+        // saying it.
+        //
+        // ON A CHANGE, and the change test is what makes it affordable. The download reports
+        // ~40 times with a moving pct and a FIXED string ("펌웨어 내려받는 중"), so comparing the
+        // words collapses the whole transfer to one line and leaves the percentage to the
+        // progress bar, which is whose job it is. What survives is the five lines that are
+        // actually events: preparing, joining WiFi, checking, downloading, and the verdict -
+        // installed, already current, or a failure reason. That fits a twenty-line ring with room
+        // for the other board's update beside it.
+        //
+        // The comparison happens before the copy below overwrites st.text, and it is bounded to
+        // NODEPROTO_TEXT because m->text came off the radio and is not promised a terminator.
+        bool said_something_new = (m->phase != st.phase) ||
+                                  strncmp(st.text, m->text, NODEPROTO_TEXT) != 0;
         copy_text(st.text, sizeof(st.text), m->text, NODEPROTO_TEXT);
         st.status  = st.text;    // published after the copy, never before
         st.phase   = m->phase;
         st.pct     = m->pct;
         st.prog_ms = now;
+        // The node's own words, unprefixed. A phase marker would be panel prose in a table whose
+        // whole value is that every line in it came off another board, and NODELOG_TEXT is exactly
+        // NODEPROTO_TEXT - so a prefix would buy a label by truncating the sentence it labels.
+        if (said_something_new) nodelog_add(m->role, st.text);
         // The acknowledgement the resends were waiting for. Any non-idle phase proves the node
         // heard a command and started acting on it - which is a stronger statement than a
         // heartbeat, and the reason the resends are not cleared by one.
         if (m->phase != NODE_PH_IDLE) st.cmd_left = 0;
         break;
+    }
 
     default:
         // A kind this build does not know. Degrade to nothing happened, exactly as nodeproto.h
