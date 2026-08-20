@@ -17,15 +17,17 @@
 // nobody can parse is a typo, and guessing at it would point a firmware install at a server that
 // does not exist.
 //
-// https:// IS REFUSED ON PURPOSE, and refusing it is the whole reason this note is long. There is
-// no TLS client on any of these three boards - it was built, it did not work, and it was taken
-// back out; see the commit that removed shared/srvconn.h. Parsing https:// and handing back
-// port 443 would leave every caller opening a PLAIN socket to a TLS port and writing a request
-// with a bearer token in it as cleartext, which the far end would drop on the floor. The failure
-// would read as "the server stopped answering". So a URL somebody types with the wrong scheme on
-// the settings page fails loudly at the parse instead of quietly on the wire.
+// BOTH SCHEMES PARSE, AND THE SCHEME IS THE ONLY THING THAT DECIDES ENCRYPTION. https:// sets
+// SrvUrl.tls and defaults the port to 443; http:// clears it and defaults to 80; an explicit
+// ":port" beats either default. Nothing else in these firmwares chooses: srvconn.h reads that one
+// flag and hands back a secure or a plain client accordingly, so switching the whole fleet from
+// cleartext to TLS is editing one string in NVS.
 //
-// AND HTTPS IS NOT BLOCKED - IT WORKS. THIS IS THE ONE THING TO READ BEFORE TOUCHING THIS FILE.
+// This file used to refuse https:// on purpose, because there was no TLS client to hand it to and
+// returning port 443 to a caller holding a plain WiFiClient writes a bearer token at a TLS port in
+// the clear. That refusal is gone because the reason is gone.
+//
+// HTTPS WORKS ON THIS HARDWARE. THIS IS THE ONE THING TO READ BEFORE TOUCHING THIS FILE.
 //
 // The client was dropped on the reading that mbedtls could not seed its CTR_DRBG from this board's
 // hardware RNG. That was measured and it is false: mbedtls_ctr_drbg_seed() succeeds here in 1.7ms
@@ -59,10 +61,8 @@
 //   that is a 60% duty cycle of TLS setup for logs alone. Whoever does the migration holds one
 //   connection open for the push rather than handshaking per chunk; the batching is already there.
 //
-// So https:// still parses to a refusal HERE, and that is now a statement about this parser and
-// not about the hardware: nothing in these three firmwares can speak it yet, and handing back
-// port 443 to a caller holding a plain WiFiClient writes a bearer token at a TLS port in the
-// clear. Teach the callers first, then this.
+// Both limits above are handled rather than left as warnings: srvconn.h pins ISRG Root X1, and
+// hlog.cpp holds one connection across pushes instead of handshaking per chunk.
 //
 // THREE BUILD TRAPS THE LAST ATTEMPT PAID FOR, so the next one does not:
 //
@@ -93,18 +93,31 @@ struct SrvUrl {
     char     host[SRVURL_HOST_CAP];
     char     prefix[SRVURL_PREFIX_CAP];  // path prefix, "" for none, never a trailing slash
     uint16_t port;
+    bool     tls;                        // https:// - the caller must open a secure socket
 };
 
 // True when `url` parsed. `out` is untouched on failure except for being zeroed, so a caller that
 // ignores the return value cannot end up pointing at a half-parsed host.
+//
+// `tls` is the whole of what the scheme decides here. This function does not know how to open a
+// socket and must not: srvconn.h is where the flag turns into a client, and a caller that reads
+// `port` without reading `tls` writes a bearer token in the clear at a TLS port. That is why the
+// field is not called `secure` or `https` - it is named after the thing the caller has to DO.
 static inline bool srvurl_parse(const char *url, struct SrvUrl *out) {
     memset(out, 0, sizeof(*out));
     if (url == NULL) return false;
 
     const char *p = url;
-    if (strncmp(p, "http://", 7) != 0) return false;   // https:// included - see the note above
-    out->port = 80;
-    p += 7;
+    if (strncmp(p, "https://", 8) == 0) {
+        out->tls = true;
+        out->port = 443;
+        p += 8;
+    } else if (strncmp(p, "http://", 7) == 0) {
+        out->port = 80;
+        p += 7;
+    } else {
+        return false;                                  // anything else is a typo, not a scheme
+    }
 
     size_t i = 0;
     while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(out->host)) out->host[i++] = *p++;
@@ -114,7 +127,7 @@ static inline bool srvurl_parse(const char *url, struct SrvUrl *out) {
     if (*p == ':') {
         int port = atoi(p + 1);
         if (port <= 0 || port > 65535) return false;
-        out->port = (uint16_t)port;
+        out->port = (uint16_t)port;                    // an explicit port beats the scheme default
         while (*p && *p != '/') p++;
     }
     i = 0;

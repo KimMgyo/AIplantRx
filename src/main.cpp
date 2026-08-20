@@ -27,6 +27,20 @@ using namespace esp_panel::board;
 
 Board *board = nullptr;
 
+// THE TLS HANDSHAKE RUNS ON THIS TASK, AND 8192 IS NOT ENOUGH FOR IT.
+//
+// plantrx_poll() opens the server socket from loop(), so with an https:// URL the handshake and
+// every mbedtls_ssl_write() after it run on the Arduino loop task - which defaults to 8192 bytes
+// and had no override here. Measured: a handshake alone peaks at 4.4KB (shared/srvurl.h), and
+// loop() is already several frames deep by the time plantrx_poll() is reached, past the LVGL lock
+// and a dozen debug ticks.
+//
+// The failure was not a panic, which is why this took a while to find. The handshake COMPLETED and
+// connect() returned 1; the first write then put 0 bytes on the wire with connected() already
+// false - measured as `[diag] conn=2830ms body=0/728 connected=0`. That is the exact symptom that
+// got TLS abandoned in this project once before and blamed on the RNG.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 
 void setup() {
     Serial.begin(115200);

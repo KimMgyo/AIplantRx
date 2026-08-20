@@ -31,6 +31,7 @@
 #include "nodeagent.h"
 #include "nodeproto.h"
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
+#include "srvconn.h"   // ...and the one socket that address opens, encrypted or not
 
 // provision.cpp registers this peer and re-adds it after every radio cycle; this is the address
 // it registers. Kept local rather than exported: provision.h's constants carry a "MUST
@@ -74,9 +75,9 @@ static const uint32_t STALL_MS = 20000;
 
 // A ceiling on the whole image transfer, because the stall timeout alone cannot bound it: a link
 // trickling one segment every nineteen seconds never trips it and would keep the camera dark for
-// as long as it kept doing that. Four minutes against a measured ~99-142KB/s for the 1,193,168
+// as long as it kept doing that. Four minutes against a measured ~99-142KB/s for the 1,195,648
 // byte image this builds is about twenty times the honest duration, so nothing that is actually
-// working reaches it. TLS grew the image by ~88KB, which is under a second of that link.
+// working reaches it. TLS grew the image by 92,676 bytes, which is under a second of that link.
 static const uint32_t IMAGE_BUDGET_MS = 240000;
 
 // 4KB, matching SPI_FLASH_SEC_SIZE and UpdateClass's own buffer, so one write() lands as exactly
@@ -410,22 +411,69 @@ static long json_long(const char *buf, const char *key, long dflt) {
 // the image that is not tidiness but the whole check: Update.begin() has to be told the exact size
 // before the first byte is written, and a chunked body only reveals its length after the last
 // chunk has gone past.
-static void write_get_head(WiFiClient &c, const char *path, const char *accept) {
-    c.print("GET "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
-    c.print("User-Agent: SmartFarm-ESP32CAM/1.0\r\n");
-    c.print("Accept: "); c.print(accept); c.print("\r\n");
-    if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
-    c.print("Connection: close\r\n\r\n");
+//
+// ONE WRITE, NOT SEVENTEEN. This was a run of c.print() calls, which over plain TCP costs nothing
+// at all: Nagle coalesces them into a single segment. Over TLS every print() becomes its OWN TLS
+// RECORD, each with a 5-byte header and a MAC, so a 250-byte request head went out as seventeen
+// tiny records - and the server this talks to sits behind Cloudflare, which RESETS a connection
+// that does that. Measured on the panel against this same server: MBEDTLS_ERR_NET_CONN_RESET
+// (-0x0050) on the FIRST write, a few hundred milliseconds after a handshake that had succeeded,
+// and 200 OK for the identical head sent as one write(). src/plantrx.cpp holds that measurement.
+// It is also the symptom that got TLS abandoned in this project once and blamed on the RNG.
+//
+// This board needs it more than the panel does, not less. A reset frame post on the panel is one
+// upload and a retry seconds later. A reset here lands in the middle of an OTA on a board with no
+// screen and no console, mounted where it can see the crop, and the only way back is a ladder, a
+// screwdriver and USB.
+//
+// 512 bytes, sized from the fields this head actually carries and their caps: 115 bytes of fixed
+// text, plus prefix (SRVURL_PREFIX_CAP, 47) + path (79, the caller's path[80] - a role query on
+// NODEPROTO_PATH_LATEST or _IMAGE) + host (SRVURL_HOST_CAP, 63) + a 5-digit port + accept (24,
+// "application/octet-stream") + bearer token (NODEPROTO_TOKEN, 95). That is 429 of 512 with every
+// one of those at its cap, so a real head - "/v1/firmware/image?role=cam" and a token nearer 40 -
+// uses well under half of it.
+//
+// On the stack, not file-static, and it is inside the margin nodeagent_start() already reasoned
+// out: 8192 bytes for a path fwpull needed 6144 for, of which the comment there spends 384 on this
+// file's format buffer and 512 on the manifest body. These 512 are the third, still 600-odd short
+// of that 2048. They are also gone before read_head() reads a byte, so they are only ever live
+// under the mbedtls write they feed - shallower than the handshake conn.connect() completes on
+// this same stack.
+static void write_get_head(Client &c, const char *path, const char *accept) {
+    char head[512];
+    int n = snprintf(head, sizeof(head),
+                     "GET %s%s HTTP/1.0\r\n"
+                     "Host: %s:%u\r\n"
+                     "User-Agent: SmartFarm-ESP32CAM/1.0\r\n"
+                     "Accept: %s\r\n",
+                     s_url.prefix, path, s_url.host, (unsigned)s_url.port, accept);
+    if (s_tok[0] && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Authorization: Bearer %s\r\n", s_tok);
+    }
+    if (n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Connection: close\r\n\r\n");
+    }
+    // Truncated, so NOT SENT. A clipped head has lost its terminating blank line, which reads to
+    // the server as a request that never ended: it would answer nothing, read_head() would spend
+    // its whole budget waiting, and the fault would present as a download that stalled rather than
+    // as a request that was wrong. Said out loud instead, because every field above is capped
+    // somewhere else and this firing means one of those caps moved.
+    if (n <= 0 || n >= (int)sizeof(head)) {
+        nodeagent_logf("[ota] request head needs %d bytes, cap is %u\n",
+                       n, (unsigned)sizeof(head));
+        return;
+    }
+    c.write((const uint8_t *)head, (size_t)n);
     // No flush(). NetworkClient implements flush() as clear(), which empties the RX buffer - so
     // the call reads as "make sure the request is out" while throwing away reply bytes that
-    // already arrived. print() writes synchronously, which is the only completion this wanted.
+    // already arrived. write() reaches the socket synchronously, which is the only completion
+    // this wanted.
 }
 
 // One CRLF-terminated line with the CRLF stripped, or -1 when the socket closed or the budget ran
 // out. A line longer than `cap` is clipped and the rest still consumed, so a header this file does
 // not read cannot desynchronise the ones it does.
-static int read_line(WiFiClient &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
+static int read_line(Client &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
     size_t i = 0;
     for (;;) {
         int ch = c.read();
@@ -445,7 +493,7 @@ static int read_line(WiFiClient &c, char *out, size_t cap, uint32_t start, uint3
 
 // Status line plus headers, leaving the socket on the first body byte. Returns the HTTP status, 0
 // for a reply that is not HTTP, -1 when nothing arrived. `clen` gets the Content-Length, or -1.
-static int read_head(WiFiClient &c, uint32_t start, uint32_t budget, long *clen) {
+static int read_head(Client &c, uint32_t start, uint32_t budget, long *clen) {
     *clen = -1;
     int status = 0;
     char line[192];
@@ -468,7 +516,7 @@ static int read_head(WiFiClient &c, uint32_t start, uint32_t budget, long *clen)
 
 // The rest of a small body until the server closes. -1 when it did not fit - a manifest that
 // overflows this buffer is not a manifest, and truncating it hands the parser a half-written hash.
-static int read_body(WiFiClient &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
+static int read_body(Client &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
     size_t n = 0;
     uint32_t last = millis();
     for (;;) {
@@ -504,20 +552,36 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_LATEST);
 
-    WiFiClient c;
+    // SrvConn rather than a WiFiClient: the scheme in the URL the panel sent decides whether this
+    // socket is encrypted, and that decision is not this call site's to make. shared/srvconn.h
+    // holds the why - seven sites across three firmwares open a socket to this server, and a
+    // per-site opt-out is how six end up encrypted and the seventh writes the bearer token in
+    // write_get_head() across the site LAN in the clear.
+    //
+    // `start` is taken before the connect exactly as before, so REPLY_MS still budgets the connect
+    // AND the reply together. A verified handshake measured 1.84s against 0.79s for a plain
+    // connect (shared/srvurl.h): the manifest keeps a little over six of its eight seconds instead
+    // of a little over seven, for a reply that is a stat() and five scalars.
+    SrvConn  conn;
     uint32_t start = millis();
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
+    Client  *cp = conn.connect(s_url, CONNECT_MS);
+    if (!cp) {
         nodeagent_logf("[ota] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
+    // Bound as a reference so every read below is character-for-character the call it was before
+    // the socket could be encrypted. read/available/connected/stop ARE virtual on Client, which is
+    // what makes that safe; connect() is NOT, which is why conn made that one call and nothing
+    // here can repeat it through a base-class handle.
+    Client &c = *cp;
     write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    c.stop();
+    conn.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published for this role. That is an
@@ -566,20 +630,22 @@ static bool download_and_install(const char *md5, size_t size) {
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_IMAGE);
 
-    WiFiClient c;
+    SrvConn  conn;
     uint32_t start = millis();
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
+    Client  *cp = conn.connect(s_url, CONNECT_MS);
+    if (!cp) {
         nodeagent_logf("[ota] cannot reach %s:%u for the image\n",
                        s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
+    Client &c = *cp;
     write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] image HTTP %d\n", status);
         fail("서버 응답 오류");
         return false;
@@ -589,7 +655,7 @@ static bool download_and_install(const char *md5, size_t size) {
         // against a file an operator can replace between them, and an image that is not the one
         // the hash and the md5 describe must never reach Update.begin() - past that point the
         // inactive slot is being erased for something nobody vouched for.
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] image is %ld bytes, manifest said %u - refusing\n",
                        clen, (unsigned)size);
         fail("크기 불일치");
@@ -612,7 +678,7 @@ static bool download_and_install(const char *md5, size_t size) {
     // 4KB-a-time allocation this file does control is the one that must not compete with it.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         fail("메모리 부족");
         return false;
@@ -621,7 +687,7 @@ static bool download_and_install(const char *md5, size_t size) {
     if (!Update.begin(size, U_FLASH)) {
         nodeagent_logf("[ota] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -631,7 +697,7 @@ static bool download_and_install(const char *md5, size_t size) {
         nodeagent_logf("[ota] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -704,7 +770,7 @@ static bool download_and_install(const char *md5, size_t size) {
     // conn.stop() and not c.stop(): closing the socket leaves the session allocated, and the
     // ~32KB of internal DRAM it holds is wanted by the md5 and the flash driver under the
     // Update.end() a few lines down.
-    c.stop();
+    conn.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which
@@ -1014,7 +1080,9 @@ void nodeagent_start(void) {
     // gets a core to itself and leaves the radio's alone.
     //
     // 8192 bytes: the same path fwpull needed 6144 for - the flash driver and the MD5 under
-    // Update - plus this file's 384-byte format buffer and a 512-byte manifest body.
+    // Update - plus this file's 384-byte format buffer, a 512-byte manifest body and the 512-byte
+    // request head write_get_head() builds so it can go out as one TLS record instead of
+    // seventeen. Those three are 1408 of the 2048 over fwpull's figure.
     //
     // Priority 5, matching fwpull's and above rtsp/http at 2: an install that loses a race does
     // not fail slowly, it fails partway through, and while one is running nothing else here

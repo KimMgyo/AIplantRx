@@ -29,6 +29,7 @@
 #include <string.h>
 #include "nodeproto.h"
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
+#include "srvconn.h"   // and the socket that address decides: plain or TLS, never a per-site call
 #include "nodelog.h"
 #include "plantrx.h"
 #include "updatemode.h"
@@ -229,36 +230,72 @@ static size_t build_body(uint32_t from, uint32_t to) {
 
 // ---- HTTP ------------------------------------------------------------------------------------
 //
-// Hand-written against a WiFiClient, the same as fwpull.cpp and plantrx.cpp, and HTTP/1.0 for
-// their reason: 1.0 has no chunked transfer encoding, so a reply is plain bytes and there is no
-// de-framing pass in front of the status line.
+// One stack SrvConn per POST - encrypted or not as shared/srvurl.h read the stored base URL, with
+// no say in it from here - and HTTP/1.0 for plantrx.cpp's reason: 1.0 has no chunked transfer
+// encoding, so a reply is plain bytes and there is no de-framing pass in front of the status line.
+//
+// A handshake per POST is not free: 1.84s with verification, measured on this board against this
+// server. It is paid anyway, and there is no plain-for-logs exception, because this request
+// carries the same bearer the uplink does and a console line is the site's node names, its
+// failures and its timings. What makes it affordable is that the cost lands per WINDOW and not per
+// line - POST_GAP_MS below already batches everything that arrived while the last request was in
+// flight, so a talkative node widens the window rather than adding handshakes. hlog.cpp answers
+// the same arithmetic the other way, by holding one connection across its pushes.
 
 static const uint32_t CONNECT_MS = 4000;   // fwpull.cpp's figure; same LAN, same server
 static const uint32_t REPLY_MS = 6000;     // an append to a log file, not a model run
 static const uint32_t IDLE_MS = 2000;      // a gap this long inside the reply means it ended
 
-static void write_post_head(WiFiClient &c, size_t clen) {
+// ONE WRITE, NOT NINETEEN. This was a run of c.print() calls, which over plain TCP costs nothing:
+// Nagle coalesces them into one segment. Over TLS every print() becomes its OWN TLS RECORD, each
+// with a header and a MAC, so a ~250-byte head went out as 19 tiny records - and Cloudflare, which
+// this server sits behind, resets a connection that does that. Measured as
+// MBEDTLS_ERR_NET_CONN_RESET (-0x0050) on the first write a few hundred milliseconds after a
+// handshake that had already succeeded; plantrx.cpp's write_request_head() carries the numbers and
+// the same fix. Nothing about the request changed here - same fields, same values, same order,
+// same HTTP/1.0 - only how the bytes reach the socket.
+//
+// 448 bytes, sized from what THIS head can hold rather than copied from plantrx.cpp's 512: a
+// 48-byte prefix cap and an 11-byte path, a 64-byte host cap and a 5-digit port, ten digits of
+// Content-Length, a 96-byte token cap, and 179 bytes of fixed header text. That is 411 with the
+// NUL, so 448 is the next round number with room and no more.
+static void write_post_head(Client &c, size_t clen) {
     const char *tok = sitecfg_token();
-    c.print("POST "); c.print(plantrx_srv_prefix()); c.print(NODEPROTO_PATH_LOG);
-    c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(plantrx_srv_host()); c.print(":"); c.print(plantrx_srv_port());
-    c.print("\r\n");
-    c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
-    c.print("Accept: application/json\r\n");
-    c.print("Content-Type: application/json\r\n");
-    c.print("Content-Length: "); c.print(clen); c.print("\r\n");
-    if (tok[0]) { c.print("Authorization: Bearer "); c.print(tok); c.print("\r\n"); }
-    c.print("Connection: close\r\n\r\n");
+    char head[448];
+    int n = snprintf(head, sizeof(head),
+                     "POST %s%s HTTP/1.0\r\n"
+                     "Host: %s:%u\r\n"
+                     "User-Agent: SmartFarm-ESP32/1.0\r\n"
+                     "Accept: application/json\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %u\r\n",
+                     plantrx_srv_prefix(), NODEPROTO_PATH_LOG,
+                     plantrx_srv_host(), (unsigned)plantrx_srv_port(),
+                     (unsigned)clen);
+    if (tok[0] && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Authorization: Bearer %s\r\n", tok);
+    }
+    if (n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Connection: close\r\n\r\n");
+    }
+    // Truncation would send a head with no blank line, which reads to the server as a request that
+    // never ended. Said out loud rather than silently sent: every field here is capped elsewhere,
+    // so this firing means one of those caps moved.
+    if (n <= 0 || n >= (int)sizeof(head)) {
+        hlogf("[nodelog] request head needs %d bytes, cap is %u\n", n, (unsigned)sizeof(head));
+        return;
+    }
+    c.write((const uint8_t *)head, (size_t)n);
     // No flush(), for the reason fwpull.cpp's write_get_head() spells out: NetworkClient
     // implements it as clear(), which empties the RX buffer and would throw away the status line
-    // this request is about to be judged by. print() writes to the socket synchronously.
+    // this request is about to be judged by. write() reaches the socket synchronously.
 }
 
 // The status line, then the rest of the reply read and thrown away. Nothing the server says about
 // an accepted log line is worth parsing, but the socket is still drained before stop(): a close
 // with bytes outstanding arrives as an RST, and uvicorn logs that as a broken pipe for a request
 // it handled perfectly. Returns the HTTP status, 0 for a reply that is not HTTP, -1 for silence.
-static int read_status_and_drain(WiFiClient &c, uint32_t start) {
+static int read_status_and_drain(Client &c, uint32_t start) {
     // One CRLF-terminated line, CRLF stripped. Mirrors fwpull.cpp's read_line(), which is static
     // to that file; a line longer than this is clipped and the rest still consumed.
     char line[128];
@@ -298,26 +335,35 @@ static int read_status_and_drain(WiFiClient &c, uint32_t start) {
 }
 
 static bool post_body(size_t len) {
-    WiFiClient c;
+    SrvConn sc;
     uint32_t start = millis();
-    if (!c.connect(plantrx_srv_host(), plantrx_srv_port(), CONNECT_MS)) {
-        hlogf("[nodelog] cannot reach %s:%u\n", plantrx_srv_host(),
-              (unsigned)plantrx_srv_port());
+    const SrvUrl *u = plantrx_srv_url();
+    Client *c = sc.connect(*u, CONNECT_MS);
+    if (!c) {
+        // mbedtls's own words appended when it has any. The gate is the URL's flag and not
+        // sc.tls(), which reports on a live socket and so reads false on exactly this path - the
+        // one path with a handshake failure to report. last_error() leaves the buffer empty when
+        // no handshake was attempted, so the plain socket still logs the line it always did, and
+        // a cert that will not verify is told apart from a server that is simply not there.
+        char err[96] = "";
+        if (u->tls) sc.last_error(err, sizeof(err));
+        hlogf("[nodelog] cannot reach %s:%u%s%s\n", u->host, (unsigned)u->port,
+              err[0] ? " - " : "", err);
         return false;
     }
 
-    write_post_head(c, len);
+    write_post_head(*c, len);
     size_t sent = 0;
     while (sent < len) {
         size_t n = len - sent;
         if (n > 1460) n = 1460;                          // one MSS, as post_frame() sends
-        size_t w = c.write((const uint8_t *)s_json + sent, n);
-        if (w == 0) { c.stop(); return false; }
+        size_t w = c->write((const uint8_t *)s_json + sent, n);
+        if (w == 0) { c->stop(); return false; }
         sent += w;
     }
 
-    int status = read_status_and_drain(c, start);
-    c.stop();
+    int status = read_status_and_drain(*c, start);
+    c->stop();
     if (status < 200 || status >= 300) {
         hlogf("[nodelog] POST failed, status=%d after %lums\n", status,
               (unsigned long)(millis() - start));

@@ -52,6 +52,7 @@
 #include "net.h"
 #include "updatemode.h"
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
+#include "srvconn.h"   // and the socket that address opens, plain or TLS as the scheme said
 #include "nodeproto.h"        // the firmware paths, shared with the two node firmwares
 
 static const uint32_t CONNECT_MS = 4000;
@@ -185,29 +186,66 @@ static long json_long(const char *buf, const char *key, long dflt) {
 }
 
 // ---- HTTP ------------------------------------------------------------------
+//
+// Every helper below takes a `Client &` and not a `WiFiClient &`. What it is handed is whichever
+// socket the stored scheme called for, and read/write/available/connected are all virtual on
+// Client, so a base reference reaches the right one. The one non-virtual call in this area is
+// connect(), and it is deliberately not here: SrvConn does the connecting on the concrete type,
+// because reaching connect() through a base pointer silently gets the plain implementation - a
+// bare TCP connect to 443 with no handshake. See shared/srvconn.h for what that cost the last
+// time.
 
 // HTTP/1.0, for the reason plantrx.cpp gives and one more of this file's own. 1.0 has no chunked
 // transfer encoding, so a body always arrives as plain bytes - and for the image that is not
 // tidiness, it is the whole check. Update.begin() has to be told the exact size before the first
 // byte is written, and a chunked body only reveals its length after the last chunk has gone past.
-static void write_get_head(WiFiClient &c, const char *path, const char *accept) {
-    c.print("GET "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
-    c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
-    c.print("Accept: "); c.print(accept); c.print("\r\n");
-    if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
-    c.print("Connection: close\r\n\r\n");
+//
+// AND ONE WRITE, NOT SEVENTEEN. This was a run of c.print() calls, which over plain TCP is free -
+// Nagle coalesces them into one segment. Over TLS every print() becomes its OWN TLS RECORD with a
+// header and a MAC of its own, so a ~250-byte head went out as 17 tiny records, and Cloudflare -
+// which this server sits behind - resets a connection that does that: MBEDTLS_ERR_NET_CONN_RESET
+// (-0x0050) on the first write, a few hundred milliseconds after a handshake that had succeeded.
+// plantrx.cpp's write_request_head() has the measurement and the same fix. That failure would land
+// hardest here of anywhere: the reset arrives before the status line, so an update check reads as
+// "server unreachable" and a panel would sit on an old image with nothing saying why.
+//
+// 448 bytes, sized from what THIS head can hold rather than copied from plantrx.cpp's 512: a
+// 48-byte prefix cap and the 64-byte `path` buffer both callers build, a 64-byte host cap and a
+// 5-digit port, the longest Accept this file passes ("application/octet-stream", 24), a 96-byte
+// token cap, and 112 bytes of fixed header text. 410 with the NUL, so 448 has room and no more.
+static void write_get_head(Client &c, const char *path, const char *accept) {
+    char head[448];
+    int n = snprintf(head, sizeof(head),
+                     "GET %s%s HTTP/1.0\r\n"
+                     "Host: %s:%u\r\n"
+                     "User-Agent: SmartFarm-ESP32/1.0\r\n"
+                     "Accept: %s\r\n",
+                     s_url.prefix, path, s_url.host, (unsigned)s_url.port, accept);
+    if (s_tok[0] && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Authorization: Bearer %s\r\n", s_tok);
+    }
+    if (n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Connection: close\r\n\r\n");
+    }
+    // Truncation would send a head with no blank line, which reads to the server as a request that
+    // never ended. Said out loud rather than silently sent: every field here is capped elsewhere,
+    // so this firing means one of those caps moved.
+    if (n <= 0 || n >= (int)sizeof(head)) {
+        hlogf("[fwpull] request head needs %d bytes, cap is %u\n", n, (unsigned)sizeof(head));
+        return;
+    }
+    c.write((const uint8_t *)head, (size_t)n);
     // No flush(). NetworkClient.h declares it `void flush(); // Print::flush tx` and then
     // implements it as clear(), which empties the RX buffer - so the call reads as "make sure
     // the request is out" while actually throwing away reply bytes that already arrived. The
-    // note in plantrx.cpp's post_frame() has the measurement. print() writes to the socket
+    // note in plantrx.cpp's post_frame() has the measurement. write() reaches the socket
     // synchronously, which is the only completion this ever wanted.
 }
 
 // One CRLF-terminated line with the CRLF stripped. Returns its length, or -1 when the socket
 // closed or the budget ran out first. A line longer than `cap` is clipped and the rest of it is
 // still consumed, so a header this file does not read cannot desynchronise the ones it does.
-static int read_line(WiFiClient &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
+static int read_line(Client &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
     size_t i = 0;
     for (;;) {
         int ch = c.read();
@@ -228,7 +266,7 @@ static int read_line(WiFiClient &c, char *out, size_t cap, uint32_t start, uint3
 // Reads the status line and the headers, leaving the socket sitting on the first body byte.
 // Returns the HTTP status, 0 for a reply that is not HTTP, or -1 when nothing arrived. `clen`
 // gets the Content-Length, or -1 when the server did not send one.
-static int read_head(WiFiClient &c, uint32_t start, uint32_t budget, long *clen) {
+static int read_head(Client &c, uint32_t start, uint32_t budget, long *clen) {
     *clen = -1;
     int status = 0;
     char line[192];
@@ -253,7 +291,7 @@ static int read_head(WiFiClient &c, uint32_t start, uint32_t budget, long *clen)
 // Reads the rest of a small body until the server closes. Returns its length, or -1 when it did
 // not fit - a manifest that overflows this buffer is not a manifest, and truncating it would
 // hand the parser a half-written hash.
-static int read_body(WiFiClient &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
+static int read_body(Client &c, char *out, size_t cap, uint32_t start, uint32_t budget) {
     size_t n = 0;
     uint32_t last = millis();
     for (;;) {
@@ -280,11 +318,19 @@ static int read_body(WiFiClient &c, char *out, size_t cap, uint32_t start, uint3
 // two the server publishes - idf_ver and mtime - are for a person reading the manifest, not for
 // this. Returns false with s_status already set to something a grower can read.
 static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
+    Client *c = conn.connect(s_url, CONNECT_MS);
+    if (c == nullptr) {
+        // The mbedtls text beside the address, because on a TLS server "cannot reach" now covers
+        // two completely different mornings: a host that never answered, and a host that answered
+        // and whose certificate did not verify. Empty on the plain path, where there is no second
+        // case to tell apart. Read before any stop(), which is where the code would be cleared.
+        char why[80];
+        conn.last_error(why, sizeof(why));
         s_status = "서버 연결 실패";
-        hlogf("[fwpull] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
+        hlogf("[fwpull] cannot reach %s:%u%s%s\n", s_url.host, (unsigned)s_url.port,
+              why[0] ? " - " : "", why);
         return false;
     }
     // Composed from the shared macro and this board's own role rather than spelled out, the same
@@ -295,13 +341,13 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     char path[64];
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_LATEST,
              nodeproto_role_name(NODE_ROLE_PANEL));
-    write_get_head(c, path, "application/json");
+    write_get_head(*c, path, "application/json");
 
     long clen = -1;
-    int status = read_head(c, start, REPLY_MS, &clen);
+    int status = read_head(*c, start, REPLY_MS, &clen);
     char body[512];
-    int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    c.stop();
+    int n = (status > 0) ? read_body(*c, body, sizeof(body), start, REPLY_MS) : -1;
+    conn.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published. That is an operator
@@ -341,22 +387,26 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
 // GET /v1/firmware/image and write it into the inactive slot. Returns only on failure, with
 // s_status set; on success it restarts and never comes back.
 static void download_and_install(const char *sha, const char *md5, size_t size) {
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
+    Client *c = conn.connect(s_url, CONNECT_MS);
+    if (c == nullptr) {
+        char why[80];
+        conn.last_error(why, sizeof(why));
         s_status = "서버 연결 실패";
-        hlogf("[fwpull] cannot reach %s:%u for the image\n", s_url.host, (unsigned)s_url.port);
+        hlogf("[fwpull] cannot reach %s:%u for the image%s%s\n", s_url.host,
+              (unsigned)s_url.port, why[0] ? " - " : "", why);
         return;
     }
     char path[64];
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_IMAGE,
              nodeproto_role_name(NODE_ROLE_PANEL));
-    write_get_head(c, path, "application/octet-stream");
+    write_get_head(*c, path, "application/octet-stream");
 
     long clen = -1;
-    int status = read_head(c, start, REPLY_MS, &clen);
+    int status = read_head(*c, start, REPLY_MS, &clen);
     if (status != 200) {
-        c.stop();
+        conn.stop();
         s_status = "서버 응답 오류";
         hlogf("[fwpull] image HTTP %d\n", status);
         return;
@@ -366,7 +416,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // requests against a file an operator can replace between them, and an image that is not
         // the one the hash and the md5 describe must never reach Update.begin() - past that
         // point the inactive slot is being erased for something nobody vouched for.
-        c.stop();
+        conn.stop();
         s_status = "크기 불일치";
         hlogf("[fwpull] image is %ld bytes, manifest said %u - refusing\n",
               clen, (unsigned)size);
@@ -379,7 +429,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // do not get for the months a wall panel actually stays up.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        c.stop();
+        conn.stop();
         s_status = "메모리 부족";
         hlogf("[fwpull] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         return;
@@ -388,7 +438,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!Update.begin(size, U_FLASH)) {
         hlogf("[fwpull] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -398,7 +448,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         hlogf("[fwpull] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -414,12 +464,12 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         if (want > CHUNK) want = CHUNK;
         size_t n = 0;
         while (n < want) {
-            int a = c.available();
+            int a = c->available();
             if (a > 0) {
-                int rd = c.read(buf + n, want - n);
+                int rd = c->read(buf + n, want - n);
                 if (rd > 0) { n += (size_t)rd; last = millis(); }
             } else {
-                if (!c.connected()) break;               // the server closed early
+                if (!c->connected()) break;               // the server closed early
                 if (millis() - last > STALL_MS) break;
                 // Two ticks while starved as well as after a write. This inner loop can spin for
                 // a whole RTT waiting on the next TCP segment and it is on the same core as the
@@ -445,7 +495,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     }
 
     heap_caps_free(buf);
-    c.stop();
+    conn.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which
@@ -581,16 +631,25 @@ void fwpull_init(void) {
     }
     s_configured = true;
 
-    // Priority 5 and 6KB of stack, both matched to ota.cpp rather than picked. The stack because
-    // this goes through the same places its update path does - the flash driver, and mbedTLS's
-    // MD5 under Update - and 4KB was measured as not enough for that on this core. The priority
-    // because an install that loses the race against something else on the board does not fail
-    // slowly, it fails partway through, and while one is running nothing else here matters.
+    // Priority 5, matched to ota.cpp rather than picked: an install that loses the race against
+    // something else on the board does not fail slowly, it fails partway through, and while one
+    // is running nothing else here matters.
+    //
+    // 8KB of stack and not the 6KB this shipped with, which was ota.cpp's number for ota.cpp's
+    // path - the flash driver and mbedTLS's MD5 under Update, where 4KB had been measured as not
+    // enough on this core. The pull now opens its socket through SrvConn, and against an https://
+    // server that is a TLS handshake on THIS task's stack: 4.4KB of it, measured on this board
+    // (shared/srvurl.h has the figures). The two peaks do not overlap - connect() has returned
+    // long before Update.begin() is called - so the requirement is the larger of the two and not
+    // the sum, but 4.4KB against 6144 leaves about a kilobyte for every frame beneath it, on a
+    // board that has already taken one stack-canary reset. hlog.cpp went 4KB -> 8KB for exactly
+    // this reason when its push moved into its own task; this is that precedent applied to the
+    // one path where an overflow costs a half-written image rather than a missing log line.
     //
     // Core 0, away from LVGL on core 1: the display has to keep painting through the download,
     // which is the only thing that distinguishes an update in progress from a crashed panel to
     // the person waiting in front of it.
-    xTaskCreatePinnedToCore(fwpull_task, "fwpull", 6144, nullptr, 5, &s_task, 0);
+    xTaskCreatePinnedToCore(fwpull_task, "fwpull", 8192, nullptr, 5, &s_task, 0);
     hlogf("[fwpull] ready; server=%s:%u%s\n", s_url.host, (unsigned)s_url.port, s_url.prefix);
 }
 

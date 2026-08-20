@@ -14,11 +14,22 @@
 // uplink is not configured at all: plantrx_configured() goes false, the client
 // never opens a socket, and the panel runs on its local rule engine.
 //
-// http:// only. The server sits on the same LAN the camera already streams
-// MJPEG across, so TLS would buy nothing here and would cost an mbedtls context
-// per poll on a board whose PSRAM is already carrying the decode buffers. A
-// URL with any other scheme is treated as unconfigured rather than guessed at.
-#define PLANTRX_BASE_URL "http://192.168.1.10:8000"
+// BOTH SCHEMES WORK, AND THIS ONE LINE IS WHAT DECIDES ENCRYPTION FOR THE WHOLE GREENHOUSE.
+// https:// makes every server socket on all three boards TLS with a pinned root; http:// makes
+// them plaintext. Nothing else in the firmware chooses - shared/srvurl.h parses the scheme and
+// shared/srvconn.h hands out the matching client, so there is no per-site override to forget.
+//
+// It reaches the two boards without a console by itself: sitecfg.cpp lets a non-empty value here
+// overwrite what NVS holds, and src/nodeota.cpp sends the panel's own stored URL to the sensor
+// node and the camera in every update command. So flashing the panel moves the fleet.
+//
+// This comment used to say "http:// only ... TLS would buy nothing here". That was wrong twice:
+// the token and every reading cross the public internet rather than a closed LAN, and TLS was
+// measured on this hardware at 1.84s a handshake with chain verification and no lasting DRAM
+// cost. See the note at the top of shared/srvurl.h for the measurements.
+//
+// A URL with any other scheme is treated as unconfigured rather than guessed at.
+#define PLANTRX_BASE_URL "https://plantrx.example.org"
 
 // Shared secret matching PLANTRX_TOKEN in the server's environment. Empty when
 // the server runs without one (its auth dependency skips the check), which is

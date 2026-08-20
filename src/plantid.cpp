@@ -8,6 +8,7 @@
 #include "hlog.h"
 #include "plantrx.h"
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
+#include "srvconn.h"   // and the socket that address decides: plain or TLS, never a per-site call
 #include "sitecfg.h"          // the same bearer the uplink sends
 
 static const size_t MAX_PHOTO = 250 * 1024;   // CAM UXGA still is ~130-160KB
@@ -112,6 +113,16 @@ static bool json_bool(const char *buf, const char *key, size_t from) {
 // --- network -----------------------------------------------------------------
 
 // GET http://<cam>/rgb/image into s_photo. Returns JPEG length or -1.
+//
+// A PLAIN WiFiClient, DELIBERATELY, IN A FILE WHOSE OTHER SOCKET IS A SrvConn. This one talks to
+// the ESP32-CAM on the LAN, not to the project server: the camera serves an MJPEG endpoint with no
+// certificate, and it is reached by IP address, so a TLS client would have no name to validate
+// against even if the camera had one to offer. There is nothing to encrypt here either - no bearer
+// goes out on this request, only a GET for a picture, and the same picture crosses the same radio
+// unencrypted whenever the monitor page draws the stream. post_identify() below is the socket in
+// this file that carries the token, and that one is a SrvConn for exactly that reason. Do not
+// "finish the migration" by pointing this at SrvConn: it would break the identification path on
+// every board, and the mistake reads as a tidy-up in a diff.
 static int http_get_photo(IPAddress ip) {
     WiFiClient c;
     // Milliseconds, not seconds: Stream::setTimeout takes ms, and this one is
@@ -155,39 +166,84 @@ static int http_get_photo(IPAddress ip) {
 // de-framing pass first; Host carries the port because the server is addressed
 // by IP and port; and the bearer goes on only when one is configured, because an
 // empty Authorization header is a malformed credential rather than none.
-static void write_request_head(WiFiClient &c, size_t clen) {
-    c.print("POST "); c.print(plantrx_srv_prefix()); c.print("/v1/identify HTTP/1.0\r\n");
-    c.print("Host: "); c.print(plantrx_srv_host()); c.print(":"); c.print(plantrx_srv_port()); c.print("\r\n");
-    c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
-    c.print("Accept: application/json\r\n");
-    c.print("Content-Type: image/jpeg\r\n");
-    c.print("Content-Length: "); c.print(clen); c.print("\r\n");
+//
+// AND ONE WRITE, NOT EIGHTEEN, which is the reason this function was touched at
+// all. It used to be a run of c.print() calls. Over plain TCP that is free -
+// Nagle coalesces them into one segment - but over TLS every print() becomes its
+// OWN TLS RECORD, header and MAC included, so a ~250-byte head left the board as
+// 18 tiny records and Cloudflare, which this server sits behind, reset the
+// connection: MBEDTLS_ERR_NET_CONN_RESET (-0x0050) on the first write, a few
+// hundred milliseconds after a handshake that had succeeded. plantrx.cpp has the
+// measurement. Not one header field, value or order below is different; only how
+// the bytes reach the socket is.
+//
+// 448 bytes, sized from what THIS head can hold and not copied from plantrx.cpp:
+// a 48-byte prefix cap and a 12-byte path, a 64-byte host cap and a 5-digit
+// port, ten digits of Content-Length, a 96-byte token cap, and 185 bytes of
+// fixed header text. 406 with the NUL, so 448 is the next round number above it.
+static void write_request_head(Client &c, size_t clen) {
     const char *tok = sitecfg_token();
-    if (tok[0]) { c.print("Authorization: Bearer "); c.print(tok); c.print("\r\n"); }
-    c.print("Connection: close\r\n\r\n");
+    char head[448];
+    int n = snprintf(head, sizeof(head),
+                     "POST %s/v1/identify HTTP/1.0\r\n"
+                     "Host: %s:%u\r\n"
+                     "User-Agent: SmartFarm-ESP32/1.0\r\n"
+                     "Accept: application/json\r\n"
+                     "Content-Type: image/jpeg\r\n"
+                     "Content-Length: %u\r\n",
+                     plantrx_srv_prefix(), plantrx_srv_host(),
+                     (unsigned)plantrx_srv_port(), (unsigned)clen);
+    if (tok[0] && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Authorization: Bearer %s\r\n", tok);
+    }
+    if (n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Connection: close\r\n\r\n");
+    }
+    // Truncation would send a head with no blank line, which reads to the server
+    // as a request that never ended. Said out loud rather than silently sent:
+    // every field here is capped elsewhere, so this firing means one of those
+    // caps moved.
+    if (n <= 0 || n >= (int)sizeof(head)) {
+        hlogf("[pid] request head needs %d bytes, cap is %u\n", n, (unsigned)sizeof(head));
+        return;
+    }
+    c.write((const uint8_t *)head, (size_t)n);
 }
 
 // POST s_photo to <server>/v1/identify and read the reply into s_resp with its
 // headers stripped. Returns the HTTP status, 0 for a reply whose status line
 // could not be read, or -1 for a transport failure.
 static int post_identify(size_t photo_len) {
-    WiFiClient c;
-    // No setTimeout(): connect() takes its own millisecond deadline and the read
-    // loop below owns the other two, so Stream's timeout would gate nothing here.
-    if (!c.connect(plantrx_srv_host(), plantrx_srv_port(), CONNECT_MS)) {
-        hlogf("[pid] connect FAIL %s:%u\n", plantrx_srv_host(), (unsigned)plantrx_srv_port());
+    SrvConn sc;
+    // No setTimeout() from here, and nothing left to set: SrvConn's connect() takes its own
+    // millisecond deadline and sets the seconds-granularity Stream one the handshake reads, while
+    // the read loop below owns the other two. A timeout written from out here would gate nothing
+    // and would be in the wrong unit besides.
+    const SrvUrl *u = plantrx_srv_url();
+    Client *c = sc.connect(*u, CONNECT_MS);
+    if (!c) {
+        // mbedtls's own words appended when there are any. Gated on the URL's flag and not on
+        // sc.tls(), which answers about a live socket and is therefore false on exactly this
+        // path - the one path that has a handshake failure to report. last_error() leaves the
+        // buffer empty whenever no handshake was attempted, so the plain socket still prints the
+        // line it always did and the encrypted one says whether the chain was the problem. On
+        // this board that line is the only diagnosis anybody gets.
+        char err[96] = "";
+        if (u->tls) sc.last_error(err, sizeof(err));
+        hlogf("[pid] connect FAIL %s:%u%s%s\n", u->host, (unsigned)u->port,
+              err[0] ? " - " : "", err);
         return -1;
     }
 
-    write_request_head(c, photo_len);
+    write_request_head(*c, photo_len);
     size_t sent = 0;
     while (sent < photo_len) {
         size_t n = photo_len - sent;
         if (n > 1460) n = 1460;
-        size_t w = c.write(s_photo + sent, n);
+        size_t w = c->write(s_photo + sent, n);
         if (w == 0) {
             hlogf("[pid] upload FAIL at %u/%u bytes\n", (unsigned)sent, (unsigned)photo_len);
-            c.stop();
+            c->stop();
             return -1;
         }
         sent += w;
@@ -200,20 +256,20 @@ static int post_identify(size_t photo_len) {
     size_t rl = 0;
     uint32_t start = millis(), last = millis();
     for (;;) {
-        int a = c.available();
+        int a = c->available();
         if (a > 0) {
             size_t room = MAX_RESP - 1 - rl;
             if (room == 0) break;
-            int rd = c.read((uint8_t *)s_resp + rl, (size_t)a < room ? (size_t)a : room);
+            int rd = c->read((uint8_t *)s_resp + rl, (size_t)a < room ? (size_t)a : room);
             if (rd > 0) { rl += (size_t)rd; last = millis(); }
         } else {
-            if (!c.connected()) break;                        // close = reply complete
+            if (!c->connected()) break;                       // close = reply complete
             if (millis() - start > RESP_DEADLINE_MS) break;
             if (rl > 0 && millis() - last > RESP_IDLE_MS) break;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-    c.stop();
+    c->stop();
     s_resp[rl] = '\0';
     if (rl == 0) return -1;
 

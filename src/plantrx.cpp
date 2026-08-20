@@ -31,12 +31,14 @@
 // nothing can: it only decides what the panel calls the reading it is already
 // drawing.
 //
-// PLAIN HTTP, ON PURPOSE. The server is on the greenhouse LAN, reached over the
-// same radio the camera already streams unencrypted MJPEG across, so TLS here
-// would protect the one link on the board that is already the least exposed -
-// and would cost an mbedtls context per poll on a board whose PSRAM is spoken
-// for by the decode buffers. plantrx_config.h documents this; a non-http base
-// URL reads as unconfigured rather than being quietly downgraded.
+// THE SCHEME DECIDES THE SOCKET, AND NOTHING IN HERE DOES. Every request below goes out through a
+// stack SrvConn (shared/srvconn.h), which reads the one `tls` flag shared/srvurl.h parsed out of
+// the stored base URL and hands back an encrypted or a plain client accordingly. This file used to
+// declare a WiFiClient and argue that a server on the greenhouse LAN made TLS pointless beside the
+// camera's cleartext MJPEG. That reasoning ignored what this particular request carries: a bearer
+// token, on every poll, across whatever uplink the site actually turns out to have. There is
+// deliberately no override here - a site that opts out is the site that leaks the token - so the
+// whole fleet moves between cleartext and TLS by editing one string in NVS.
 //
 // EVERY FAILURE IS SILENT AND KEEPS THE LAST GOOD ANSWER. No path here clears a
 // row. The worst any failure does is move RxLink and let the status bar say so.
@@ -69,6 +71,7 @@
 #include "fwpull.h"
 #include "nodeota.h"
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
+#include "srvconn.h"   // and the socket that address decides: plain or TLS, never a per-site call
 
 // The request is a few hundred bytes; the reply carries one judgment row, four
 // plan rows, four action rows, the four-row window table and the control half.
@@ -562,25 +565,54 @@ static JudgeLevel level_of(const char *obj) {
 // HTTP/1.0, matching plantid.cpp's https_get and for the same reason: 1.0 has
 // no chunked transfer encoding, so the body always arrives as plain bytes that
 // the parser above can walk without a de-framing pass first.
-static void write_request_head(WiFiClient &c, const char *path, const char *ctype,
+// ONE WRITE, NOT TWENTY-ONE. This used to be a run of c.print() calls, which over plain TCP is
+// free - Nagle coalesces them into one segment. Over TLS every print() becomes its OWN TLS
+// RECORD, each with a header and a MAC, so a 250-byte request head went out as 21 tiny records.
+// Cloudflare resets a connection that does that: measured as MBEDTLS_ERR_NET_CONN_RESET (-0x0050)
+// on the first write a few hundred milliseconds after a handshake that had succeeded. That is the
+// symptom that got TLS abandoned in this project once and blamed on the RNG - and a probe sending
+// the same request as a single write() got 200 OK from the same server on the same board.
+static void write_request_head(Client &c, const char *path, const char *ctype,
                                size_t clen, const char *xdev, const char *xkind) {
-    c.print("POST "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
-    c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
-    c.print("Accept: application/json\r\n");
-    c.print("Content-Type: "); c.print(ctype); c.print("\r\n");
-    c.print("Content-Length: "); c.print(clen); c.print("\r\n");
-    if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
-    if (xdev)  { c.print("X-Device: "); c.print(xdev); c.print("\r\n"); }
-    if (xkind) { c.print("X-Kind: ");   c.print(xkind); c.print("\r\n"); }
-    c.print("Connection: close\r\n\r\n");
+    char head[512];
+    int n = snprintf(head, sizeof(head),
+                     "POST %s%s HTTP/1.0\r\n"
+                     "Host: %s:%u\r\n"
+                     "User-Agent: SmartFarm-ESP32/1.0\r\n"
+                     "Accept: application/json\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %u\r\n",
+                     s_url.prefix, path, s_url.host, (unsigned)s_url.port,
+                     ctype, (unsigned)clen);
+    if (s_tok[0] && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Authorization: Bearer %s\r\n", s_tok);
+    }
+    if (xdev && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "X-Device: %s\r\n", xdev);
+    }
+    if (xkind && n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "X-Kind: %s\r\n", xkind);
+    }
+    if (n > 0 && n < (int)sizeof(head)) {
+        n += snprintf(head + n, sizeof(head) - n, "Connection: close\r\n\r\n");
+    }
+    // Truncation would send a head with no blank line, which reads to the server as a request that
+    // never ended. Said out loud rather than silently sent: every field here is capped elsewhere,
+    // so this firing means one of those caps moved.
+    if (n <= 0 || n >= (int)sizeof(head)) {
+        hlogf("[plantrx] request head needs %d bytes, cap is %u\n", n, (unsigned)sizeof(head));
+        return;
+    }
+    c.write((const uint8_t *)head, (size_t)n);
 }
 
 // Read until the socket closes, then strip the headers in place. Returns the
 // HTTP status, 0 for a malformed reply, or -1 for a transport failure.
 // `truncated` says the reply filled the buffer, which is indistinguishable from
 // a body cut short and has to fail the same way.
-static int read_reply(WiFiClient &c, char *out, size_t outsz,
+// `Client` and not `WiFiClient` because the socket may be either: read, write, available and stop
+// are virtual on Client, which is the whole reason SrvConn hands one out.
+static int read_reply(Client &c, char *out, size_t outsz,
                       uint32_t deadline_ms, bool *truncated) {
     size_t n = 0;
     uint32_t start = millis(), last = millis();
@@ -617,16 +649,17 @@ static int read_reply(WiFiClient &c, char *out, size_t outsz,
 // LAN the server cannot reach. Returns true on a 2xx.
 static bool post_frame(const char *device, const char *kind, const char *ctype,
                        const uint8_t *body, size_t len, uint32_t deadline_ms) {
-    WiFiClient c;
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) return false;
+    SrvConn sc;
+    Client *c = sc.connect(s_url, CONNECT_MS);
+    if (!c) return false;
 
-    write_request_head(c, "/v1/frame", ctype, len, device, kind);
+    write_request_head(*c, "/v1/frame", ctype, len, device, kind);
     size_t sent = 0;
     while (sent < len) {
         size_t n = len - sent;
         if (n > 1460) n = 1460;
-        size_t w = c.write(body + sent, n);
-        if (w == 0) { c.stop(); return false; }
+        size_t w = c->write(body + sent, n);
+        if (w == 0) { c->stop(); return false; }
         sent += w;
     }
     // No flush() here, and pointedly not the clear() the deprecation warning
@@ -640,8 +673,8 @@ static bool post_frame(const char *device, const char *kind, const char *ctype,
     // this path was ever asking about.
 
     bool trunc = false;
-    int status = read_reply(c, s_resp, MAX_RESP, deadline_ms, &trunc);
-    c.stop();
+    int status = read_reply(*c, s_resp, MAX_RESP, deadline_ms, &trunc);
+    c->stop();
     return status >= 200 && status < 300;
 }
 
@@ -1405,26 +1438,41 @@ static void exchange(void) {
     }
 
     uint32_t t0 = millis();
-    WiFiClient c;
-    // No setTimeout() here: connect() takes its own millisecond timeout and the read loop below
-    // owns a deadline of its own, so Stream's timeout gates nothing here. The neighbouring files
-    // set it in seconds against a millisecond API; copying that would plant the same dead line.
-    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
+    SrvConn sc;
+    // Still no setTimeout() from here, and now there is nothing left to set: SrvConn owns both
+    // halves of the connect deadline - the millisecond one connect() takes, and the
+    // seconds-granularity Stream one the handshake reads - and the read loop below owns its own.
+    // Setting Stream's timeout from out here in seconds against a millisecond API is the dead
+    // line the neighbouring files used to plant.
+    Client *c = sc.connect(s_url, CONNECT_MS);
+    if (!c) {
         s_dbg_status = -1;
         s_dbg_rtt = millis() - t0;
-        net_note_uplink_fail();  // LAN TCP connect timed out; feeds net_poll's watchdog
+        // mbedtls's own words for the failure, and gated on the URL's flag rather than on
+        // sc.tls(): that one answers about a live socket and so is false on exactly this path,
+        // which would swallow every certificate failure it exists to report. Only said out loud
+        // when a handshake was actually attempted and had something to say, so the plain path's
+        // line count does not move - why=connect on the debug line below has room for a tag and
+        // nothing else, and "nothing answered" and "the chain did not verify" are a different
+        // afternoon each.
+        if (s_url.tls) {
+            char err[96];
+            sc.last_error(err, sizeof(err));
+            if (err[0]) hlogf("[plantrx] TLS connect to %s failed: %s\n", s_host_disp, err);
+        }
+        net_note_uplink_fail();  // nothing came up at all; feeds net_poll's watchdog
         schedule_fail(0, "connect");
         return;
     }
-    write_request_head(c, "/v1/telemetry", "application/json", strlen(s_req), nullptr, nullptr);
-    c.print(s_req);
+    write_request_head(*c, "/v1/telemetry", "application/json", strlen(s_req), nullptr, nullptr);
+    c->print(s_req);
     // No flush(): it discards the RX buffer despite its name and its own header
-    // comment - see the note in post_frame(). c.print() has already written the
+    // comment - see the note in post_frame(). c->print() has already written the
     // body.
 
     bool trunc = false;
-    int status = read_reply(c, s_resp, MAX_RESP, RESP_DEADLINE_MS, &trunc);
-    c.stop();
+    int status = read_reply(*c, s_resp, MAX_RESP, RESP_DEADLINE_MS, &trunc);
+    c->stop();
     s_dbg_status = status;
     if (status > 0) net_note_uplink();  // a reply came back - the uplink is alive
     s_dbg_rtt = millis() - t0;
