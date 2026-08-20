@@ -127,6 +127,64 @@ static void begin_target(const char *ssid, const char *pass) {
     scan_try_start();
 }
 
+// ONE SECURITY POLICY FOR BOTH CONNECT PATHS, AND WHY IT DECLINES WPA3.
+//
+// WPA3 turns a password into a curve point two ways. Hunting-and-pecking draws a random number,
+// tests whether it is a quadratic residue, and repeats until one is - a loop of big-number
+// modular arithmetic and RNG draws with no fixed bound. Hash-to-element replaces that with a
+// fixed-cost derivation, and exists because the loop was a problem.
+//
+// This board was taking task-watchdog resets inside that loop. A decoded coredump:
+//
+//   Panic reason: Task watchdog got triggered ... IDLE0 (CPU 0)
+//   #12 dragonfly_get_random_qr_qnr
+//   #13 sae_derive_pwe_ecc (password_len=9)
+//   #15 wpa3_build_sae_commit
+//   #24 wifi_sta_connect_internal_process
+//
+// with the program counters landing in esp_random() (hw_random.c:84) and mbedtls_mpi_div_mpi()
+// (bignum.c:1436). sae_derive_pwe_ecc IS the hunting-and-pecking derivation. Nothing in it is
+// broken: the WiFi task holds CPU 0 long enough inside the loop that the idle task on that core
+// misses its watchdog deadline, and the panic reboots the panel. It compounds, which is the part
+// that matters - the note further down records that this AP refuses the first association of
+// every boot, so every boot runs the derivation at least twice, and a watchdog reset is a boot.
+// health.cpp's cumulative counter moved 145 -> 150 across one evening.
+//
+// ASKING FOR HASH-TO-ELEMENT WAS TRIED FIRST AND THIS AP CANNOT DO IT. With
+// WPA3_SAE_PWE_HASH_TO_ELEMENT the association stops at reason 210,
+// WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY - the station demanded H2E, the AP does not offer
+// it, so no compatible AP exists. Measured, not assumed; that is why this file no longer asks.
+//
+// So the remaining lever is to decline WPA3 altogether, and pmf_cfg is where that lives rather
+// than in any SAE field: WPA3-SAE mandates Protected Management Frames, and a station that does
+// not advertise PMF in its RSN capabilities cannot be taken up on WPA3. Against a transition-mode
+// AP that means WPA2-PSK, no SAE exchange, and no derivation loop to sit in.
+//
+// WHAT THIS COSTS, BOTH HALVES MEASURED.
+//
+// On the air: WPA2 rather than WPA3, and no PMF, so deauthentication frames are unprotected
+// again. Weighed against a bearer token that already crosses the public internet as cleartext on
+// port 80 (see the HTTPS attempt that was abandoned), the marginal exposure is small.
+//
+// On the clock: the join got five times slower. With WPA3 this AP refused once with AUTH_FAIL(202)
+// and was online after 9.4s; declining PMF it refuses repeatedly with AUTH_EXPIRE(2) and is online
+// after 50s on the fifth try. The retry ladder below is what carries it, unchanged - the AP simply
+// needs more attempts to settle on WPA2. Once per boot on a board that boots rarely, and bounded,
+// but it is a real regression to weigh against a crash that is not yet proven fixed.
+//
+// STILL A HYPOTHESIS. The evidence is one backtrace and a counter that climbs; what settles it is
+// health.cpp's crash count staying still across several boots. Applied through a helper because
+// there are two connect paths and only one of them used to set any of this: connect_blind() left
+// the driver at its defaults, so a fallback association would have run the old policy and muddied
+// exactly this observation.
+static void apply_security_policy(void) {
+    wifi_config_t conf = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return;
+    conf.sta.pmf_cfg.capable  = false;   // declines WPA3-SAE; see the block above
+    conf.sta.pmf_cfg.required = false;
+    esp_wifi_set_config(WIFI_IF_STA, &conf);
+}
+
 // Connect without a scan behind us: hand the SSID to the driver and let it find
 // the AP itself. Slower and it picks the BSSID for us, but it is the only path
 // that still works when our own scan cannot see the target - a hidden SSID, or
@@ -136,7 +194,14 @@ static void connect_blind(void) {
     s_connect_start = millis();
     s_need_scan = false;
     hlogf("[net] connect (driver search)" "\n");
-    WiFi.begin(s_target_ssid, s_target_pass[0] ? s_target_pass : NULL);
+    // begin() with connect=false, then the policy, then connect - the same three steps as the
+    // picked path below and for the same reason: esp_wifi_set_config() only reaches the attempt
+    // that has not started yet. Channel 0 and a null BSSID are what keep this the driver-search
+    // path; only the auto-connect is given up.
+    WiFi.begin(s_target_ssid, s_target_pass[0] ? s_target_pass : NULL,
+               0 /*any channel*/, nullptr /*any BSSID*/, false /*connect*/);
+    apply_security_policy();
+    esp_wifi_connect();
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_15dBm);  // below the 20dBm default: spare the RGB panel's shared supply a droop on each TX burst
 }
@@ -148,19 +213,9 @@ static void connect_picked(void) {
     // Aim at the BSSID the scan chose rather than letting the driver pick: this
     // SSID is carried by several APs and the driver's own choice was the one
     // thing that could send us to a weaker one.
-    //
-    // sae_pwe_h2e is stated rather than left at Arduino's zero-filled
-    // UNSPECIFIED because the AP runs WPA2/WPA3 transition mode (scan reports
-    // authmode 7). Measured: it makes no difference to the first-attempt
-    // failure below, but leaving SAE parameters unstated against a mixed-mode
-    // AP is not something to rely on either.
     WiFi.begin(s_target_ssid, s_target_pass[0] ? s_target_pass : NULL,
                s_ap_ch, s_ap_bssid, false /*connect*/);
-    wifi_config_t conf = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK) {
-        conf.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-        esp_wifi_set_config(WIFI_IF_STA, &conf);
-    }
+    apply_security_policy();
     esp_wifi_connect();
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_15dBm);  // below the 20dBm default: spare the RGB panel's shared supply a droop on each TX burst
