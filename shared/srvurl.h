@@ -25,20 +25,59 @@
 // would read as "the server stopped answering". So a URL somebody types with the wrong scheme on
 // the settings page fails loudly at the parse instead of quietly on the wire.
 //
-// AND THE REASON TLS WAS ABANDONED IS NOW KNOWN TO BE WRONG, which matters because it is the only
-// thing standing between a bearer token and the public internet. The TLS client was dropped on
-// the reading that mbedtls could not seed its CTR_DRBG - "the entropy source failed" - which
-// pointed at this board's hardware RNG. Measured directly since: mbedtls_ctr_drbg_seed() succeeds
-// here in 1.7 ms with the radio off and 2.0 ms with WiFi associated, mbedtls_entropy_func()
-// returns real bytes both times, and esp_random() passes a bit-balance and chi-square check. The
-// numeric code recorded next to that failure, 0x0032, is MBEDTLS_ERR_DES_INVALID_INPUT_LENGTH,
-// which cannot be what a handshake returned - so a real symptom and an unrelated number were read
-// as one diagnosis.
+// AND HTTPS IS NOT BLOCKED - IT WORKS. THIS IS THE ONE THING TO READ BEFORE TOUCHING THIS FILE.
 //
-// The observed facts are unchanged and still unexplained: the handshake reported success and the
-// first write put zero bytes on the wire. Entropy is not the reason. Whoever picks HTTPS back up
-// starts from that, and from the fact that the server already serves it - https://<host>/health
-// answers 200 today - so this is a client-side problem with a known-good far end.
+// The client was dropped on the reading that mbedtls could not seed its CTR_DRBG from this board's
+// hardware RNG. That was measured and it is false: mbedtls_ctr_drbg_seed() succeeds here in 1.7ms
+// with the radio off and 2.0ms associated, esp_random() passes bit-balance and chi-square, and the
+// hex code recorded beside the original failure (0x0032) is MBEDTLS_ERR_DES_INVALID_INPUT_LENGTH,
+// which no handshake returns. A real symptom and an unrelated number had been read as one cause.
+//
+// A probe then ran a real request from this panel against this server. Three cases, because a
+// positive result on its own proves nothing - a client that ignores its CA argument also reports
+// success:
+//
+//   insecure              connect rc=1   791ms  -> HTTP/1.1 200 OK
+//   pinned ISRG Root X1   connect rc=1  1844ms  -> HTTP/1.1 200 OK
+//   deliberately wrong CA connect rc=0  1304ms  -> -0x2700 X509 verification failed
+//
+// The third line is what makes the second mean something: chain verification is enforced, so a
+// pinned root is real authentication and not decoration. Cost per connection: 4.4KB of stack,
+// no net internal DRAM once the session is closed, and 1.84s of handshake with verification
+// against 0.79s without - the difference being four signature checks.
+//
+// TWO LIMITS TO CARRY FORWARD, both measured rather than assumed:
+//
+//   Expiry is NOT checked. CONFIG_MBEDTLS_HAVE_TIME_DATE is unset in this framework (the IDF
+//   default), so notBefore/notAfter are ignored: a chain that verifies cryptographically is
+//   accepted whatever its dates say. Signatures are checked, expiry is not. Pinning the LEAF
+//   would be wrong regardless - this server's certificate is a 90-day Let's Encrypt one, renewed
+//   under the panel. Pin the root: ISRG Root X1 runs to 2035 and validates the chain alone.
+//
+//   Handshake cost versus push cadence. hlog.cpp pushes the console every 3s, and it carries the
+//   same bearer token, so it cannot stay on port 80 while the poll moves. At 1.84s a handshake
+//   that is a 60% duty cycle of TLS setup for logs alone. Whoever does the migration holds one
+//   connection open for the push rather than handshaking per chunk; the batching is already there.
+//
+// So https:// still parses to a refusal HERE, and that is now a statement about this parser and
+// not about the hardware: nothing in these three firmwares can speak it yet, and handing back
+// port 443 to a caller holding a plain WiFiClient writes a bearer token at a TLS port in the
+// clear. Teach the callers first, then this.
+//
+// THREE BUILD TRAPS THE LAST ATTEMPT PAID FOR, so the next one does not:
+//
+//   The include must live under src/. PlatformIO's dependency finder walks includes it finds in
+//   src/, and does NOT walk includes reached through -I shared - so <WiFiClientSecure.h> inside
+//   shared/srvconn.h meant NetworkClientSecure was never compiled and the build failed on a
+//   missing header. A probe including it from src/ compiled with no lib_deps change at all.
+//
+//   NetworkClient::connect(const char *, uint16_t, int32_t) IS NOT VIRTUAL. Holding a
+//   WiFiClient* to a WiFiClientSecure and calling connect() through it reaches the PLAIN
+//   implementation: a bare TCP connect to 443, no handshake, and a first write that goes nowhere -
+//   which is precisely the symptom that got TLS abandoned. Keep the concrete type.
+//
+//   It costs 98.5KB of flash on the panel, measured (3,566,934 -> 3,665,490 bytes) and the two
+//   nodes ran about 90KB each. The panel has room; the nodes are the ones to check first.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
