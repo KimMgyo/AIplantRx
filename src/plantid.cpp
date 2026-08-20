@@ -7,7 +7,7 @@
 #include "camprov.h"
 #include "hlog.h"
 #include "plantrx.h"
-#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL          // the server address, parsed once by the uplink
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "sitecfg.h"          // the same bearer the uplink sends
 
 static const size_t MAX_PHOTO = 250 * 1024;   // CAM UXGA still is ~130-160KB
@@ -171,16 +171,13 @@ static void write_request_head(WiFiClient &c, size_t clen) {
 // headers stripped. Returns the HTTP status, 0 for a reply whose status line
 // could not be read, or -1 for a transport failure.
 static int post_identify(size_t photo_len) {
-    SrvConn conn;
+    WiFiClient c;
     // No setTimeout(): connect() takes its own millisecond deadline and the read
     // loop below owns the other two, so Stream's timeout would gate nothing here.
-    // SrvConn sets one on the TLS client, where mbedtls reads through it to handshake.
-    WiFiClient *cp = conn.connect(*plantrx_srv_url(), CONNECT_MS);
-    if (cp == nullptr) {
+    if (!c.connect(plantrx_srv_host(), plantrx_srv_port(), CONNECT_MS)) {
         hlogf("[pid] connect FAIL %s:%u\n", plantrx_srv_host(), (unsigned)plantrx_srv_port());
         return -1;
     }
-    WiFiClient &c = *cp;
 
     write_request_head(c, photo_len);
     size_t sent = 0;

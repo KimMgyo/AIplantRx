@@ -12,11 +12,18 @@
 // PlatformIO projects share this directory with -I and none of them has a build step that could
 // link a fourth translation unit.
 //
-// WHAT IS AND IS NOT ACCEPTED. "http://host[:port][/prefix]" and "https://host[:port][/prefix]".
-// Anything else reads as unconfigured, which is the same rule all four copies had: a base URL
+// WHAT IS AND IS NOT ACCEPTED. "http://host[:port][/prefix]", and nothing else. Anything that
+// does not parse reads as unconfigured, which is the same rule all four copies had: a base URL
 // nobody can parse is a typo, and guessing at it would point a firmware install at a server that
-// does not exist. The default port follows the scheme - 80 or 443 - so a stored URL that names no
-// port keeps working across the switch.
+// does not exist.
+//
+// https:// IS REFUSED ON PURPOSE, and refusing it is the whole reason this note is long. There is
+// no TLS client on any of these three boards - it was built, it did not work, and it was taken
+// back out; see the commit that removed shared/srvconn.h. Parsing https:// and handing back
+// port 443 would leave every caller opening a PLAIN socket to a TLS port and writing a request
+// with a bearer token in it as cleartext, which the far end would drop on the floor. The failure
+// would read as "the server stopped answering". So a URL somebody types with the wrong scheme on
+// the settings page fails loudly at the parse instead of quietly on the wire.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -32,7 +39,6 @@ struct SrvUrl {
     char     host[SRVURL_HOST_CAP];
     char     prefix[SRVURL_PREFIX_CAP];  // path prefix, "" for none, never a trailing slash
     uint16_t port;
-    bool     tls;                        // the scheme said https
 };
 
 // True when `url` parsed. `out` is untouched on failure except for being zeroed, so a caller that
@@ -42,17 +48,9 @@ static inline bool srvurl_parse(const char *url, struct SrvUrl *out) {
     if (url == NULL) return false;
 
     const char *p = url;
-    if (strncmp(p, "https://", 8) == 0) {
-        out->tls = true;
-        out->port = 443;
-        p += 8;
-    } else if (strncmp(p, "http://", 7) == 0) {
-        out->tls = false;
-        out->port = 80;
-        p += 7;
-    } else {
-        return false;
-    }
+    if (strncmp(p, "http://", 7) != 0) return false;   // https:// included - see the note above
+    out->port = 80;
+    p += 7;
 
     size_t i = 0;
     while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(out->host)) out->host[i++] = *p++;

@@ -30,8 +30,7 @@
 #include <strings.h>
 #include "nodeagent.h"
 #include "nodeproto.h"
-#include "srvconn.h"
-#include "srvurl.h"
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 
 // provision.cpp registers this peer and re-adds it after every radio cycle; this is the address
 // it registers. Kept local rather than exported: provision.h's constants carry a "MUST
@@ -502,22 +501,20 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_LATEST);
 
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == NULL) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         nodeagent_logf("[ota] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
-    WiFiClient &c = *cp;
     write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    conn.stop();
+    c.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published for this role. That is an
@@ -566,22 +563,20 @@ static bool download_and_install(const char *md5, size_t size) {
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_IMAGE);
 
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == NULL) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         nodeagent_logf("[ota] cannot reach %s:%u for the image\n",
                        s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
-    WiFiClient &c = *cp;
     write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        conn.stop();
+        c.stop();
         nodeagent_logf("[ota] image HTTP %d\n", status);
         fail("서버 응답 오류");
         return false;
@@ -591,7 +586,7 @@ static bool download_and_install(const char *md5, size_t size) {
         // against a file an operator can replace between them, and an image that is not the one
         // the hash and the md5 describe must never reach Update.begin() - past that point the
         // inactive slot is being erased for something nobody vouched for.
-        conn.stop();
+        c.stop();
         nodeagent_logf("[ota] image is %ld bytes, manifest said %u - refusing\n",
                        clen, (unsigned)size);
         fail("크기 불일치");
@@ -614,7 +609,7 @@ static bool download_and_install(const char *md5, size_t size) {
     // 4KB-a-time allocation this file does control is the one that must not compete with it.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        conn.stop();
+        c.stop();
         nodeagent_logf("[ota] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         fail("메모리 부족");
         return false;
@@ -623,7 +618,7 @@ static bool download_and_install(const char *md5, size_t size) {
     if (!Update.begin(size, U_FLASH)) {
         nodeagent_logf("[ota] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        conn.stop();
+        c.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -633,7 +628,7 @@ static bool download_and_install(const char *md5, size_t size) {
         nodeagent_logf("[ota] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        conn.stop();
+        c.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -706,7 +701,7 @@ static bool download_and_install(const char *md5, size_t size) {
     // conn.stop() and not c.stop(): closing the socket leaves the session allocated, and the
     // ~32KB of internal DRAM it holds is wanted by the md5 and the flash driver under the
     // Update.end() a few lines down.
-    conn.stop();
+    c.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which

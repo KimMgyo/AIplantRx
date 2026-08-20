@@ -10,8 +10,7 @@
 #include "nodeagent.h"
 #include "nodeota.h"
 #include "nodeproto.h"
-#include "srvconn.h"
-#include "srvurl.h"
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 
 // Every number below is src/fwpull.cpp's, and the panel's comments hold the measurements behind
 // them. They are repeated rather than shared because they describe an HTTP conversation against
@@ -296,22 +295,20 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_LATEST,
              nodeproto_role_name(NODE_ROLE_NODE));
 
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == NULL) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         nlogf_always("[ota] cannot reach %s:%u", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
-    WiFiClient &c = *cp;
     write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    conn.stop();
+    c.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published for this role. That is an
@@ -367,21 +364,19 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // What does change is where a board that has run out finds out. The session is allocated
     // before the chunk buffer, so an exhausted heap now fails the connect below and reports
     // "서버 연결 실패", not the "메모리 부족" branch and its free-heap figure.
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == NULL) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         nlogf_always("[ota] cannot reach %s:%u for the image", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return;
     }
-    WiFiClient &c = *cp;
     write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        conn.stop();
+        c.stop();
         nlogf_always("[ota] image HTTP %d", status);
         fail("서버 응답 오류");
         return;
@@ -391,7 +386,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // requests against a file an operator can replace between them, and an image that is not
         // the one the hash and the md5 describe must never reach Update.begin() - past that point
         // the inactive slot is being erased for something nobody vouched for.
-        conn.stop();
+        c.stop();
         nlogf_always("[ota] image is %ld bytes, manifest said %u - refusing", clen, (unsigned)size);
         fail("크기 불일치");
         return;
@@ -403,7 +398,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // path's frame, payload and fragment buffers do not get for the months this board stays up.
     uint8_t *buf = (uint8_t *)malloc(CHUNK);
     if (!buf) {
-        conn.stop();
+        c.stop();
         nlogf_always("[ota] no room for a %u byte chunk buffer (%u free)",
                      (unsigned)CHUNK, (unsigned)ESP.getFreeHeap());
         fail("메모리 부족");
@@ -413,7 +408,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!Update.begin(size, U_FLASH)) {
         nlogf_always("[ota] Update.begin(%u) refused: %s", (unsigned)size, Update.errorString());
         free(buf);
-        conn.stop();
+        c.stop();
         fail("설치 시작 실패");
         return;
     }
@@ -424,7 +419,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         nlogf_always("[ota] Update.setMD5(%s) refused", md5);
         Update.abort();
         free(buf);
-        conn.stop();
+        c.stop();
         fail("설치 시작 실패");
         return;
     }
@@ -489,7 +484,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // conn.stop() and not c.stop(): on an https URL the socket carries an mbedtls session, and
     // closing it would leave the ~32KB of record buffers held through the md5 pass below and the
     // restart after it, for a connection that has nothing left to say.
-    conn.stop();
+    c.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which

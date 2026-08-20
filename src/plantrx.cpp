@@ -68,7 +68,7 @@
 #include "updatemode.h"
 #include "fwpull.h"
 #include "nodeota.h"
-#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL    // the same server flag, aimed at a board that is not this one
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 
 // The request is a few hundred bytes; the reply carries one judgment row, four
 // plan rows, four action rows, the four-row window table and the control half.
@@ -617,10 +617,8 @@ static int read_reply(WiFiClient &c, char *out, size_t outsz,
 // LAN the server cannot reach. Returns true on a 2xx.
 static bool post_frame(const char *device, const char *kind, const char *ctype,
                        const uint8_t *body, size_t len, uint32_t deadline_ms) {
-    SrvConn conn;
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == nullptr) return false;
-    WiFiClient &c = *cp;
+    WiFiClient c;
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) return false;
 
     write_request_head(c, "/v1/frame", ctype, len, device, kind);
     size_t sent = 0;
@@ -1407,19 +1405,17 @@ static void exchange(void) {
     }
 
     uint32_t t0 = millis();
-    SrvConn conn;
+    WiFiClient c;
     // No setTimeout() here: connect() takes its own millisecond timeout and the read loop below
-    // owns a deadline of its own, so Stream's timeout gates nothing. SrvConn does set one on the
-    // TLS client, where mbedtls genuinely reads through it during the handshake.
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == nullptr) {
+    // owns a deadline of its own, so Stream's timeout gates nothing here. The neighbouring files
+    // set it in seconds against a millisecond API; copying that would plant the same dead line.
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         s_dbg_status = -1;
         s_dbg_rtt = millis() - t0;
         net_note_uplink_fail();  // LAN TCP connect timed out; feeds net_poll's watchdog
         schedule_fail(0, "connect");
         return;
     }
-    WiFiClient &c = *cp;
     write_request_head(c, "/v1/telemetry", "application/json", strlen(s_req), nullptr, nullptr);
     c.print(s_req);
     // No flush(): it discards the RX buffer despite its name and its own header
@@ -1575,7 +1571,7 @@ void plantrx_init(void) {
     // that fails on a link that was simply not up yet starts the backoff from
     // one for no reason.
     s_next_ms = millis() + 3000;
-    hlogf("[plantrx] server=%s%s%s\n", s_host_disp, s_url.prefix, s_url.tls ? " (TLS)" : "");
+    hlogf("[plantrx] server=%s%s\n", s_host_disp, s_url.prefix);
 }
 
 void plantrx_poll(void) {

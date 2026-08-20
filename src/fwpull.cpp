@@ -51,7 +51,7 @@
 #include "hlog.h"
 #include "net.h"
 #include "updatemode.h"
-#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "nodeproto.h"        // the firmware paths, shared with the two node firmwares
 
 static const uint32_t CONNECT_MS = 4000;
@@ -280,15 +280,13 @@ static int read_body(WiFiClient &c, char *out, size_t cap, uint32_t start, uint3
 // two the server publishes - idf_ver and mtime - are for a person reading the manifest, not for
 // this. Returns false with s_status already set to something a grower can read.
 static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == nullptr) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         s_status = "서버 연결 실패";
         hlogf("[fwpull] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
         return false;
     }
-    WiFiClient &c = *cp;
     // Composed from the shared macro and this board's own role rather than spelled out, the same
     // way both node firmwares compose it (sensor_node/src/nodeota.cpp:323). The role is not
     // optional here just because the server defaults it to "panel": that default exists for
@@ -303,7 +301,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    conn.stop();
+    c.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published. That is an operator
@@ -343,15 +341,13 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
 // GET /v1/firmware/image and write it into the inactive slot. Returns only on failure, with
 // s_status set; on success it restarts and never comes back.
 static void download_and_install(const char *sha, const char *md5, size_t size) {
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
-    if (cp == nullptr) {
+    if (!c.connect(s_url.host, s_url.port, CONNECT_MS)) {
         s_status = "서버 연결 실패";
         hlogf("[fwpull] cannot reach %s:%u for the image\n", s_url.host, (unsigned)s_url.port);
         return;
     }
-    WiFiClient &c = *cp;
     char path[64];
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_IMAGE,
              nodeproto_role_name(NODE_ROLE_PANEL));
@@ -360,7 +356,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        conn.stop();
+        c.stop();
         s_status = "서버 응답 오류";
         hlogf("[fwpull] image HTTP %d\n", status);
         return;
@@ -370,7 +366,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // requests against a file an operator can replace between them, and an image that is not
         // the one the hash and the md5 describe must never reach Update.begin() - past that
         // point the inactive slot is being erased for something nobody vouched for.
-        conn.stop();
+        c.stop();
         s_status = "크기 불일치";
         hlogf("[fwpull] image is %ld bytes, manifest said %u - refusing\n",
               clen, (unsigned)size);
@@ -383,7 +379,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // do not get for the months a wall panel actually stays up.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        conn.stop();
+        c.stop();
         s_status = "메모리 부족";
         hlogf("[fwpull] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         return;
@@ -392,7 +388,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!Update.begin(size, U_FLASH)) {
         hlogf("[fwpull] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        conn.stop();
+        c.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -402,7 +398,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         hlogf("[fwpull] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        conn.stop();
+        c.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -449,7 +445,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     }
 
     heap_caps_free(buf);
-    conn.stop();
+    c.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which

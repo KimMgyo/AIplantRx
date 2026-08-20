@@ -28,7 +28,7 @@
 #include <stdlib.h>          // atoi, for the status line
 #include <string.h>
 #include "nodeproto.h"
-#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL
+#include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "nodelog.h"
 #include "plantrx.h"
 #include "updatemode.h"
@@ -298,15 +298,13 @@ static int read_status_and_drain(WiFiClient &c, uint32_t start) {
 }
 
 static bool post_body(size_t len) {
-    SrvConn conn;
+    WiFiClient c;
     uint32_t start = millis();
-    WiFiClient *cp = conn.connect(*plantrx_srv_url(), CONNECT_MS);
-    if (cp == nullptr) {
+    if (!c.connect(plantrx_srv_host(), plantrx_srv_port(), CONNECT_MS)) {
         hlogf("[nodelog] cannot reach %s:%u\n", plantrx_srv_host(),
               (unsigned)plantrx_srv_port());
         return false;
     }
-    WiFiClient &c = *cp;
 
     write_post_head(c, len);
     size_t sent = 0;
