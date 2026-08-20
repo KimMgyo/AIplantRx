@@ -160,11 +160,25 @@ static void begin_target(const char *ssid, const char *pass) {
 // not advertise PMF in its RSN capabilities cannot be taken up on WPA3. Against a transition-mode
 // AP that means WPA2-PSK, no SAE exchange, and no derivation loop to sit in.
 //
-// WHAT THIS COSTS.
+// WHY THIS IS BLANKET AND NOT CONDITIONAL, WHICH IS THE FIRST THING A READER WILL WANT TO CHANGE.
+// The obvious shape is "try WPA3, fall back to WPA2 when it fails". That shape does not exist
+// here: the failure IS a task-watchdog reset. There is no error return to inspect, no exception,
+// no retry point - the board reboots inside the derivation, so the code never gets to observe its
+// own failure and act on it. The only two reachable states are "run that loop" and "do not", which
+// makes this a choice of one rather than a balance of two. Any conditional logic in this file
+// would be reacting to a crash it cannot see.
+//
+// WHAT IT COSTS.
 //
 // On the air: WPA2 rather than WPA3, and no PMF, so deauthentication frames are unprotected
 // again. Weighed against a bearer token that already crosses the public internet as cleartext on
 // port 80 (see the HTTPS attempt that was abandoned), the marginal exposure is small.
+//
+// The one case it genuinely breaks is an AP offering WPA3 and nothing else, which cannot be
+// negotiated at all without PMF. That is named at the scan below rather than left to present as
+// "no such network", and it stays rare for a reason outside this board: an AP with WPA3 only
+// locks out every client older than about 2019, so consumer and ISP firmware ships transition
+// mode instead - which is what this AP does (authmode 7, WIFI_AUTH_WPA2_WPA3_PSK).
 //
 // On the clock: unclear, and stated that way rather than guessed. Sixteen boots after this change
 // came online in 9-27s - the documented AUTH_FAIL(202) refusal first, then one to four
@@ -640,6 +654,23 @@ void net_poll(void) {
             }
             bool picked = false;
             if (best_i >= 0) {
+                // The one case the blanket WPA3 decline cannot handle, said out loud because it
+                // is otherwise indistinguishable from a wrong password. apply_security_policy()
+                // refuses PMF, and WPA3-SAE requires it, so an AP offering ONLY WPA3 has nothing
+                // left to negotiate: the association will fail every time with a reason code that
+                // reads like "no such network". Nothing here gives up - the attempt still runs,
+                // because the driver knowing better than this check is a cheaper outcome than a
+                // board that refuses to try - but the log now names the cause instead of leaving
+                // somebody to rediscover it from a coredump.
+                // Measured here, at the point the check runs: authmode=7,
+                // WIFI_AUTH_WPA2_WPA3_PSK. Recorded because the claim used to live in a comment
+                // further up that was written from a scan log, and this is the read the branch
+                // below actually depends on.
+                if (WiFi.encryptionType(best_i) == WIFI_AUTH_WPA3_PSK) {
+                    hlogf("[net] %s offers WPA3 only; this board declines WPA3 (see"
+                          " apply_security_policy) and cannot associate. Enable WPA2 or"
+                          " WPA2/WPA3 on the AP.\n", s_target_ssid);
+                }
                 const uint8_t *b = WiFi.BSSID(best_i);
                 int32_t ch = WiFi.channel(best_i);
                 if (b != NULL && ch >= 1 && ch <= 14) {
