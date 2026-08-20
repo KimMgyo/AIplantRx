@@ -30,6 +30,8 @@
 #include <strings.h>
 #include "nodeagent.h"
 #include "nodeproto.h"
+#include "srvconn.h"
+#include "srvurl.h"
 
 // provision.cpp registers this peer and re-adds it after every radio cycle; this is the address
 // it registers. Kept local rather than exported: provision.h's constants carry a "MUST
@@ -73,8 +75,9 @@ static const uint32_t STALL_MS = 20000;
 
 // A ceiling on the whole image transfer, because the stall timeout alone cannot bound it: a link
 // trickling one segment every nineteen seconds never trips it and would keep the camera dark for
-// as long as it kept doing that. Four minutes against a measured ~99-142KB/s for a 1.09MB image
-// is roughly thirty times the honest duration, so nothing that is actually working reaches it.
+// as long as it kept doing that. Four minutes against a measured ~99-142KB/s for the 1,193,168
+// byte image this builds is about twenty times the honest duration, so nothing that is actually
+// working reaches it. TLS grew the image by ~88KB, which is under a second of that link.
 static const uint32_t IMAGE_BUDGET_MS = 240000;
 
 // 4KB, matching SPI_FLASH_SEC_SIZE and UpdateClass's own buffer, so one write() lands as exactly
@@ -121,10 +124,8 @@ static volatile bool s_ack_wanted = false;
 // Server address, parsed out of whatever NODE_UPDATE carried. Not persisted: the panel knows
 // where the server is and says so on every command, which is the whole reason a node that has to
 // be reflashed to learn about a moved server is a node somebody has to physically reach.
-static char     s_host[64];
-static uint16_t s_port = 80;
-static char     s_prefix[48];
-static char     s_tok[NODEPROTO_TOKEN];
+static struct SrvUrl s_url;
+static char          s_tok[NODEPROTO_TOKEN];
 
 // ---- the log ring ------------------------------------------------------------------------
 //
@@ -346,33 +347,6 @@ static void log_drain(void) {
 
 // ---- small helpers, lifted from fwpull.cpp ----------------------------------------------------
 
-// Split "http://host:port/prefix". Anything that is not http:// with a host is a typo, and
-// guessing at a typo points a firmware install at a server that does not exist.
-static bool parse_base_url(const char *url) {
-    s_host[0] = s_prefix[0] = '\0';
-    const char *p = url;
-    if (strncmp(p, "http://", 7) != 0) return false;
-    p += 7;
-    size_t i = 0;
-    while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(s_host)) s_host[i++] = *p++;
-    s_host[i] = '\0';
-    if (!s_host[0]) return false;
-    while (*p && *p != ':' && *p != '/') p++;          // an over-long host is a typo
-    s_port = 80;
-    if (*p == ':') {
-        int port = atoi(p + 1);
-        if (port <= 0 || port > 65535) return false;
-        s_port = (uint16_t)port;
-        while (*p && *p != '/') p++;
-    }
-    i = 0;
-    while (*p && i + 1 < sizeof(s_prefix)) s_prefix[i++] = *p++;
-    s_prefix[i] = '\0';
-    size_t n = strlen(s_prefix);                        // "…:8000/" would double the slash
-    if (n && s_prefix[n - 1] == '/') s_prefix[n - 1] = '\0';
-    return true;
-}
-
 static const char HEXDIG[] = "0123456789abcdef";
 
 // The first 8 bytes of app_elf_sha256 as 16 lowercase hex characters plus a NUL; `out` holds 17.
@@ -435,8 +409,8 @@ static long json_long(const char *buf, const char *key, long dflt) {
 // before the first byte is written, and a chunked body only reveals its length after the last
 // chunk has gone past.
 static void write_get_head(WiFiClient &c, const char *path, const char *accept) {
-    c.print("GET "); c.print(s_prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_host); c.print(":"); c.print(s_port); c.print("\r\n");
+    c.print("GET "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
+    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
     c.print("User-Agent: SmartFarm-ESP32CAM/1.0\r\n");
     c.print("Accept: "); c.print(accept); c.print("\r\n");
     if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
@@ -528,20 +502,22 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_LATEST);
 
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
-        nodeagent_logf("[ota] cannot reach %s:%u\n", s_host, (unsigned)s_port);
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == NULL) {
+        nodeagent_logf("[ota] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
+    WiFiClient &c = *cp;
     write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    c.stop();
+    conn.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published for this role. That is an
@@ -590,19 +566,22 @@ static bool download_and_install(const char *md5, size_t size) {
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_IMAGE);
 
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
-        nodeagent_logf("[ota] cannot reach %s:%u for the image\n", s_host, (unsigned)s_port);
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == NULL) {
+        nodeagent_logf("[ota] cannot reach %s:%u for the image\n",
+                       s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
+    WiFiClient &c = *cp;
     write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] image HTTP %d\n", status);
         fail("서버 응답 오류");
         return false;
@@ -612,7 +591,7 @@ static bool download_and_install(const char *md5, size_t size) {
         // against a file an operator can replace between them, and an image that is not the one
         // the hash and the md5 describe must never reach Update.begin() - past that point the
         // inactive slot is being erased for something nobody vouched for.
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] image is %ld bytes, manifest said %u - refusing\n",
                        clen, (unsigned)size);
         fail("크기 불일치");
@@ -623,9 +602,19 @@ static bool download_and_install(const char *md5, size_t size) {
     // about to need - and on this board internal DRAM is already the scarce half, with the WiFi
     // stack and two socket paths living in it. Taken here and not at init: this runs at most once
     // between reboots.
+    //
+    // Over TLS that pressure is worse and the stand-down does not relieve it. The framework this
+    // pins builds mbedtls with CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y, so the session is allocated
+    // MALLOC_CAP_INTERNAL whatever else is free, and with CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384
+    // and CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN unset that is a 16KB in record buffer and a 16KB
+    // out one - about 32KB of internal DRAM held for the whole transfer, and not handed back
+    // after the handshake because CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH is unset too. Parking
+    // the camera buys nothing against it: its frame buffers are CAMERA_FB_IN_PSRAM (main.cpp), so
+    // deinit returns PSRAM. Which is exactly why this chunk buffer stays in PSRAM - the one
+    // 4KB-a-time allocation this file does control is the one that must not compete with it.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        c.stop();
+        conn.stop();
         nodeagent_logf("[ota] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         fail("메모리 부족");
         return false;
@@ -634,7 +623,7 @@ static bool download_and_install(const char *md5, size_t size) {
     if (!Update.begin(size, U_FLASH)) {
         nodeagent_logf("[ota] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -644,7 +633,7 @@ static bool download_and_install(const char *md5, size_t size) {
         nodeagent_logf("[ota] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return false;
     }
@@ -714,7 +703,10 @@ static bool download_and_install(const char *md5, size_t size) {
     }
 
     heap_caps_free(buf);
-    c.stop();
+    // conn.stop() and not c.stop(): closing the socket leaves the session allocated, and the
+    // ~32KB of internal DRAM it holds is wanted by the md5 and the flash driver under the
+    // Update.end() a few lines down.
+    conn.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which
@@ -760,14 +752,16 @@ static void run_update(const char *base, const char *token) {
         fail("네트워크 없음");
         return;
     }
-    if (!parse_base_url(base)) {
+    // http:// or https://, and anything else is refused rather than guessed at - the rule, and
+    // why guessing would be worse, are in shared/srvurl.h, which is now the only copy of both.
+    if (!srvurl_parse(base, &s_url)) {
         nodeagent_logf("[ota] cannot parse server base URL '%s'\n", base);
         fail("서버 주소 오류");
         return;
     }
     strncpy(s_tok, token, sizeof(s_tok) - 1);
     s_tok[sizeof(s_tok) - 1] = '\0';
-    nodeagent_logf("[ota] server=%s:%u%s\n", s_host, (unsigned)s_port, s_prefix);
+    nodeagent_logf("[ota] server=%s:%u%s\n", s_url.host, (unsigned)s_url.port, s_url.prefix);
 
     char want_sha[65], want_md5[33];
     long want_size = 0;
@@ -1011,7 +1005,8 @@ static void nodeagent_task(void *arg) {
 }
 
 void nodeagent_start(void) {
-    s_host[0] = s_prefix[0] = s_tok[0] = '\0';
+    memset(&s_url, 0, sizeof(s_url));
+    s_tok[0] = '\0';
 
     // Core 1, and this is the opposite of the panel's choice for a reason. fwpull pins to core 0
     // to stay off LVGL; here core 0 is where the WiFi stack lives and where provision, rtsp and

@@ -27,6 +27,21 @@ using namespace esp_panel::board;
 
 Board *board = nullptr;
 
+// THE ARDUINO LOOP TASK NEEDS MORE STACK THAN IT SHIPS WITH, and the reason is TLS.
+//
+// The core's default is 8192 bytes (cores/esp32/main.cpp). plantrx_poll(), fwpull's arming and
+// nodelog_tick() all run from loop(), and the first of those now opens an HTTPS socket - an
+// mbedtls handshake wants something close to that 8KB on its own, on top of whatever loop() was
+// already using. It does not overflow into a panic, which would at least be loud. It fails
+// inside mbedtls_ctr_drbg_seed() and surfaces as "CTR_DRBG - The entropy source failed", the
+// handshake returns without writing a byte, and the panel reports a server that never answered.
+// That cost an evening to read the second time it happened, so it is written down here.
+//
+// 16KB rather than a measured minimum: the margin is one page of internal DRAM against a failure
+// mode that presents as a network fault, and the poll task is the one place on this board where
+// a stack overflow would be blamed on the server.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 void setup() {
     Serial.begin(115200);
     delay(1000);

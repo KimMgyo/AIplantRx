@@ -51,6 +51,7 @@
 #include "hlog.h"
 #include "net.h"
 #include "updatemode.h"
+#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL
 #include "nodeproto.h"        // the firmware paths, shared with the two node firmwares
 
 static const uint32_t CONNECT_MS = 4000;
@@ -100,49 +101,27 @@ static const char *volatile s_status = "";
 static char s_why[32] = "";
 static TaskHandle_t s_task = nullptr;
 
-// The server address, parsed here rather than borrowed from plantrx.cpp. Its copies are static
-// to that translation unit and they should stay that way: making the uplink's host and port a
-// shared global would mean two files could disagree about where the server is, and the bug that
-// produces - telemetry landing on one box and firmware coming from another - reads as a server
-// fault from every angle except this one. Fifteen lines of parser is the cheaper half of that
-// trade, and it also leaves this file able to be pointed somewhere else without touching the
-// uplink.
+// The server address, parsed here into this module's OWN SrvUrl rather than borrowed from
+// plantrx_srv_url(). Two reasons, and the second is why it survived the parser moving to
+// shared/srvurl.h. One: fwpull_init() runs before plantrx_init() in main.cpp, so borrowing would
+// read a host that has not been parsed yet and a configured panel would report no server for pull
+// updates. Two: it leaves this file able to be pointed somewhere else without touching the uplink
+// - and a shared mutable host is how two files come to disagree about where the server is, which
+// produces telemetry landing on one box and firmware coming from another and reads as a server
+// fault from every angle except this one.
 static bool     s_configured = false;
-static char     s_host[64];
-static uint16_t s_port = 80;
-static char     s_prefix[48];      // path prefix from the base URL, "" for none
+static SrvUrl   s_url;
 // Borrowed from sitecfg rather than copied, for the reason plantrx.cpp gives at its own s_tok:
 // the buffer outlives this file and never changes after init.
 static const char *s_tok = "";
 
 // ---- small helpers ----------------------------------------------------------
 
-// Split "http://host:port/prefix". Same shape and same rule as plantrx.cpp's: anything that is
-// not http:// with a host reads as unconfigured, because a base URL nobody can parse is a typo
-// and guessing at it would point a firmware install at a server that does not exist.
-static bool parse_base_url(const char *url) {
-    const char *p = url;
-    if (strncmp(p, "http://", 7) != 0) return false;
-    p += 7;
-    size_t i = 0;
-    while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(s_host)) s_host[i++] = *p++;
-    s_host[i] = '\0';
-    if (!s_host[0]) return false;
-    while (*p && *p != ':' && *p != '/') p++;          // an over-long host is a typo
-    s_port = 80;
-    if (*p == ':') {
-        int port = atoi(p + 1);
-        if (port <= 0 || port > 65535) return false;
-        s_port = (uint16_t)port;
-        while (*p && *p != '/') p++;
-    }
-    i = 0;
-    while (*p && i + 1 < sizeof(s_prefix)) s_prefix[i++] = *p++;
-    s_prefix[i] = '\0';
-    size_t n = strlen(s_prefix);                        // "…:8000/" would double the slash
-    if (n && s_prefix[n - 1] == '/') s_prefix[n - 1] = '\0';
-    return true;
-}
+// The parse moved to shared/srvurl.h - see the block at the top of that file for what is accepted
+// and why an unparseable URL reads as unconfigured. Kept as this module's OWN SrvUrl rather than
+// borrowed from plantrx_srv_url(): fwpull_init() runs before plantrx_init() in main.cpp, so
+// borrowing would read a host that has not been parsed yet and turn a configured panel into one
+// that reports no server for pull updates.
 
 static const char HEXDIG[] = "0123456789abcdef";
 
@@ -212,8 +191,8 @@ static long json_long(const char *buf, const char *key, long dflt) {
 // tidiness, it is the whole check. Update.begin() has to be told the exact size before the first
 // byte is written, and a chunked body only reveals its length after the last chunk has gone past.
 static void write_get_head(WiFiClient &c, const char *path, const char *accept) {
-    c.print("GET "); c.print(s_prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_host); c.print(":"); c.print(s_port); c.print("\r\n");
+    c.print("GET "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
+    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
     c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
     c.print("Accept: "); c.print(accept); c.print("\r\n");
     if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
@@ -301,13 +280,15 @@ static int read_body(WiFiClient &c, char *out, size_t cap, uint32_t start, uint3
 // two the server publishes - idf_ver and mtime - are for a person reading the manifest, not for
 // this. Returns false with s_status already set to something a grower can read.
 static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == nullptr) {
         s_status = "서버 연결 실패";
-        hlogf("[fwpull] cannot reach %s:%u\n", s_host, (unsigned)s_port);
+        hlogf("[fwpull] cannot reach %s:%u\n", s_url.host, (unsigned)s_url.port);
         return false;
     }
+    WiFiClient &c = *cp;
     // Composed from the shared macro and this board's own role rather than spelled out, the same
     // way both node firmwares compose it (sensor_node/src/nodeota.cpp:323). The role is not
     // optional here just because the server defaults it to "panel": that default exists for
@@ -322,7 +303,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    c.stop();
+    conn.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published. That is an operator
@@ -362,13 +343,15 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
 // GET /v1/firmware/image and write it into the inactive slot. Returns only on failure, with
 // s_status set; on success it restarts and never comes back.
 static void download_and_install(const char *sha, const char *md5, size_t size) {
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == nullptr) {
         s_status = "서버 연결 실패";
-        hlogf("[fwpull] cannot reach %s:%u for the image\n", s_host, (unsigned)s_port);
+        hlogf("[fwpull] cannot reach %s:%u for the image\n", s_url.host, (unsigned)s_url.port);
         return;
     }
+    WiFiClient &c = *cp;
     char path[64];
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_IMAGE,
              nodeproto_role_name(NODE_ROLE_PANEL));
@@ -377,7 +360,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        c.stop();
+        conn.stop();
         s_status = "서버 응답 오류";
         hlogf("[fwpull] image HTTP %d\n", status);
         return;
@@ -387,7 +370,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // requests against a file an operator can replace between them, and an image that is not
         // the one the hash and the md5 describe must never reach Update.begin() - past that
         // point the inactive slot is being erased for something nobody vouched for.
-        c.stop();
+        conn.stop();
         s_status = "크기 불일치";
         hlogf("[fwpull] image is %ld bytes, manifest said %u - refusing\n",
               clen, (unsigned)size);
@@ -400,7 +383,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // do not get for the months a wall panel actually stays up.
     uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        c.stop();
+        conn.stop();
         s_status = "메모리 부족";
         hlogf("[fwpull] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         return;
@@ -409,7 +392,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!Update.begin(size, U_FLASH)) {
         hlogf("[fwpull] Update.begin(%u) refused: %s\n", (unsigned)size, Update.errorString());
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -419,7 +402,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         hlogf("[fwpull] Update.setMD5(%s) refused\n", md5);
         Update.abort();
         heap_caps_free(buf);
-        c.stop();
+        conn.stop();
         s_status = "설치 시작 실패";
         return;
     }
@@ -466,7 +449,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     }
 
     heap_caps_free(buf);
-    c.stop();
+    conn.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which
@@ -588,12 +571,12 @@ static void fwpull_task(void *arg) {
 // ---- public API -------------------------------------------------------------
 
 void fwpull_init(void) {
-    s_host[0] = s_prefix[0] = '\0';
+    memset(&s_url, 0, sizeof(s_url));
 
     const char *base = sitecfg_base_url();
     s_tok = sitecfg_token();
 
-    if (base[0] == '\0' || !parse_base_url(base)) {
+    if (base[0] == '\0' || !srvurl_parse(base, &s_url)) {
         // No task at all in this case. A worker that can never do anything would still cost its
         // whole stack in internal DRAM, which on this board is the scarce half of memory, and
         // fwpull_request() below turns the request away on its own.
@@ -612,7 +595,7 @@ void fwpull_init(void) {
     // which is the only thing that distinguishes an update in progress from a crashed panel to
     // the person waiting in front of it.
     xTaskCreatePinnedToCore(fwpull_task, "fwpull", 6144, nullptr, 5, &s_task, 0);
-    hlogf("[fwpull] ready; server=%s:%u%s\n", s_host, (unsigned)s_port, s_prefix);
+    hlogf("[fwpull] ready; server=%s:%u%s\n", s_url.host, (unsigned)s_url.port, s_url.prefix);
 }
 
 void fwpull_request(const char *why) {

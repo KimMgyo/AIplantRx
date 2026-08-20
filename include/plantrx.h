@@ -346,6 +346,13 @@ const char *plantrx_srv_host(void);
 uint16_t    plantrx_srv_port(void);
 const char *plantrx_srv_prefix(void);
 
+// The same address as the three accessors above, as one struct, for the callers that need to open
+// a socket rather than print a host. shared/srvconn.h takes it directly, and going through here
+// rather than each module parsing sitecfg again is what keeps one answer to "is this link
+// encrypted" instead of four. Valid from plantrx_init() on; host[0] is '\0' until then, which
+// SrvConn::connect() already refuses.
+const struct SrvUrl *plantrx_srv_url(void);
+
 // HTTP status of the last exchange. 0 is "nothing attempted this boot", -1 is
 // "the connection or the reply never happened at all" - a 500 means the server
 // is alive and answering, which is a different afternoon of debugging from

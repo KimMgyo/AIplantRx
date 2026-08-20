@@ -10,6 +10,8 @@
 #include "nodeagent.h"
 #include "nodeota.h"
 #include "nodeproto.h"
+#include "srvconn.h"
+#include "srvurl.h"
 
 // Every number below is src/fwpull.cpp's, and the panel's comments hold the measurements behind
 // them. They are repeated rather than shared because they describe an HTTP conversation against
@@ -40,9 +42,7 @@ static const int      JOIN_TRIES  = 3;
 static const uint32_t REPORT_MS  = 2000;
 static const uint8_t  REPORT_PCT = 5;
 
-static char     s_host[64];
-static uint16_t s_port = 80;
-static char     s_prefix[48];
+static struct SrvUrl s_url;
 static char     s_tok[NODEPROTO_TOKEN];
 
 static const char HEXDIG[] = "0123456789abcdef";
@@ -50,33 +50,6 @@ static const char HEXDIG[] = "0123456789abcdef";
 // ---- small helpers ----------------------------------------------------------------------------
 
 static void fail(const char *why) { nodeagent_report(NODE_PH_FAIL, NODE_PCT_NONE, why); }
-
-// Split "http://host:port/prefix". Same shape and same rule as the panel's: anything that is not
-// http:// with a host reads as unconfigured, because a base URL nobody can parse is a typo and
-// guessing at it would point a firmware install at a server that does not exist.
-static bool parse_base_url(const char *url) {
-    const char *p = url;
-    if (strncmp(p, "http://", 7) != 0) return false;
-    p += 7;
-    size_t i = 0;
-    while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(s_host)) s_host[i++] = *p++;
-    s_host[i] = '\0';
-    if (!s_host[0]) return false;
-    while (*p && *p != ':' && *p != '/') p++;          // an over-long host is a typo
-    s_port = 80;
-    if (*p == ':') {
-        int port = atoi(p + 1);
-        if (port <= 0 || port > 65535) return false;
-        s_port = (uint16_t)port;
-        while (*p && *p != '/') p++;
-    }
-    i = 0;
-    while (*p && i + 1 < sizeof(s_prefix)) s_prefix[i++] = *p++;
-    s_prefix[i] = '\0';
-    size_t n = strlen(s_prefix);                        // "…:8000/" would double the slash
-    if (n && s_prefix[n - 1] == '/') s_prefix[n - 1] = '\0';
-    return true;
-}
 
 // This image's identity as the manifest spells it: the first 8 bytes of app_elf_sha256 in
 // lowercase hex. Eight and not thirty-two because that is what NodeRepMsg carries to the panel, so
@@ -147,8 +120,8 @@ static long json_long(const char *buf, const char *key, long dflt) {
 // Update.begin() has to be told the exact size before the first byte is written, and a chunked
 // body only reveals its length after the last chunk has gone past.
 static void write_get_head(WiFiClient &c, const char *path, const char *accept) {
-    c.print("GET "); c.print(s_prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_host); c.print(":"); c.print(s_port); c.print("\r\n");
+    c.print("GET "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
+    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
     c.print("User-Agent: SmartFarm-Node/1.0\r\n");
     c.print("Accept: "); c.print(accept); c.print("\r\n");
     if (s_tok[0]) { c.print("Authorization: Bearer "); c.print(s_tok); c.print("\r\n"); }
@@ -323,20 +296,22 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_LATEST,
              nodeproto_role_name(NODE_ROLE_NODE));
 
-    WiFiClient c;
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
-        nlogf_always("[ota] cannot reach %s:%u", s_host, (unsigned)s_port);
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == NULL) {
+        nlogf_always("[ota] cannot reach %s:%u", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return false;
     }
+    WiFiClient &c = *cp;
     write_get_head(c, path, "application/json");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     char body[512];
     int n = (status > 0) ? read_body(c, body, sizeof(body), start, REPLY_MS) : -1;
-    c.stop();
+    conn.stop();
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published for this role. That is an
@@ -381,19 +356,32 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_IMAGE,
              nodeproto_role_name(NODE_ROLE_NODE));
 
-    WiFiClient c;
+    // What a TLS session costs here, because this is the allocation that could not afford to be a
+    // guess. The pinned esp32-arduino-libs sdkconfig has CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384
+    // with ASYMMETRIC_CONTENT_LEN off, so mbedtls takes that size in BOTH directions: ~32KB of
+    // record buffers plus the context, against the 4KB chunk buffer below that the comment there
+    // already treats as worth freeing. It fits, and not narrowly - this image links at 66,524
+    // bytes of static RAM out of the esp32's 327,680, leaving something over 200KB of heap once
+    // the WiFi driver has taken its share of what is left.
+    //
+    // What does change is where a board that has run out finds out. The session is allocated
+    // before the chunk buffer, so an exhausted heap now fails the connect below and reports
+    // "서버 연결 실패", not the "메모리 부족" branch and its free-heap figure.
+    SrvConn conn;
     uint32_t start = millis();
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
-        nlogf_always("[ota] cannot reach %s:%u for the image", s_host, (unsigned)s_port);
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == NULL) {
+        nlogf_always("[ota] cannot reach %s:%u for the image", s_url.host, (unsigned)s_url.port);
         fail("서버 연결 실패");
         return;
     }
+    WiFiClient &c = *cp;
     write_get_head(c, path, "application/octet-stream");
 
     long clen = -1;
     int status = read_head(c, start, REPLY_MS, &clen);
     if (status != 200) {
-        c.stop();
+        conn.stop();
         nlogf_always("[ota] image HTTP %d", status);
         fail("서버 응답 오류");
         return;
@@ -403,7 +391,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // requests against a file an operator can replace between them, and an image that is not
         // the one the hash and the md5 describe must never reach Update.begin() - past that point
         // the inactive slot is being erased for something nobody vouched for.
-        c.stop();
+        conn.stop();
         nlogf_always("[ota] image is %ld bytes, manifest said %u - refusing", clen, (unsigned)size);
         fail("크기 불일치");
         return;
@@ -415,7 +403,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // path's frame, payload and fragment buffers do not get for the months this board stays up.
     uint8_t *buf = (uint8_t *)malloc(CHUNK);
     if (!buf) {
-        c.stop();
+        conn.stop();
         nlogf_always("[ota] no room for a %u byte chunk buffer (%u free)",
                      (unsigned)CHUNK, (unsigned)ESP.getFreeHeap());
         fail("메모리 부족");
@@ -425,7 +413,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!Update.begin(size, U_FLASH)) {
         nlogf_always("[ota] Update.begin(%u) refused: %s", (unsigned)size, Update.errorString());
         free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return;
     }
@@ -436,7 +424,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         nlogf_always("[ota] Update.setMD5(%s) refused", md5);
         Update.abort();
         free(buf);
-        c.stop();
+        conn.stop();
         fail("설치 시작 실패");
         return;
     }
@@ -498,7 +486,10 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     }
 
     free(buf);
-    c.stop();
+    // conn.stop() and not c.stop(): on an https URL the socket carries an mbedtls session, and
+    // closing it would leave the ~32KB of record buffers held through the md5 pass below and the
+    // restart after it, for a connection that has nothing left to say.
+    conn.stop();
 
     if (got != size) {
         // errorString() first, abort() second. abort() calls _abort(UPDATE_ERROR_ABORT), which
@@ -549,14 +540,17 @@ void nodeota_run(const char *base_url, const char *token) {
         fail("OTA 슬롯 없음");
         return;
     }
-    if (!parse_base_url(base_url)) {
+    // srvurl_parse() rather than a fourth copy of the same split; shared/srvurl.h holds the rule
+    // and the reason an address nobody can parse has to read as unconfigured.
+    if (!srvurl_parse(base_url, &s_url)) {
         nlogf_always("[ota] cannot parse server url '%s'", base_url);
         fail("서버 주소 오류");
         return;
     }
     strncpy(s_tok, token ? token : "", sizeof(s_tok) - 1);
     s_tok[sizeof(s_tok) - 1] = '\0';
-    nlogf_always("[ota] update requested: %s:%u%s", s_host, (unsigned)s_port, s_prefix);
+    nlogf_always("[ota] update requested: %s:%u%s", s_url.host, (unsigned)s_url.port,
+                 s_url.prefix);
 
     if (!wifi_up()) return;   // reported and tore down its own failure
 

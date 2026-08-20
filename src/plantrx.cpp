@@ -67,7 +67,8 @@
 #include "ui.h"
 #include "updatemode.h"
 #include "fwpull.h"
-#include "nodeota.h"    // the same server flag, aimed at a board that is not this one
+#include "nodeota.h"
+#include "srvconn.h"   // one socket to the server, TLS decided by the stored URL    // the same server flag, aimed at a board that is not this one
 
 // The request is a few hundred bytes; the reply carries one judgment row, four
 // plan rows, four action rows, the four-row window table and the control half.
@@ -130,9 +131,10 @@ static const uint32_t FRAME_WAIT_MS = 10000;
 // ---- state ------------------------------------------------------------------
 
 static bool     s_configured = false;
-static char     s_host[64];
-static uint16_t s_port = 80;
-static char     s_prefix[48];      // path prefix from the base URL, "" for none
+// The server, parsed once by shared/srvurl.h. It replaced a private copy of that parser which
+// three other files also carried; the scheme now decides whether the socket is encrypted, and
+// four copies of that decision is three chances for one board to keep talking in the clear.
+static SrvUrl   s_url;
 // "host:port" as one string. Built at init rather than per call because the
 // settings page polls it on a UI timer, and an snprintf per tick to rebuild a
 // string that cannot change is work the panel pays for as long as it is up.
@@ -562,8 +564,8 @@ static JudgeLevel level_of(const char *obj) {
 // the parser above can walk without a de-framing pass first.
 static void write_request_head(WiFiClient &c, const char *path, const char *ctype,
                                size_t clen, const char *xdev, const char *xkind) {
-    c.print("POST "); c.print(s_prefix); c.print(path); c.print(" HTTP/1.0\r\n");
-    c.print("Host: "); c.print(s_host); c.print(":"); c.print(s_port); c.print("\r\n");
+    c.print("POST "); c.print(s_url.prefix); c.print(path); c.print(" HTTP/1.0\r\n");
+    c.print("Host: "); c.print(s_url.host); c.print(":"); c.print(s_url.port); c.print("\r\n");
     c.print("User-Agent: SmartFarm-ESP32/1.0\r\n");
     c.print("Accept: application/json\r\n");
     c.print("Content-Type: "); c.print(ctype); c.print("\r\n");
@@ -615,8 +617,10 @@ static int read_reply(WiFiClient &c, char *out, size_t outsz,
 // LAN the server cannot reach. Returns true on a 2xx.
 static bool post_frame(const char *device, const char *kind, const char *ctype,
                        const uint8_t *body, size_t len, uint32_t deadline_ms) {
-    WiFiClient c;
-    if (!c.connect(s_host, s_port, CONNECT_MS)) return false;
+    SrvConn conn;
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == nullptr) return false;
+    WiFiClient &c = *cp;
 
     write_request_head(c, "/v1/frame", ctype, len, device, kind);
     size_t sent = 0;
@@ -1403,18 +1407,19 @@ static void exchange(void) {
     }
 
     uint32_t t0 = millis();
-    WiFiClient c;
-    // No setTimeout(): connect() takes its own millisecond timeout and the read
-    // loop below owns a deadline of its own, so Stream's timeout gates nothing
-    // here. The neighbouring files set it in seconds against a millisecond API;
-    // copying that would just plant the same dead line in a third place.
-    if (!c.connect(s_host, s_port, CONNECT_MS)) {
+    SrvConn conn;
+    // No setTimeout() here: connect() takes its own millisecond timeout and the read loop below
+    // owns a deadline of its own, so Stream's timeout gates nothing. SrvConn does set one on the
+    // TLS client, where mbedtls genuinely reads through it during the handshake.
+    WiFiClient *cp = conn.connect(s_url, CONNECT_MS);
+    if (cp == nullptr) {
         s_dbg_status = -1;
         s_dbg_rtt = millis() - t0;
         net_note_uplink_fail();  // LAN TCP connect timed out; feeds net_poll's watchdog
         schedule_fail(0, "connect");
         return;
     }
+    WiFiClient &c = *cp;
     write_request_head(c, "/v1/telemetry", "application/json", strlen(s_req), nullptr, nullptr);
     c.print(s_req);
     // No flush(): it discards the RX buffer despite its name and its own header
@@ -1528,35 +1533,12 @@ static void exchange(void) {
 
 // ---- public API -------------------------------------------------------------
 
-// Split "http://host:port/prefix" into its parts. Anything that is not http://
-// with a host reads as unconfigured: a base URL nobody can parse is a typo, and
-// guessing at it would point the panel at a server that does not exist.
-static bool parse_base_url(const char *url) {
-    const char *p = url;
-    if (strncmp(p, "http://", 7) != 0) return false;
-    p += 7;
-    size_t i = 0;
-    while (*p && *p != ':' && *p != '/' && i + 1 < sizeof(s_host)) s_host[i++] = *p++;
-    s_host[i] = '\0';
-    if (!s_host[0]) return false;
-    while (*p && *p != ':' && *p != '/') p++;          // an over-long host is a typo
-    s_port = 80;
-    if (*p == ':') {
-        int port = atoi(p + 1);
-        if (port <= 0 || port > 65535) return false;
-        s_port = (uint16_t)port;
-        while (*p && *p != '/') p++;
-    }
-    i = 0;
-    while (*p && i + 1 < sizeof(s_prefix)) s_prefix[i++] = *p++;
-    s_prefix[i] = '\0';
-    size_t n = strlen(s_prefix);                        // "…:8000/" would double the slash
-    if (n && s_prefix[n - 1] == '/') s_prefix[n - 1] = '\0';
-    return true;
-}
+// The parse moved to shared/srvurl.h - see the block at the top of that file for what is accepted
+// and why an unparseable URL reads as unconfigured rather than being guessed at.
 
 void plantrx_init(void) {
-    s_host[0] = s_prefix[0] = s_host_disp[0] = '\0';
+    memset(&s_url, 0, sizeof(s_url));
+    s_host_disp[0] = '\0';
     s_notice[0] = s_species[0] = s_species_conf[0] = s_species_sci[0] = '\0';
     s_rx_id[0] = '\0';
     memset(s_plan, 0, sizeof(s_plan));
@@ -1570,8 +1552,8 @@ void plantrx_init(void) {
         hlogf("[plantrx] no server configured; rule engine only" "\n");
         return;
     }
-    if (!parse_base_url(base)) {
-        hlogf("[plantrx] base URL is not http://host[:port][/prefix]; uplink off" "\n");
+    if (!srvurl_parse(base, &s_url)) {
+        hlogf("[plantrx] base URL is not http(s)://host[:port][/prefix]; uplink off" "\n");
         return;
     }
 
@@ -1588,12 +1570,12 @@ void plantrx_init(void) {
     }
 
     s_configured = true;
-    snprintf(s_host_disp, sizeof(s_host_disp), "%s:%u", s_host, (unsigned)s_port);
+    snprintf(s_host_disp, sizeof(s_host_disp), "%s:%u", s_url.host, (unsigned)s_url.port);
     // Not immediately: the radio has not associated at boot, and a first poll
     // that fails on a link that was simply not up yet starts the backoff from
     // one for no reason.
     s_next_ms = millis() + 3000;
-    hlogf("[plantrx] server=%s%s\n", s_host_disp, s_prefix);
+    hlogf("[plantrx] server=%s%s%s\n", s_host_disp, s_url.prefix, s_url.tls ? " (TLS)" : "");
 }
 
 void plantrx_poll(void) {
@@ -1770,6 +1752,7 @@ uint32_t    plantrx_failures(void) { return s_fails; }
 // is - plantrx_init() writes them once and nothing writes them again, so a
 // borrower on another task cannot catch them half-updated.
 
-const char *plantrx_srv_host(void) { return s_host; }
-uint16_t    plantrx_srv_port(void) { return s_port; }
-const char *plantrx_srv_prefix(void) { return s_prefix; }
+const char *plantrx_srv_host(void) { return s_url.host; }
+uint16_t    plantrx_srv_port(void) { return s_url.port; }
+const char *plantrx_srv_prefix(void) { return s_url.prefix; }
+const SrvUrl *plantrx_srv_url(void) { return &s_url; }
