@@ -41,6 +41,13 @@ __pycache__/
 # ---------------------------------------------------------------------------
 server/data/
 
+# And the same directory when PLANTRX_DB names a database somewhere other than ./data - the image
+# directory is always `<db parent>/firmware` (server/app/firmware.py:image_path), so pointing the
+# variable at server/plantrx.db to try something out leaves three downloaded release images here.
+# They are 5.6 MB the puller re-fetches from GitHub on demand, and there is no version of them
+# that is source.
+server/firmware/
+
 # ---------------------------------------------------------------------------
 # Build and debug artifacts
 # ---------------------------------------------------------------------------
