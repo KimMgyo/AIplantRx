@@ -197,11 +197,9 @@ enum DevHintMode : uint8_t {
     HINT_NONE, HINT_ARMED, HINT_QUIET, HINT_NOOTA, HINT_SAID, HINT_GOOD, HINT_BUSY, HINT_IDLE,
 };
 
-// When the 서버 row stops saying 정상. The poll interval is the SERVER's to choose - it rides back
-// on every prescription as next_poll_s - so this cannot be a multiple of a constant here. Three
-// minutes is chosen against the longest cadence the server actually asks for (60s) being missed
-// twice: one missed poll is a lost packet and not news, three is a wire that has stopped.
-static const int32_t SRV_STALE_S = 180;
+// The 서버 row's staleness bound USED TO BE HERE. It is gone because the row no longer decides:
+// plantrx.cpp owns RX_OK vs RX_STALE and this file asks it, which is one threshold instead of two
+// that could disagree about the same server on two pages.
 
 struct DevCard {
     uint8_t   role;
@@ -435,32 +433,30 @@ static void dev_refresh(DevCard *c) {
     // this row, on the narrowest cards in this UI. What changes, and what a person standing here can
     // act on, is whether it answered and how long ago.
     if (c->srv != NULL) {
-        // plantrx_age_s() and not plantrx_content_age_s(): this row answers "did the far end
-        // answer", and plantrx.h is explicit that the content age is the one a widget describing
-        // the JUDGMENT wants. A server whose model has failed still answers every poll, and that
-        // is a different fault on a different screen.
-        int32_t age = plantrx_configured() ? plantrx_age_s() : -1;
-        int8_t state;                                     // 0 none, 1 waiting, 2 fresh, 3 stale
-        if (!plantrx_configured()) state = 0;
-        else if (age < 0)          state = 1;
-        else if (age <= SRV_STALE_S) state = 2;
-        else                       state = 3;
-
-        if (state <= 1) {
-            ui_set_label_text(c->srv, state == 0 ? "미설정" : "대기 중");
-        } else {
+        // plantrx_link() and not an age of my own. The first version of this row derived four
+        // states from plantrx_age_s(), which reinvented an enum that already exists and got it
+        // wrong in one place that matters: with no RX_ERROR case, a server whose last attempt
+        // FAILED read as 지연 - a word that means "taking its time". ui_rx_word() is the one
+        // vocabulary for these five states; see the table in ui_helpers.cpp.
+        RxLink st = plantrx_link();
+        // The age rides along on the two states where it adds something. 미설정 has nothing to be
+        // old, and 대기 중 means nothing has arrived yet - an age beside either would be a number
+        // describing an absence.
+        int32_t age = plantrx_age_s();
+        if (age >= 0 && (st == RX_OK || st == RX_STALE || st == RX_ERROR)) {
             char when[24];
             dev_fmt_age(when, sizeof(when), (uint32_t)age * 1000u);
-            snprintf(buf, sizeof(buf), "%s · %s", state == 2 ? "정상" : "지연", when);
+            snprintf(buf, sizeof(buf), "%s · %s", ui_rx_word(st), when);
             ui_set_label_text(c->srv, buf);
+        } else {
+            ui_set_label_text(c->srv, ui_rx_word(st));
         }
         // Colour written only when the state changes, the way link_shown gates the row above:
         // lv_obj_set_style_text_color invalidates whether or not the colour moved, and this runs
         // every second.
-        if (c->srv_shown != state) {
-            c->srv_shown = state;
-            lv_obj_set_style_text_color(
-                c->srv, state == 2 ? C_BLUE : state == 3 ? C_AMBER : C_TEXT_SECONDARY, 0);
+        if (c->srv_shown != (int8_t)st) {
+            c->srv_shown = (int8_t)st;
+            lv_obj_set_style_text_color(c->srv, ui_rx_color(st), 0);
         }
     }
 
@@ -743,9 +739,11 @@ static void dev_card_build(lv_obj_t *parent, uint8_t role) {
 
     c->link = info_row(cd, "연결");
     c->ver  = info_row(cd, "버전");
+    // "IP" and not "IP 주소": the settings page said IP 주소 for the same fact and one of the two
+    // had to go. Both are this one now - these three cards are the narrowest containers in the UI,
+    // and the word 주소 buys nothing beside a dotted quad.
     c->ip   = info_row(cd, "IP");
     c->up   = info_row(cd, "가동");
-
     // 남은 메모리 WAS HERE AND IS NOT COMING BACK. A grower cannot act on a heap figure, and the
     // person who can read it in the console this panel pushes to the server, per second, with a
     // low-water mark and a block count beside it. A row on a 7" screen that only a developer can

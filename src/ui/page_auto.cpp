@@ -729,7 +729,11 @@ static void refresh_badges(void) {
     ui_set_label_text(w_judge_badge, !from_server ? "패널" : model ? "모델" : "서버");
 
     bool up = plantrx_configured();
-    const char *srv_badge = !up ? "미연결" : model ? "모델" : "서버";
+    // 미설정 and not 미연결, which is what this badge said. The two words describe the same state -
+    // no server configured - and RxLink's RX_OFF is the fact behind both, so it goes through
+    // ui_rx_word() like every other widget that draws a server state. See ui_helpers.cpp for why
+    // there is one vocabulary and not four.
+    const char *srv_badge = !up ? ui_rx_word(RX_OFF) : model ? "모델" : "서버";
     ui_set_label_text(w_plan_badge, srv_badge);
     ui_set_label_text(w_action_badge, srv_badge);
 
@@ -910,8 +914,10 @@ lv_obj_t *page_auto_build(lv_obj_t *parent) {
     w_turn_label = NULL;
     w_judge_list = build_column(row, "AI 판단 내역", C_AMBER, "패널", &w_judge_badge, &w_turn_label);
 
-    w_plan_list = build_column(row, "AI 예약 내역", C_BLUE, "미연결", &w_plan_badge, NULL);
-    w_action_list = build_column(row, "AI 조치 내역", C_GREEN, "미연결", &w_action_badge, NULL);
+    // The initial badge text, through the same vocabulary the refresh uses - a build-time literal
+    // that disagreed with what the first tick would write is a flicker nobody can explain.
+    w_plan_list = build_column(row, "AI 예약 내역", C_BLUE, ui_rx_word(RX_OFF), &w_plan_badge, NULL);
+    w_action_list = build_column(row, "AI 조치 내역", C_GREEN, ui_rx_word(RX_OFF), &w_action_badge, NULL);
 
     // Both guards start one behind their producer so the first fill is
     // unconditional: a theme rebuild lands here with the live revisions already

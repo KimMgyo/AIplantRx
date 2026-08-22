@@ -17,6 +17,9 @@
 #include "lvgl.h"
 #include "fonts.h"
 #include "ui_colors.h"
+// For RxLink, which ui_rx_word()/ui_rx_color() below take. plantrx.h pulls in nothing but stddef
+// and stdint, so this costs no cycle and no build time worth measuring.
+#include "plantrx.h"
 
 // ---------------------------------------------------------------------------
 // Shared state (defined in ui.cpp)
@@ -121,6 +124,12 @@ int32_t rx_content_stale_s(void);
 // lost its key still holds a real judgment that is really ageing, and that one has
 // earned its amber.
 bool rx_no_model(void);
+
+// The one vocabulary for RxLink, shared by every widget that draws it - the AI page's badge and
+// the firmware page's 서버 row today. Four widgets used to name these five states four ways; the
+// note in ui_helpers.cpp has the table and why 지연 and 실패 stay different words.
+const char *ui_rx_word(RxLink st);
+lv_color_t  ui_rx_color(RxLink st);
 
 // ---------------------------------------------------------------------------
 // Tiny builders (ui_helpers.cpp)

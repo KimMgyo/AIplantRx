@@ -39,6 +39,50 @@ bool rx_no_model(void) {
            !plantrx_model_ready();
 }
 
+// ONE WORD PER SERVER STATE, IN ONE PLACE, BECAUSE THERE WERE FOUR VOCABULARIES.
+//
+// RxLink has five values and three widgets described them three different ways: the AI page's
+// badge said 미연결 for a server that was merely unconfigured, the firmware page's row invented
+// 미설정 / 대기 중 / 정상 / 지연 from an AGE rather than from the enum - which collapsed RX_ERROR
+// into 지연, so a failing uplink read as a slow one - and the settings page had a fifth set before
+// it was removed. Four names for one fact is how a grower learns that the words do not mean
+// anything.
+//
+// The vocabulary is the one the settings block used, because it was the only one that covered all
+// five states with one word each and mapped onto the enum without arithmetic:
+//
+//   RX_OFF     미설정    nothing to reach
+//   RX_WAITING 대기 중   configured, no exchange yet this boot
+//   RX_OK      정상      answered recently
+//   RX_STALE   지연      answered, but not lately
+//   RX_ERROR   실패      the last attempt failed
+//
+// 지연 and 실패 are deliberately different words: one is a server taking its time and the other is
+// a server that refused, and the grower's next move is to wait or to go and look.
+const char *ui_rx_word(RxLink st) {
+    switch (st) {
+    case RX_OFF:     return "미설정";
+    case RX_WAITING: return "대기 중";
+    case RX_OK:      return "정상";
+    case RX_STALE:   return "지연";
+    case RX_ERROR:   return "실패";
+    }
+    return "미설정";   // no default in the switch, so a new enum value fails the build first
+}
+
+// Paired with the word and kept beside it: no two words share a colour, so a caller that has
+// written one has written the other, and an unchanged word means an unchanged colour.
+lv_color_t ui_rx_color(RxLink st) {
+    switch (st) {
+    case RX_OK:      return C_BLUE;
+    case RX_STALE:   return C_AMBER;
+    case RX_ERROR:   return C_AMBER;
+    case RX_OFF:
+    case RX_WAITING: break;
+    }
+    return C_TEXT_SECONDARY;
+}
+
 // ---------------------------------------------------------------------------
 // Tiny builders
 // ---------------------------------------------------------------------------

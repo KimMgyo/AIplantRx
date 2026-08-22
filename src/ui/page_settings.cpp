@@ -549,7 +549,7 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     build_device_header(c, ICON_WIFI, C_BLUE_TINT, C_BLUE, "WiFi 설정", t_wifi, on_toggle_wifi);
     build_status_line(c, &st_wifi);
     v_ssid = build_info_row(c, "네트워크");
-    v_ip = build_info_row(c, "IP 주소");
+    v_ip = build_info_row(c, "IP");
     v_rssi = build_info_row(c, "신호 세기");
     v_wifi_mac = build_info_row(c, "MAC");
 
@@ -617,7 +617,7 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     label(ehdr, "카메라 노드", &font_bold_14, C_TEXT_DARK);
 
     build_status_line(e, &st_cam);
-    v_cam_ip = build_info_row(e, "IP 주소");
+    v_cam_ip = build_info_row(e, "IP");
     v_cam_rssi = build_info_row(e, "신호 세기");
     // Two links reach this one device and only one of them was ever on this card.
     // The status line above is the ESP-NOW beacon: provisioning and presence. The
