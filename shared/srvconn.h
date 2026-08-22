@@ -114,6 +114,19 @@ static const char SRVCONN_ROOT_CA[] =
 // by some future bug shows up as a slow uplink rather than a permanently silent one.
 static const uint32_t GATE_WAIT_MS = 30000;
 
+// The least a TLS connect gets, whatever the caller asked for. Every CONNECT_MS in this project is
+// 4000 and every one of them says "same LAN, same server" - which was true of a TCP connect and is
+// not true of a handshake. Measured: 1.84s on the greenhouse LAN, and over a phone hotspot the
+// panel's whole exchange averages 5.0s with a 7.5s worst case, at which point a 4s budget starts
+// refusing connects that would have completed ("[hlog] push failed, status=-1 after 5330ms").
+//
+// Floored here rather than raised at five call sites, because the call sites were not wrong: 4s IS
+// enough to open a socket, and this is the only code that knows whether it is also negotiating one.
+// Bounded at ten seconds and not more: plantrx_poll() runs on the loop task, so this is time the
+// node ticks beside it do not get, and a dead server should read as a failed poll rather than a
+// stalled panel.
+static const uint32_t TLS_CONNECT_FLOOR_MS = 10000;
+
 // Holds whichever client the URL called for and hands out the Client* the caller writes through.
 // Copying is meaningless - it owns a live socket - so it is not copyable.
 
@@ -139,6 +152,9 @@ public:
         m_tls = u.tls;
 
         if (u.tls) {
+            // What the caller asked for, or the floor, whichever is longer - see
+            // TLS_CONNECT_FLOOR_MS. A caller that already asks for more keeps it.
+            if (timeout_ms < TLS_CONNECT_FLOOR_MS) timeout_ms = TLS_CONNECT_FLOOR_MS;
             // The gate, taken before anything is allocated and released only by stop().
             //
             // Its wait has a budget of its OWN and does not come out of timeout_ms, which was the

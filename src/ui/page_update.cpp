@@ -395,10 +395,18 @@ static void dev_refresh(DevCard *c) {
     // is the DESIGN: that board joins for the length of an OTA download and drops straight back to
     // ESP-NOW, so a permanent 연결 안 됨 there would be a red herring on the one card where it
     // means nothing.
+    //
+    // This row said "WiFi 꺼짐" for the node and that was not enough. It is accurate and it still
+    // reads as a fault - the first person to see it beside 온라인 asked why the node's WiFi was
+    // off, which is the question the wording existed to prevent. The fix is to name what the board
+    // IS doing rather than what it is not: this row answers "how is this board reachable", and for
+    // the sensor node the answer is ESP-NOW, not an absence. During an OTA it joins and the real
+    // address appears here, so the row stays informative in both states rather than being a
+    // constant.
     if (v.wifi && v.ip[0] != '\0' && v.ip[0] != '-') {
         ui_set_label_text(c->ip, v.ip);
     } else {
-        ui_set_label_text(c->ip, c->role == NODE_ROLE_NODE ? "WiFi 꺼짐" : "연결 안 됨");
+        ui_set_label_text(c->ip, c->role == NODE_ROLE_NODE ? "ESP-NOW" : "연결 안 됨");
     }
 
     if (v.known) {
