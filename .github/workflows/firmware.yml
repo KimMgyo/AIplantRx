@@ -97,7 +97,17 @@ jobs:
             allow: ""
 
     steps:
+      # fetch-tags, and without it the whole version-ordering scheme is silently off. scripts/fwver.py
+      # compiles `git describe --tags` into the image as FW_VERSION, and the boards use it to tell a
+      # release they are behind from one they are ahead of. checkout's default is a shallow clone with
+      # no tag objects, so describe would fail, FW_VERSION would be empty, and every board would fall
+      # back to comparing hashes - which is exactly the behaviour this replaces. The failure would not
+      # break a build or a test; it would just quietly stop working, which is why it is pinned here
+      # with a reason rather than left to the action's defaults.
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

@@ -33,6 +33,15 @@ release once and then settles each role against it. A role that is absent or ref
 the other two - the panel is the board a grower is standing in front of, and it should not wait on
 a camera image somebody forgot to tag.
 
+WHAT THE TAG IS FOR BESIDES NAMING THE RELEASE.
+It is the version. Nothing in an image says which of two builds is later - firmware.py's version
+section spells out why, and it is why a board comparing hashes reinstalls code it is already
+running and overwrites unreleased work with the published image - so the tag this module reads out
+of the release JSON is the only ordering that exists anywhere in this system. Every role that ends
+up agreeing with a release therefore has that tag recorded against its image through
+firmware.record_version(), which is what puts a "version" in the manifest a board reads. A release
+is only ever cut for a v* tag, so a version offered to a board always names something published.
+
 WHY THE DIGEST IS CHECKED BEFORE THE BODY IS FETCHED.
 The release JSON already carries each asset's sha256, so "is this already published" is answerable
 for nothing. It used to be answered AFTER downloading the whole asset and parsing its descriptor,
@@ -86,8 +95,11 @@ _UA = "plantrx-server"
 #
 # In memory rather than on disk, which costs one wasted 3.5MB download per restart: after a
 # restart the first poll re-fetches and then finds the elf_sha256 already published. The
-# alternative is a state file next to the image, and a second thing in the volume that can
-# disagree with the image beside it is worse than a download a day.
+# alternative is a state file for the ETag, and a state file that can disagree with the image
+# beside it is worse than a download a day. The version record firmware.py writes is on disk and
+# is not a counterexample: it names the elf_sha256 of the image it describes, so a stale one is
+# recognised as stale and ignored. An ETag can name nothing - it is a string about a request - so
+# a stale one is indistinguishable from a current one and would be believed.
 _etag: str | None = None
 
 
@@ -135,6 +147,14 @@ def _pull_role(client: httpx.Client, role: str, rel: dict, tag: str) -> tuple[bo
     next poll should look at again - including an asset that is simply not on the release. A
     missing image is not a steady state to be remembered: the workflow re-uploads assets with
     --clobber, so a release that grows the asset it was missing must not be behind a 304.
+
+    The release's tag is the only version anything in this system has - firmware.py explains why
+    the image cannot carry one - so every outcome that ends in agreement records it against the
+    image on disk. That includes the two "already published" paths, and deliberately so: a box
+    that restarts holding the newest release's bytes replaces nothing, and if only a replace wrote
+    a record then those boards would be offered no ordering until somebody cut another release.
+    Recording after os.replace and never before is what keeps a tag from ever naming bytes that
+    did not land.
     """
     name = _asset_name(role)
     asset = next((a for a in rel.get("assets") or [] if a.get("name") == name), None)
@@ -149,6 +169,7 @@ def _pull_role(client: httpx.Client, role: str, rel: dict, tag: str) -> tuple[bo
     # behaviour this module had before it existed.
     want = asset.get("digest")
     if want and want == _local_digest(dest):
+        firmware.record_version(role, tag)
         return True, f"{role}: already {want[7:19]}"
 
     # Downloaded beside the destination and renamed over it, never written to it. os.replace is
@@ -184,9 +205,13 @@ def _pull_role(client: httpx.Client, role: str, rel: dict, tag: str) -> tuple[bo
         # a re-tagged identical build, or a release whose JSON carries no digest.
         cur = firmware.manifest(role)
         if cur is not None and cur["elf_sha256"] == desc["elf_sha256"]:
+            # The bytes are unchanged and the tag may not be: this is the re-tagged identical
+            # build, and the record moving to the new tag is the whole point of recording here.
+            firmware.record_version(role, tag)
             return True, f"{role}: already {desc['elf_sha256'][:12]}"
 
         os.replace(part, dest)
+        firmware.record_version(role, tag)
     finally:
         # Anything still at .part failed a check or died mid-stream. Leaving it costs megabytes
         # in the volume and, worse, reads as a publish in progress to whoever looks next.

@@ -758,6 +758,23 @@ class FirmwareManifest(BaseModel):
     idf_ver and mtime are for the human reading a log or a panel, not for any decision: they
     answer "which build is this" in a form a person recognises, which a 64-character hash does
     not.
+
+    version is the git tag of the release these bytes were published from ("v0.4.3"), and unlike
+    idf_ver and mtime it is not for a person: it is the second field in this model a device makes
+    a decision on, and the first one that can order two images. A board compares it against its
+    own compiled-in FW_VERSION with fwver_cmp() and installs only what is NEWER, which is the
+    difference between "these bytes differ from mine" and "these bytes are later than mine". That
+    distinction is the whole reason this field exists: a rebuild of identical sources links to a
+    different ELF and so changes elf_sha256, which had a node downloading a megabyte to reinstall
+    what it was already running, and a locally flashed build differs from the published one in
+    exactly the same way, which had the update button replacing unreleased work with an older
+    release.
+
+    An EMPTY STRING means there is no ordering available and the device must compare elf_sha256
+    exactly as it did before this field existed - it is not a version of "" and never compares as
+    one. That is the honest answer for an image an operator copied in by hand, which belongs to no
+    release and has no tag, and no version is invented for it. A device must read a missing key
+    the same way, because a server that has not been redeployed yet sends no key at all.
     """
 
     elf_sha256: str
@@ -765,6 +782,7 @@ class FirmwareManifest(BaseModel):
     md5: str
     idf_ver: str
     mtime: int
+    version: str
 
 
 # --------------------------------------------------------------------------

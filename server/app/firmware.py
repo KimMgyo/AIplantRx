@@ -30,6 +30,7 @@ device reads its own copy out of esp_app_get_description() to compare against.
 """
 
 import hashlib
+import json
 import logging
 import os
 import struct
@@ -148,6 +149,112 @@ def describe(path: Path) -> Optional[dict[str, str]]:
         return None
 
 
+# THE VERSION OF WHAT IS PUBLISHED, AND WHY THE IMAGE CANNOT SUPPLY IT.
+#
+# elf_sha256 identifies an image; it does not order two of them. Every question a board actually
+# has is an ordering question - is what the server is offering newer than what I am running - and
+# a hash can only answer "different". That answer is wrong in both directions and both have
+# happened here. A rebuild of identical sources changes the linked ELF's hash, so a node already
+# running the newest code downloads a megabyte to install what it is already running; measured on
+# this project's own releases, sensor_node's image is the same 1,085,584 bytes in v0.4.2 and
+# v0.4.3 with an empty `git diff` between them, and 68 of those bytes differ. In the other
+# direction, a board flashed over USB with unreleased work has a hash that merely differs from
+# the published one, so pressing update replaces newer code with older - three times, before this
+# existed. The descriptor cannot break the tie: as the module docstring explains, its version
+# field reads '76b7a3f' in every image this repository has ever produced.
+#
+# The one place a real version exists is the release the bytes came from. ghfw.py asks GitHub for
+# the newest release and that release's TAG is the version, because the workflow publishes a
+# release only for a v* tag - so a tag is the only thing that ever becomes a published image, and
+# an untagged build cannot be offered to anybody. The tag is recorded here when the image lands
+# and handed to the board in the manifest, next to the hash it already compares.
+#
+# THE RECORD CARRIES THE elf_sha256 OF THE IMAGE IT WAS WRITTEN FOR.
+# A version kept in a second file is a version that can disagree with the bytes it claims to
+# describe, which is the objection ghfw.py already raises against holding its ETag on disk. So a
+# record names the image it belongs to, and _recorded_tag() ignores one whose hash is not the hash
+# of the image being described. That makes the drift unrepresentable instead of unlikely. If the
+# image is written and the record is not - a crash between the two, an operator's scp, a volume
+# restored one directory at a time - the record describes bytes that are no longer here, the
+# manifest reports "" and every board falls back to comparing hashes, which is exactly what they
+# all do today. A bare tag file fails the other way and far worse: v0.4.3 left sitting over
+# v0.4.2's bytes tells a board running v0.4.3 that it is current when it is a release behind, and
+# no later release can talk it out of that until the tag itself changes.
+#
+# Beside the database rather than in the firmware directory, because that directory's contents are
+# a contract: everything in it is an image an operator published, and anything else in it reads as
+# a publish in progress to whoever looks next (which is the property tests/test_firmware_pull.py
+# pins down when it refuses to leave a .part behind). One file per role rather than one file for
+# all three, so a write for the node cannot lose the panel's record, and so an operator can delete
+# one board's version without editing anything.
+def version_path(role: str = DEFAULT_ROLE) -> Path:
+    """Where this role's published version is remembered. Named after the image it describes."""
+    return store.db_path().parent / "fwver" / (_IMAGE_NAME[role] + ".json")
+
+
+def record_version(role: str, tag: str) -> None:
+    """Remember that the image now on disk for this role is the one released under `tag`.
+
+    Called by ghfw.py for every role that agreed with a release - both the role whose bytes it
+    just installed and the role that already had them. The second case is not an optimisation to
+    skip: a server that comes up with images already matching the newest release replaces nothing,
+    and if only a replace recorded a tag then those boards would have no ordering available until
+    somebody happened to cut another release.
+
+    Reads the descriptor itself rather than taking an elf_sha256 from the caller, so the record
+    can only ever describe the bytes that are actually published. An image that is missing or
+    unreadable records nothing at all: there is no image for the tag to be about, and a tag on its
+    own is the thing this must never write.
+    """
+    desc = describe(image_path(role))
+    if desc is None:
+        log.warning("firmware: not recording %s for %s: no readable image", tag, role)
+        return
+    path = version_path(role)
+    tmp = path.with_name(path.name + ".part")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Written aside and renamed over, for the same reason ghfw.py downloads to .part: a reader
+        # arriving mid-write must see the old record or the new one, never half of either. Half a
+        # record is unparseable, which is answered with "" and a fallback to hashes, so even the
+        # torn write is safe - this only keeps it from happening at all.
+        tmp.write_text(json.dumps({"tag": tag, "elf_sha256": desc["elf_sha256"]}) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("firmware: cannot record %s for %s: %s", tag, role, exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _recorded_tag(role: str, elf_sha256: str) -> str:
+    """The tag published with this exact image, or "" when there is not one.
+
+    "" is not a degraded answer and is never logged as one. It is what an image an operator copied
+    in by hand honestly has - no release, no tag, nothing to order it against - and it is also
+    what a record left over from an image that has since been replaced deserves to be worth. Both
+    reach the device as an absent ordering and put it back on comparing hashes.
+
+    A record that cannot be read or parsed is a "" as well, and it says so in the log, because
+    that one is not an ordinary state: it is a truncated write or something else editing this
+    directory, and the manifest it feeds still has to be answerable.
+    """
+    path = version_path(role)
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:
+        log.warning("firmware: cannot read %s: %s", path, exc)
+        return ""
+    if not isinstance(rec, dict) or rec.get("elf_sha256") != elf_sha256:
+        return ""
+    tag = rec.get("tag")
+    return tag if isinstance(tag, str) else ""
+
+
 # md5 of the whole image, remembered against the file identity that produced it.
 #
 # The manifest is fetched on every pull attempt, and re-reading 2.5MB off disk to arrive at the
@@ -208,6 +315,11 @@ def manifest(role: str = DEFAULT_ROLE) -> Optional[dict[str, Any]]:
 
     The stat and the hash come off one open handle rather than off the path twice, so a manifest
     always describes a single consistent view of the file even if a publish lands mid-request.
+
+    The version is read after the image and against the image's own elf_sha256, so a manifest can
+    never carry a tag belonging to bytes it is not describing. There is no manifest at all without
+    an image, which is why a record that outlives the image it names is answered by the None above
+    rather than by a version with nothing under it.
     """
     path = image_path(role)
     try:
@@ -233,4 +345,7 @@ def manifest(role: str = DEFAULT_ROLE) -> Optional[dict[str, Any]]:
         "md5": md5,
         "idf_ver": desc["idf_ver"],
         "mtime": int(st.st_mtime),
+        # "" whenever there is no tag to be had, which is what a device reads as "no ordering
+        # available, compare hashes" - the behaviour every board had before this key existed.
+        "version": _recorded_tag(role, desc["elf_sha256"]),
     }

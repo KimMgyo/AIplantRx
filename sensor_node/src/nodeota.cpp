@@ -10,8 +10,17 @@
 #include "nodeagent.h"
 #include "nodeota.h"
 #include "nodeproto.h"
+#include "fwver.h"     // ordering two version strings, when both ends have one
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "srvconn.h"   // ...and the one socket that address opens, encrypted or not
+
+// scripts/fwver.py compiles this in on every build (platformio.ini names it) and an empty string
+// is one of its ordinary answers, meaning "this tree has no version, compare hashes". The fallback
+// is for anything that builds this file without that script: the same empty string, so a build
+// that never ran it behaves like a tree git could not describe rather than failing to compile.
+#ifndef FW_VERSION
+#define FW_VERSION ""
+#endif
 
 // Every number below is src/fwpull.cpp's, and the panel's comments hold the measurements behind
 // them. They are repeated rather than shared because they describe an HTTP conversation against
@@ -74,10 +83,16 @@ static void lowercase(char *s) {
 // ---- JSON --------------------------------------------------------------------------------------
 //
 // Flat lookups, hand-written, no ArduinoJson - the panel's fwpull.cpp explains why and this
-// manifest is the same five scalar keys at the top level, none of them a substring of another, and
-// the only string values are hex, which can hold neither a quote nor an escape. Pulling a JSON
-// library onto this board to read that would cost more flash than the two functions below and
-// would still need every one of the length checks around them.
+// manifest is the same six scalar keys at the top level, none of them a substring of another
+// ("version" is not inside "idf_ver"). Pulling a JSON library onto this board to read that would
+// cost more flash than the two functions below and would still need every one of the length checks
+// around them.
+//
+// Five of those values are hex or digits, which can hold neither a quote nor an escape. "version"
+// is a git describe string and in principle could, and the reason that is still not a hazard is
+// downstream rather than here: a value this clips or stops early at is no longer something
+// fwver_parse() accepts, so it reads as "no version" and the hash decides - which is the same
+// answer as a server that never sent one.
 
 // "key":"value" -> value. False when the key is absent, or when the value did not fit or was cut
 // short by a truncated body - a clipped hash is worse than no hash, because it compares unequal
@@ -333,9 +348,16 @@ static void wifi_down(void) {
 
 // ---- the pull ------------------------------------------------------------------------------------
 
-// GET /v1/firmware/latest?role=node and pull the three fields that decide anything out of it. The
+// GET /v1/firmware/latest?role=node and pull the four fields that decide anything out of it. The
 // other two the server publishes - idf_ver and mtime - are for a person reading the manifest.
-static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
+//
+// `ver` is the published image's version string and is the only one of the four that is allowed to
+// come back empty: a server that has not been redeployed sends no such key, and one that published
+// a hand-copied image sends "". Both mean the same thing - there is no order to compare, so the
+// caller compares hashes exactly as it did before this field existed - which is why an absent
+// version is not a malformed manifest and is not rejected below.
+static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size,
+                           char *ver, size_t vercap) {
     char path[64];
     snprintf(path, sizeof(path), "%s%s", NODEPROTO_PATH_LATEST,
              nodeproto_role_name(NODE_ROLE_NODE));
@@ -401,6 +423,14 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         fail("서버 응답 이상");
         return false;
     }
+    // Cleared first and then filled only on a clean read, so every way of not getting a version -
+    // key absent, value empty, value longer than vercap - arrives at the caller as the same empty
+    // string. json_str() returns false on a clipped value and what it left behind is a PREFIX,
+    // which is the one outcome that must not be believed: "v0.4.3" clipped out of
+    // "v0.4.3-4-g1c2d3e4" would order as an exact tag and skip an install that was due.
+    ver[0] = '\0';
+    if (!json_str(body, "version", ver, vercap)) ver[0] = '\0';
+
     lowercase(sha);
     lowercase(md5);
     return true;
@@ -613,10 +643,52 @@ void nodeota_run(const char *base_url, const char *token) {
 
     nodeagent_report(NODE_PH_ASK, NODE_PCT_NONE, "업데이트 확인 중");
     char sha[65], md5[33];
+    // 48 for a git describe: "v0.4.3-1-g0ab2efa-dirty" is 23 characters and a three-digit patch
+    // with a four-digit commit count and a sixteen-character abbreviation still fits. Anything
+    // past it is clipped, and a clipped version is treated as no version at all (fetch_manifest
+    // says why), which costs the ordering and keeps the hash - not a wrong answer.
+    char ver[48];
     long size = 0;
-    if (!fetch_manifest(sha, sizeof(sha), md5, sizeof(md5), &size)) {
+    if (!fetch_manifest(sha, sizeof(sha), md5, sizeof(md5), &size, ver, sizeof(ver))) {
         wifi_down();
         return;
+    }
+
+    // ORDER FIRST, AND ONLY FALL BACK TO THE HASH WHEN THERE IS NO ORDER.
+    //
+    // The hash below answers "same or different", and this node acted on "different" in the wrong
+    // direction twice. A rebuild of byte-identical source moves it - v0.4.2 and v0.4.3 of this
+    // firmware have no source diff, both images are 1,085,584 bytes, and 68 of them differ - so a
+    // node running the newest code spent a megabyte of a borrowed radio reinstalling it. And a
+    // USB-flashed build is newer than what the server has, which the hash cannot say, so the
+    // panel's update button replaced unreleased work with the published image.
+    //
+    // Only FWVER_NEWER goes on to download. SAME and OLDER are finished, successful checks with
+    // nothing to install, so they end the way the hash match below ends: NODE_PH_CURRENT, a phrase
+    // for the panel's hint line, and the radio handed straight back to ESP-NOW. FWVER_UNKNOWN
+    // means one of the two strings is not a version - an empty FW_VERSION, a server that has not
+    // been redeployed - and falls through to the comparison this node has always made.
+    switch (fwver_cmp(FW_VERSION, ver)) {
+        case FWVER_SAME:
+            nlogf_always("[ota] server publishes %s and this node runs %s - nothing to install",
+                         ver, FW_VERSION);
+            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신 버전입니다");
+            wifi_down();
+            return;
+        case FWVER_OLDER:
+            nlogf_always("[ota] server publishes %s but this node runs the later %s - not going "
+                         "back", ver, FW_VERSION);
+            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, "서버가 구버전입니다");
+            wifi_down();
+            return;
+        case FWVER_NEWER:
+            nlogf_always("[ota] server publishes %s, this node runs %s - installing",
+                         ver, FW_VERSION);
+            break;
+        case FWVER_UNKNOWN:
+            nlogf_always("[ota] no version to order (mine '%s', server '%s') - comparing hashes",
+                         FW_VERSION, ver);
+            break;
     }
 
     // Eight bytes, not thirty-two. PlatformIO stamps no app version this project controls - every
@@ -624,6 +696,10 @@ void nodeota_run(const char *base_url, const char *token) {
     // core - so app_elf_sha256 is the only field in the descriptor that moves with our sources.
     // Sixteen hex characters of it is what NodeRepMsg carries and what the panel displays, and a
     // collision inside eight bytes of SHA-256 is not a thing that happens to a greenhouse.
+    //
+    // Still reached with a version in hand, deliberately: it is the check that stops an install of
+    // the image already in flash, and FW_VERSION cannot replace it. Two builds of the same commit
+    // describe identically, so "newer by version" and "the same bytes" are not exclusive.
     char own[17];
     own_elf_hex(own);
     if (strncmp(sha, own, 16) == 0) {

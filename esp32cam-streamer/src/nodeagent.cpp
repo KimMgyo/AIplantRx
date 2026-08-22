@@ -30,8 +30,17 @@
 #include <strings.h>
 #include "nodeagent.h"
 #include "nodeproto.h"
+#include "fwver.h"     // ordering two version strings, when both ends have one
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "srvconn.h"   // ...and the one socket that address opens, encrypted or not
+
+// scripts/fwver.py compiles this in on every build (platformio.ini names it) and an empty string
+// is one of its ordinary answers, meaning "this tree has no version, compare hashes". The fallback
+// is for anything that builds this file without that script: the same empty string, so a build
+// that never ran it behaves like a tree git could not describe rather than failing to compile.
+#ifndef FW_VERSION
+#define FW_VERSION ""
+#endif
 
 // provision.cpp registers this peer and re-adds it after every radio cycle; this is the address
 // it registers. Kept local rather than exported: provision.h's constants carry a "MUST
@@ -370,8 +379,11 @@ static void lowercase(char *s) {
     }
 }
 
-// Flat lookups. The manifest is five scalar keys at the top level, none a substring of another,
-// and the only string values are hex, which can hold neither a quote nor an escape.
+// Flat lookups. The manifest is six scalar keys at the top level, none a substring of another
+// ("version" is not inside "idf_ver"). Five of the values are hex or digits, which can hold
+// neither a quote nor an escape; "version" is a git describe string and in principle could, and
+// what makes that harmless is downstream rather than here - a value this clips or stops early at
+// is no longer something fwver_parse() accepts, so it reads as "no version" and the hash decides.
 
 // False when the key is absent, or when the value did not fit or was cut short by a truncated
 // body - a clipped hash is worse than no hash, because it compares unequal and would reinstall
@@ -546,9 +558,16 @@ static void role_path(char *out, size_t cap, const char *base) {
     snprintf(out, cap, "%s%s", base, nodeproto_role_name(NODE_ROLE_CAM));
 }
 
-// GET the manifest and pull out the three fields that decide anything. Sets the FAIL phase and
+// GET the manifest and pull out the four fields that decide anything. Sets the FAIL phase and
 // returns false on every unhappy path, so the caller only ever has to check the bool.
-static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
+//
+// `ver` is the published image's version string and is the only one of the four allowed to come
+// back empty: a server that has not been redeployed sends no such key, and one that published a
+// hand-copied image sends "". Both mean there is no order to compare, so the caller compares
+// hashes exactly as it did before this field existed - which is why an absent version is not a
+// malformed manifest and is not rejected below.
+static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size,
+                           char *ver, size_t vercap) {
     char path[80];
     role_path(path, sizeof(path), NODEPROTO_PATH_LATEST);
 
@@ -614,6 +633,14 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         fail("서버 응답 이상");
         return false;
     }
+    // Cleared first and then filled only on a clean read, so every way of not getting a version -
+    // key absent, value empty, value longer than vercap - reaches the caller as the same empty
+    // string. json_str() returns false on a clipped value and what it left behind is a PREFIX,
+    // which is the one outcome that must not be believed: "v0.4.3" clipped out of
+    // "v0.4.3-4-g1c2d3e4" would order as an exact tag and skip an install that was due.
+    ver[0] = '\0';
+    if (!json_str(body, "version", ver, vercap)) ver[0] = '\0';
+
     lowercase(sha);
     lowercase(md5);
     return true;
@@ -852,16 +879,65 @@ static void run_update(const char *base, const char *token) {
     }
 
     char want_sha[65], want_md5[33];
+    // 48 for a git describe: "v0.4.3-1-g0ab2efa-dirty" is 23 characters and a three-digit patch
+    // with a four-digit commit count and a sixteen-character abbreviation still fits. Anything
+    // past it is clipped, and a clipped version is treated as no version at all (fetch_manifest
+    // says why), which costs the ordering and keeps the hash - not a wrong answer.
+    char want_ver[48];
     long want_size = 0;
-    if (!fetch_manifest(want_sha, sizeof(want_sha), want_md5, sizeof(want_md5), &want_size)) {
+    if (!fetch_manifest(want_sha, sizeof(want_sha), want_md5, sizeof(want_md5), &want_size,
+                        want_ver, sizeof(want_ver))) {
         camstream_resume();
         return;   // fetch_manifest already published why
     }
 
-    // The comparison the whole thing turns on. app_elf_sha256 out of the running image's
-    // descriptor against the one the server computed from the .bin - not the version string, which
+    // ORDER FIRST, AND ONLY FALL BACK TO THE HASH WHEN THERE IS NO ORDER.
+    //
+    // The hash below answers "same or different", and this board acted on "different" in the wrong
+    // direction twice. A rebuild of byte-identical source moves it - the sensor node's v0.4.2 and
+    // v0.4.3 images have no source diff between them, are both 1,085,584 bytes, and differ in 68 -
+    // so a board already running the newest code took its camera off the wall for the length of a
+    // 1.2MB download to install what it was already running. And a USB-flashed build is newer than
+    // what the server has, which a hash cannot say, so the panel's update button replaced
+    // unreleased work with the published image.
+    //
+    // EVERY BRANCH HERE THAT IS NOT AN INSTALL RESUMES THE CAMERA, which is the rule the
+    // stand-down above is written around: nothing to install must never be a reason for a dark
+    // camera. SAME and OLDER are finished, successful checks, so they end exactly the way the hash
+    // match below ends - NODE_PH_CURRENT, a phrase for the panel's hint line, camstream_resume().
+    // FWVER_UNKNOWN means one of the two strings is not a version - an empty FW_VERSION, a server
+    // that has not been redeployed - and falls through to the comparison this board always made.
+    switch (fwver_cmp(FW_VERSION, want_ver)) {
+        case FWVER_SAME:
+            nodeagent_logf("[ota] server publishes %s and this board runs %s - nothing to "
+                           "install\n", want_ver, FW_VERSION);
+            publish(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신");
+            camstream_resume();
+            return;
+        case FWVER_OLDER:
+            nodeagent_logf("[ota] server publishes %s but this board runs the later %s - not "
+                           "going back\n", want_ver, FW_VERSION);
+            publish(NODE_PH_CURRENT, NODE_PCT_NONE, "서버가 구버전");
+            camstream_resume();
+            return;
+        case FWVER_NEWER:
+            nodeagent_logf("[ota] server publishes %s, this board runs %s - installing\n",
+                           want_ver, FW_VERSION);
+            break;
+        case FWVER_UNKNOWN:
+            nodeagent_logf("[ota] no version to order (mine '%s', server '%s') - comparing "
+                           "hashes\n", FW_VERSION, want_ver);
+            break;
+    }
+
+    // The comparison this turned on before there was a version, and still the one that stops an
+    // install of the image already in flash. app_elf_sha256 out of the running image's descriptor
+    // against the one the server computed from the .bin - not esp_app_desc's version string, which
     // is "76b7a3f" in every image this project has ever built because it describes the Arduino
     // core and not our code, and which would therefore report a match forever.
+    //
+    // Reached with a version in hand too, deliberately: two builds of the same commit describe
+    // identically, so "newer by version" and "the same bytes" are not exclusive.
     char have_sha[17];
     hex8(esp_app_get_description()->app_elf_sha256, have_sha);
     nodeagent_logf("[ota] running elf=%s server elf=%.16s (%ld bytes)\n",

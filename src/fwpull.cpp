@@ -25,9 +25,17 @@
 // image was linked from, which the toolchain writes in and which differs for any change to our
 // sources. So that is the identity on both sides. This file reads its own out of
 // esp_app_get_description(); the server reads the candidate's straight out of the .bin, where
-// the descriptor sits at file offset 0x20 and app_elf_sha256 is 32 raw bytes 0x90 into it. It is
-// not a version and it does not order - it answers "is this the same image", which is the only
-// question asked here.
+// the descriptor sits at file offset 0x20 and app_elf_sha256 is 32 raw bytes 0x90 into it.
+//
+// AND IT IS NOT A VERSION: it answers "is this the same image" and it has no order, which is a
+// limit that cost this project twice. Different, from a hash, covers a rebuild of unchanged
+// source - so a board already running the newest code reinstalled it - and a local build flashed
+// over USB, which is NEWER than anything published and which this button therefore overwrote. So
+// the hash is no longer asked first. scripts/fwver.py compiles `git describe` in as FW_VERSION,
+// the server publishes its own beside the hash, and shared/fwver.h orders the two: same or
+// behind means there is nothing to do and the hash is never consulted. The hash keeps the case
+// it is good for - one or both sides having no version at all, where it decides alone exactly as
+// it did before. pull_once() has the ladder.
 //
 // WHY THIS IS SAFE TO SHIP AS SHORT AS IT IS. Nothing here retries and nothing here reboots on
 // failure, because two things already in the tree make that unnecessary. Update mode
@@ -54,6 +62,16 @@
 #include "srvurl.h"    // the server address, parsed once for all three firmwares
 #include "srvconn.h"   // and the socket that address opens, plain or TLS as the scheme said
 #include "nodeproto.h"        // the firmware paths, shared with the two node firmwares
+#include "fwver.h"            // ordering the version strings, shared with the two node firmwares
+
+// scripts/fwver.py injects this on every build of this project (see extra_scripts in
+// platformio.ini). Defined away to the empty string if it ever isn't, because empty is already a
+// state this file handles - fwver_cmp() calls it FWVER_UNKNOWN and the decision goes back to the
+// elf hash below - and a missing version must degrade to the old behaviour rather than refuse to
+// compile. A build with no git and a build with no fwver.py should reach the same panel.
+#ifndef FW_VERSION
+#define FW_VERSION ""
+#endif
 
 static const uint32_t CONNECT_MS = 4000;
 // How long the server gets to produce a whole small reply - the manifest, or the headers in
@@ -145,9 +163,17 @@ static void lowercase(char *s) {
 //
 // Flat lookups, the same ones plantid.cpp uses. plantrx.cpp needed a structural walker because
 // "at" and "head" repeat inside nested rows there, and its own comment says so explicitly - the
-// strstr form is enough for a flat reply. This manifest is five scalar keys at the top level,
-// none of them a substring of another, and the only string values are hex, which can hold
-// neither a quote nor an escape. That is the flat case exactly.
+// strstr form is enough for a flat reply. This manifest is six scalar keys at the top level, none
+// of them a substring of another, and that is the flat case exactly.
+//
+// FIVE OF THE SIX VALUES ARE HEX OR A NUMBER, which can hold neither a quote nor an escape. The
+// sixth is "version", and what the server puts there is a git tag - the character set `git
+// describe` emits contains no quote and no backslash either, so the same reasoning covers it.
+// What makes that safe rather than merely true today is what happens when it stops being true:
+// json_str() ends a value at the first quote it meets, so a value that somehow carried one would
+// arrive clipped, and a clipped version is not a parseable version - it lands in FWVER_UNKNOWN
+// and the decision goes back to the hash. The failure direction is the old behaviour, which is
+// not something the hash fields can say about themselves.
 
 // "key":"value" -> value. False when the key is absent, or when the value did not fit or was cut
 // short by a truncated body - a clipped hash is worse than no hash, because it compares unequal
@@ -314,10 +340,18 @@ static int read_body(Client &c, char *out, size_t cap, uint32_t start, uint32_t 
 
 // ---- the pull ---------------------------------------------------------------
 
-// GET /v1/firmware/latest and pull the three fields that decide anything out of it. The other
-// two the server publishes - idf_ver and mtime - are for a person reading the manifest, not for
-// this. Returns false with s_status already set to something a grower can read.
-static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size) {
+// GET /v1/firmware/latest and pull the four fields that decide anything out of it. The other two
+// the server publishes - idf_ver and mtime - are for a person reading the manifest, not for this.
+// Returns false with s_status already set to something a grower can read.
+//
+// `ver` is the one output that is allowed to come back empty on success, and that is not
+// laxness: a server that has not been redeployed since the version field was added sends no such
+// key, and a hand-copied image gets an empty one from a server that has. Both mean "no ordering
+// available here", which is a state pull_once() handles by comparing hashes exactly as it always
+// did. Refusing the manifest over it would break firmware pull against every server in the field
+// on the day this shipped, to gain nothing.
+static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, long *size,
+                           char *ver, size_t vercap) {
     SrvConn conn;
     uint32_t start = millis();
     Client *c = conn.connect(s_url, CONNECT_MS);
@@ -381,6 +415,14 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
     }
     lowercase(sha);
     lowercase(md5);
+    // Read after the required fields and never able to fail the manifest, for the reason above
+    // the signature. Cleared on a false return rather than left as json_str() found it, because
+    // false covers a value that was cut short by a truncated body as well as a key that was never
+    // there - and the first six characters of "v0.4.3-1-g0ab2efa" are "v0.4.3", which parses, and
+    // orders, and is a different build from the one the server meant. Empty is the one honest way
+    // to say "this reply did not carry a version", and it is the only one fwver_cmp() cannot
+    // mistake for an answer.
+    if (!json_str(body, "version", ver, vercap)) ver[0] = '\0';
     return true;
 }
 
@@ -552,19 +594,76 @@ static void pull_once(void) {
     char want_sha[65];
     char want_md5[33];
     long want_size = 0;
-    if (!fetch_manifest(want_sha, sizeof(want_sha), want_md5, sizeof(want_md5), &want_size)) {
+    // 48, from what the server can actually put here: a tag of the shape this project cuts plus
+    // git's own "-N-g<hash>-dirty" suffix is 23 characters, so a release named twice as long as
+    // ours still fits. Overflowing it is not a corruption risk - json_str() reports a value that
+    // did not fit as a failure and fetch_manifest() clears it - but it would quietly cost the
+    // ordering and leave the hash deciding, so the cap sits where no plausible tag reaches it.
+    char want_ver[48] = "";
+    if (!fetch_manifest(want_sha, sizeof(want_sha), want_md5, sizeof(want_md5), &want_size,
+                        want_ver, sizeof(want_ver))) {
         return;
     }
 
-    // The comparison the whole file turns on. app_elf_sha256 out of the running image's
-    // descriptor against the one the server computed from the .bin - not the version string,
-    // which is "76b7a3f" in every image this project has ever built and would report a match
-    // forever. See the note at the top of this file.
+    // TWO QUESTIONS, IN THIS ORDER, and the order is what makes the answer safe.
+    //
+    // First: which build is later? That is what FW_VERSION and the manifest's "version" are for -
+    // `git describe` output on both sides, ordered by shared/fwver.h. It is the only question here
+    // with a direction in it, and a direction is precisely what a hash cannot give. Two separate
+    // failures came from asking one to. A rebuild of unchanged source moves elf_sha256 and almost
+    // nothing else - measured on this project's own releases, where two images with byte-identical
+    // sources differ in 68 bytes - so a board already running the newest code downloaded a
+    // megabyte to install it a second time. And a USB-flashed local build differs from the
+    // published image too, in the OTHER direction, which a hash reports the same way: pressing
+    // this button replaced unreleased work with an older release, three times.
+    //
+    // Second, and only where the first has no answer: is this the same image? The descriptor's own
+    // version field cannot help with either question - it reads "76b7a3f" in every image this
+    // project has ever built, because it describes the Arduino core rather than our code, per the
+    // note at the top of this file - so app_elf_sha256 stays the identity. That comparison is
+    // untouched below, which is the compatibility story in one line: a board or a server without a
+    // version behaves exactly as it did before any of this was here.
     s_status = "확인하는 중";
     char have_sha[65];
     hex32(esp_app_get_description()->app_elf_sha256, have_sha);
-    hlogf("[fwpull] running elf=%s\n", have_sha);
-    hlogf("[fwpull] server  elf=%s (%ld bytes)\n", want_sha, want_size);
+    hlogf("[fwpull] running elf=%s ver=%s\n", have_sha, FW_VERSION[0] ? FW_VERSION : "(none)");
+    hlogf("[fwpull] server  elf=%s ver=%s (%ld bytes)\n", want_sha,
+          want_ver[0] ? want_ver : "(none)", want_size);
+
+    const int rel = fwver_cmp(FW_VERSION, want_ver);
+    if (rel == FWVER_SAME) {
+        // The rebuilt-identical-source case: same release on both sides, whatever the hashes say
+        // about the two builds of it. Nothing to install, and nothing has been taken from the
+        // panel to find that out - update mode is still below this line.
+        s_status = "이미 최신";
+        hlogf("[fwpull] running %s and the server publishes %s - same release; nothing to do\n",
+              FW_VERSION, want_ver);
+        return;
+    }
+    if (rel == FWVER_OLDER) {
+        // This board is AHEAD of the server, which is what a build flashed over USB looks like
+        // from here: it carries commits the published tag does not. Installing would be a
+        // downgrade onto work nobody has released, so it does not happen - and the status says
+        // which way round it is, because "이미 최신" would tell the person at the panel they are
+        // level with the server when they are in front of it, and that is the fact they need to
+        // decide whether the release they were waiting for is actually out.
+        s_status = "서버보다 최신 버전";
+        hlogf("[fwpull] running %s, server publishes the older %s - not overwriting it\n",
+              FW_VERSION, want_ver);
+        return;
+    }
+    if (rel == FWVER_UNKNOWN) {
+        // One of the two is not a version this can order: a server that has not been redeployed
+        // since it started publishing the field, an image built from a tree with no tags, a zip
+        // with no .git. Said out loud because it is the difference between "the versions were
+        // compared and matched" and "there were no versions to compare", and from a distance the
+        // two look identical on the screen. The hash below then decides, exactly as it always did.
+        hlogf("[fwpull] no version ordering (mine=\"%s\" theirs=\"%s\"); comparing hashes\n",
+              FW_VERSION, want_ver);
+    }
+    // FWVER_NEWER needs no branch: the server has something later, and what happens to something
+    // later is everything that already followed this point. The hash is still asked first, because
+    // a newer version whose image is byte-for-byte the one running has nothing to install either.
 
     if (strcmp(have_sha, want_sha) == 0) {
         s_status = "이미 최신";
