@@ -827,9 +827,34 @@ static void run_update(const char *base, const char *token) {
     s_tok[sizeof(s_tok) - 1] = '\0';
     nodeagent_logf("[ota] server=%s:%u%s\n", s_url.host, (unsigned)s_url.port, s_url.prefix);
 
+    // THE CAMERA GOES DOWN BEFORE THE MANIFEST FETCH, AND THAT ORDER IS A REGRESSION FIX.
+    //
+    // It used to happen after, and the note that lived here explained why: the manifest is "one
+    // small GET and a string compare, none of which needs a quiet radio", so every way of finding
+    // out there is nothing to install left the camera streaming. That was right for as long as the
+    // GET was plaintext.
+    //
+    // Over TLS it is not a small GET. A session costs about 50KB of internal DRAM - mbedtls's 16KB
+    // inbound and 4KB outbound content buffers, which this framework does not let us shrink, plus
+    // the server's certificate chain parsed beside our pinned root - and this board is an ESP32
+    // running a camera, an RTSP server and an HTTP server, with 55-70KB free and fragmented.
+    // Measured from the field: three consecutive presses of the panel's update button produced
+    // "서버 연결 실패" at 확인하는 중, while the sensor node - same firmware path, 215KB free -
+    // succeeded every time. The manifest fetch was failing for want of memory the stand-down was
+    // about to free.
+    //
+    // So the intent is preserved by RESTORING instead of by waiting: the camera comes back for
+    // every outcome that is not an install, which costs a couple of seconds of feed on an explicit
+    // button press rather than leaving a working camera dark.
+    if (!camstream_stand_down()) {
+        fail("카메라 정지 실패");
+        return;
+    }
+
     char want_sha[65], want_md5[33];
     long want_size = 0;
     if (!fetch_manifest(want_sha, sizeof(want_sha), want_md5, sizeof(want_md5), &want_size)) {
+        camstream_resume();
         return;   // fetch_manifest already published why
     }
 
@@ -843,16 +868,7 @@ static void run_update(const char *base, const char *token) {
                    have_sha, want_sha, want_size);
     if (strncmp(have_sha, want_sha, 16) == 0) {
         publish(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신");
-        return;
-    }
-
-    // ONLY NOW does the board go dark, and the ordering is the point. Everything above is one
-    // small GET and a string compare, none of which needs a quiet radio - and the panel's fwpull
-    // learned this the hard way, taking a board over behind a takeover screen to deliver the
-    // answer "cannot reach the server". Every way of finding out there is nothing to install
-    // leaves this camera streaming.
-    if (!camstream_stand_down()) {
-        fail("카메라 정지 실패");
+        camstream_resume();
         return;
     }
 
