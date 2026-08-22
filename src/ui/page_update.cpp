@@ -782,21 +782,34 @@ static void dev_card_build(lv_obj_t *parent, uint8_t role) {
     c->hint = label(cd, "", &font_reg_12, C_TEXT_SECONDARY);
     lv_obj_set_width(c->hint, LV_PCT(100));
     lv_label_set_long_mode(c->hint, LV_LABEL_LONG_WRAP);
+    // A SPACER TAKES THE SLACK, AND IT MUST NOT BE THE LABEL. Growing c->hint was tried and it
+    // crash-looped this board 48 times in one flash: LV_LABEL_LONG_WRAP derives a label's HEIGHT
+    // from its width by laying the text out, and flex_grow assigns its height from what is left in
+    // the column - so LVGL is asked to solve a height that depends on a width that depends on the
+    // height it is being handed. A plain object has no content-driven size and no opinion to
+    // conflict with, so growing one is unambiguous.
+    lv_obj_t *spacer = plain(cd);
+    lv_obj_set_width(spacer, LV_PCT(100));
+    lv_obj_set_height(spacer, 0);
+    lv_obj_set_flex_grow(spacer, 1);
 
-    // The one control, and it takes everything left in the column. On the settings page this was
-    // LV_SIZE_CONTENT squeezed under three other cards, which is what made it a mis-tap risk worth
-    // burying; here it is the subject of the page, and a control this consequential should be
-    // impossible to miss and impossible to hit by accident. The confirmation buys the second half.
+    // SLIM, AND AT THE BOTTOM. This used to be the button that took everything left in the column -
+    // flex_grow(1) with a 72px floor - on the reasoning that a consequential control should be
+    // impossible to miss. It was impossible to miss and it was also most of the card: three of them
+    // side by side made the page read as three buttons with some text above, on a page whose
+    // subject is what each board is RUNNING.
     //
-    // min_height, because flex_grow hands out what is left and a long failure reason can leave
-    // nothing. A button that has shrunk to its label is still a button; one that has shrunk to
-    // zero is a card that lost its only control at the moment it most needed pressing again.
+    // SIZE_CONTENT with a 44px floor instead. 44px is a deliberate number and not a small one: it
+    // is the smallest touch target worth shipping, and this control still has the confirmation
+    // behind it for the other half of mis-tap safety. Content-sized also means it GROWS by itself
+    // while a download runs, because the progress track below is hidden until then - so the one
+    // moment the button needs to be bigger is the one moment it is.
     c->btn = card(cd, C_PILL_BG, 12, true);
     lv_obj_set_width(c->btn, LV_PCT(100));
-    lv_obj_set_flex_grow(c->btn, 1);
-    lv_obj_set_style_min_height(c->btn, 72, 0);
-    flex_col(c->btn, 8, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    pad_all(c->btn, 10);
+    lv_obj_set_height(c->btn, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(c->btn, 44, 0);
+    flex_col(c->btn, 6, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    pad_all(c->btn, 8);
     clickable(c->btn);
     // The role travels in the user data rather than in a per-button struct: the handler needs
     // exactly one number to find its card, and a pointer-sized integer is what LVGL already

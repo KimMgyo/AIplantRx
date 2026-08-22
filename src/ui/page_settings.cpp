@@ -20,13 +20,12 @@ static ToggleWidgets t_wifi, t_dark;
 static lv_obj_t *st_wifi, *st_dark;
 static lv_obj_t *v_ssid, *v_ip, *v_rssi, *v_wifi_mac;   // WiFi info row value labels
 static lv_obj_t *st_cam;                    // ESP-NOW camera online status
-static lv_obj_t *v_cam_ip, *v_cam_rssi, *v_cam_mac, *v_cam_video;
+static lv_obj_t *v_cam_ip, *v_cam_rssi, *v_cam_video;
 static lv_obj_t *st_node;                   // ESP-NOW sensor-node online status
-static lv_obj_t *v_node_age, *v_node_rx, *v_node_thermal, *v_node_peak;
+static lv_obj_t *v_node_age, *v_node_rx, *v_node_thermal;
 #if PANEL_OLED
 static lv_obj_t *v_oled;                    // rear OLED state; see the note where it is built
 #endif
-static lv_obj_t *v_plantnet;                      // PlantNet daily quota remaining
 static lv_obj_t *w_net_list;               // scrollable scan-result list
 static lv_obj_t *w_dlg;                    // password dialog root (NULL = closed)
 static lv_obj_t *w_dlg_ta;
@@ -369,8 +368,6 @@ void page_settings_refresh(void) {
     } else {
         lv_label_set_text(v_cam_rssi, "-");
     }
-    camprov_cam_mac(buf, sizeof(buf));
-    lv_label_set_text(v_cam_mac, buf);
 
     // The video path, which is not the link the status line above describes. camnet
     // pulls MJPEG over HTTP and a session already open outlives a lapsed beacon, so
@@ -412,19 +409,13 @@ void page_settings_refresh(void) {
         snprintf(buf, sizeof(buf), "수신 없음");
     }
     lv_label_set_text(v_node_thermal, buf);
-    // No thermal_live() test beside the one on the row above, and not an omission:
-    // thermal_max() returns its < -999 sentinel the moment the stream goes quiet
-    // (thermal.cpp:148), so this row falls to "-" on exactly the tick that row
-    // falls to "수신 없음". They cannot contradict each other any more - this one
-    // used to hold the last peak the MLX90640 ever sent, indefinitely, beside a
-    // row saying nothing was arriving.
-    float peak = thermal_max();
-    if (reading_present(peak)) {
-        snprintf(buf, sizeof(buf), "%.1f\xC2\xB0""C", peak);
-    } else {
-        snprintf(buf, sizeof(buf), "-");
-    }
-    lv_label_set_text(v_node_peak, buf);
+    // 피크 온도 WAS THE ROW BELOW AND IT BROKE THIS CARD'S OWN RULE. The comment where this card is
+    // built says it plainly: the node's READINGS have a home on the monitor page, so this card
+    // carries only what a settings page wants - is the ESP-NOW link healthy and how fast is thermal
+    // arriving. A peak temperature is a reading. It was also the fourth row, which is the one this
+    // card has never had room for: at 149px with a header and a status line, three rows fit and the
+    // fourth is drawn at about 95% of its height - so it read as a rendering fault rather than as a
+    // card that needed scrolling.
 
 #if PANEL_OLED
     // Three states, and they need three different actions, so they get three different
@@ -442,24 +433,12 @@ void page_settings_refresh(void) {
     lv_label_set_text(v_oled, buf);
 #endif
 
-    // PlantNet daily quota, total remaining across all keys - and 최대 until every
-    // key has actually answered. The count is the server's now and rides back on
-    // each identify reply, so a boot that has not identified anything yet has not
-    // been told a figure: -1 means unknown and prints as "-", the same dash the
-    // rows above use for a value the panel has not heard. This row printed a bare
-    // "2000" once, which is four keys' allowance assumed and nothing measured; the
-    // denominator the AI-RX page's chip carries is not here, so the qualifier is
-    // the only thing standing between an estimate and a reading. See
-    // plantid_total_is_measured().
-    int pn_left = plantid_total_remaining();
-    if (pn_left < 0) {
-        snprintf(buf, sizeof(buf), "-");
-    } else if (plantid_total_is_measured()) {
-        snprintf(buf, sizeof(buf), "%d", pn_left);
-    } else {
-        snprintf(buf, sizeof(buf), "최대 %d", pn_left);
-    }
-    lv_label_set_text(v_plantnet, buf);
+    // 식별 API WAS HERE, on the camera's card, and it is not a fact about the camera. It is a cloud
+    // API's remaining daily quota, put on this card because identification happens to use a photo -
+    // which is guilt by association, not information architecture. The server owns that count now
+    // (it rides back on each identify reply) and /admin can show it beside the rest of the server's
+    // own state. Removing it and MAC is what takes this card from five rows to three, which is what
+    // it has height for.
 
 
     // Rebuild the list on fresh scan results or when scan/link state changes.
@@ -640,7 +619,6 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     build_status_line(e, &st_cam);
     v_cam_ip = build_info_row(e, "IP 주소");
     v_cam_rssi = build_info_row(e, "신호 세기");
-    v_cam_mac = build_info_row(e, "MAC");
     // Two links reach this one device and only one of them was ever on this card.
     // The status line above is the ESP-NOW beacon: provisioning and presence. The
     // pictures travel over HTTP, and camnet keeps an open session running after the
@@ -659,7 +637,6 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     // What survives is the question a grower came to ask - 영상 수신, whether pictures are actually
     // arriving - and where the camera is. The paths live in esp32cam-streamer's own log banner, and
     // the panel now pushes that log to the server.
-    v_plantnet = build_info_row(e, "식별 API");
 
     // Sensor node (ESP32 devkit): the other half. Its readings already have a
     // home on the monitor page, so this card carries what only a settings page
@@ -685,7 +662,6 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     v_node_age = build_info_row(n, "마지막 수신");
     v_node_rx = build_info_row(n, "텔레메트리");
     v_node_thermal = build_info_row(n, "열화상");
-    v_node_peak = build_info_row(n, "피크 온도");
 
     rebuild_net_list();
 
