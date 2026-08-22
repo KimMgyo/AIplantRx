@@ -21,17 +21,12 @@ static lv_obj_t *st_wifi, *st_dark;
 static lv_obj_t *v_ssid, *v_ip, *v_rssi, *v_wifi_mac;   // WiFi info row value labels
 static lv_obj_t *st_cam;                    // ESP-NOW camera online status
 static lv_obj_t *v_cam_ip, *v_cam_rssi, *v_cam_mac, *v_cam_video;
-static lv_obj_t *v_cam_stream, *v_cam_image, *v_cam_rtsp;  // URL rows, built from the IP
 static lv_obj_t *st_node;                   // ESP-NOW sensor-node online status
 static lv_obj_t *v_node_age, *v_node_rx, *v_node_thermal, *v_node_peak;
 #if PANEL_OLED
 static lv_obj_t *v_oled;                    // rear OLED state; see the note where it is built
 #endif
 static lv_obj_t *v_plantnet;                      // PlantNet daily quota remaining
-static lv_obj_t *st_rx;                     // uplink link state, in the section header's value slot
-static lv_obj_t *w_rx_rows, *v_rx_none;     // detail rows / the "no server" one-liner
-static lv_obj_t *v_rx_host, *v_rx_age, *v_rx_judged, *v_rx_resp;
-static lv_obj_t *v_rx_err, *v_rx_fails, *v_rx_count, *v_rx_mode;
 static lv_obj_t *w_net_list;               // scrollable scan-result list
 static lv_obj_t *w_dlg;                    // password dialog root (NULL = closed)
 static lv_obj_t *w_dlg_ta;
@@ -299,197 +294,22 @@ static void rebuild_net_list(void) {
 // Refresh / handlers
 // ---------------------------------------------------------------------------
 
-// ---- uplink diagnostics ----
+// The uplink's diagnostics USED TO LIVE HERE - eight rows and a state word, inside the WiFi card.
+// They are gone, and what replaced them is worth naming so nobody rebuilds them.
 //
-// A panel that has stopped receiving prescriptions gives a grower nothing to act
-// on: the local rule keeps judging and the last prescription keeps showing, which
-// is the uplink's design and also why its failure is invisible. These rows are
-// the whole diagnosis - address, both freshnesses, last status, last reason - so
-// the answer does not require a serial console and a laptop in the greenhouse.
-// Both freshnesses, because a working wire carrying a dead model's last answer is
-// a failure the transport cannot see and the one this block is worst at showing.
-
-// The state word and its colour are both functions of the state being drawn, and
-// no two words share a colour, so an unchanged word means an unchanged colour and
-// one guard covers both writes.
-// lv_obj_set_style_text_color refreshes the style and invalidates whether or not
-// the colour moved, which is the same per-second waste ui_set_label_text avoids.
-static void rx_set_state(lv_obj_t *lbl, const char *txt, lv_color_t color) {
-    const char *cur = lv_label_get_text(lbl);
-    if (cur != NULL && strcmp(cur, txt) == 0) return;
-    lv_label_set_text(lbl, txt);
-    lv_obj_set_style_text_color(lbl, color, 0);
-}
-
-// Guarded on the current flag: lv_obj_add_flag / lv_obj_clear_flag invalidate the
-// object and dirty the parent's layout unconditionally for LV_OBJ_FLAG_HIDDEN, so
-// re-hiding an already hidden row would relayout the WiFi card every second.
-static void rx_visible(lv_obj_t *o, bool show) {
-    if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN) != show) return;
-    if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
-    else      lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void rx_row_set(lv_obj_t *value, const char *txt) {
-    rx_visible(lv_obj_get_parent(value), true);
-    ui_set_label_text(value, txt);
-}
-
-static void rx_row_hide(lv_obj_t *value) { rx_visible(lv_obj_get_parent(value), false); }
-
-// One ladder for both of the uplink's ages. Drawing them together is the entire
-// point - the comparison is the diagnosis - and two formats would make "3초 전"
-// and "0시간 7분 전" look like different kinds of number. Negative is "없음" and
-// not a zero: no exchange, or no judgment, is not an age of nothing.
-static void rx_fmt_age(char *buf, size_t cap, int32_t s) {
-    if (s < 0)         snprintf(buf, cap, "없음");
-    else if (s < 60)   snprintf(buf, cap, "%ld초 전", (long)s);
-    else if (s < 3600) snprintf(buf, cap, "%ld분 전", (long)(s / 60));
-    else               snprintf(buf, cap, "%ld시간 %ld분 전", (long)(s / 3600), (long)((s % 3600) / 60));
-}
-
-static void refresh_uplink(void) {
-    // No server: one line, and none of the eight rows. A column of "-" under the
-    // header reads as a panel that lost its uplink, which is the opposite of what
-    // an unconfigured build means.
-    if (!plantrx_configured()) {
-        rx_set_state(st_rx, "미설정", C_TEXT_SECONDARY);
-        rx_visible(w_rx_rows, false);
-        rx_visible(v_rx_none, true);
-        return;
-    }
-    rx_visible(v_rx_none, false);
-    rx_visible(w_rx_rows, true);
-
-    RxLink link = plantrx_link();
-
-    // A successful exchange is not a fresh judgment. When the model is down the
-    // server answers every poll with the previous prescription verbatim
-    // (server/app/main.py:312), so the transport reads perfect while the content
-    // ages - and this is the screen a grower opens to find out which of the two
-    // has stopped. Same rule and the same rx_content_stale_s() as the top bar; the
-    // two screens disagreeing about what "stale" means is the class of bug this
-    // round exists to remove. Only at RX_OK: behind a dead link a climbing
-    // judgment age is that one outage told twice, and 마지막 수신 already told it.
-    int32_t cage = plantrx_content_age_s();
-    bool content_stale = (link == RX_OK) && (cage < 0 || cage >= rx_content_stale_s());
-
-    // ...and a server with no model at all is not a delayed judgment. It answers
-    // every poll cleanly and will never send one, so content_stale is permanently
-    // true on a keyless install and this line spent an unactionable amber on it
-    // forever - on the very screen a grower opens to find out what is wrong. Same
-    // split, same reason and the same wording as the top bar's (src/ui/topbar.cpp,
-    // no_model): a configuration is not an event, and the two screens have to
-    // answer this identically or one of them is lying.
-    //
-    // cage < 0 gates it because a server that judged and then lost its key still
-    // holds a real judgment that is really ageing, and that IS a delay.
-    bool no_model = content_stale && rx_no_model();
-
-    // Amber for 지연 / 실패, not the plain secondary grey the other cards use for
-    // "off": those two are the states a grower can act on, and RX_STALE in
-    // particular is easy to read as healthy when it is drawn the same as 대기 중.
-    // 판단 지연 earns that same amber for that same reason, and keeps 정상 in the
-    // string so the line cannot be read as a transport fault: that one says 실패
-    // with no 정상 in it and brings 실패 원인 and 연속 실패 along with it. No red is
-    // spent here at all - red on this panel is the all-stop, and the two faults
-    // send a grower to two different places.
-    //
-    // 모델 없음 keeps the 정상 for the same reason and takes the grey, because there
-    // is nothing here to chase: the fix is a key on the server, and the line's job
-    // is to name that rather than to imply the panel is waiting.
-    if (no_model) {
-        rx_set_state(st_rx, "정상 (모델 없음)", C_TEXT_SECONDARY);
-    } else if (content_stale) {
-        rx_set_state(st_rx, "정상 (판단 지연)", C_AMBER);
-    } else {
-        switch (link) {
-            case RX_OK:    rx_set_state(st_rx, "정상", C_BLUE); break;
-            case RX_STALE: rx_set_state(st_rx, "지연", C_AMBER); break;
-            case RX_ERROR: rx_set_state(st_rx, "실패", C_AMBER); break;
-            default:       rx_set_state(st_rx, "대기 중", C_TEXT_SECONDARY); break;
-        }
-    }
-
-    char buf[48];
-    const char *host = plantrx_host();
-    rx_row_set(v_rx_host, host[0] != '\0' ? host : "-");
-
-    // Both "3초 전" and "40분 전" are RX_OK and only one of them means the panel is
-    // current, which is the whole reason plantrx_age_s() exists.
-    int32_t age = plantrx_age_s();
-    rx_fmt_age(buf, sizeof(buf), age);
-    rx_row_set(v_rx_age, buf);
-
-    // 마지막 판단, and only when there is something to say - the rule 실패 원인 /
-    // 연속 실패 / 서버 모드 already follow here. While the judgment is current the
-    // row above answers the only question anyone came with, and a row that is
-    // always present is a row a grower stops reading. "없음" is not a formatting
-    // fallback: it is a server that has never diagnosed this device, which over
-    // the wire is indistinguishable from one that answers every minute.
-    if (content_stale) {
-        rx_fmt_age(buf, sizeof(buf), cage);
-        rx_row_set(v_rx_judged, buf);
-    } else {
-        rx_row_hide(v_rx_judged);
-    }
-
-    // The round trip belongs to the last COMPLETED exchange, so pairing it with a
-    // transport failure would attribute an old timing to an attempt that never
-    // reached the server. Those two cases print the reason instead of a number.
-    int status = plantrx_last_status();
-    uint32_t rtt = plantrx_last_rtt_ms();
-    if (status == 0) {
-        snprintf(buf, sizeof(buf), "교신 없음");
-    } else if (status < 0) {
-        snprintf(buf, sizeof(buf), "전송 실패");
-    } else if (rtt > 0) {
-        snprintf(buf, sizeof(buf), "%d (%lums)", status, (unsigned long)rtt);
-    } else {
-        snprintf(buf, sizeof(buf), "%d", status);
-    }
-    rx_row_set(v_rx_resp, buf);
-
-    const char *err = plantrx_last_error();
-    if (err[0] != '\0') rx_row_set(v_rx_err, err);
-    else                rx_row_hide(v_rx_err);
-
-    // Zero consecutive failures is the absence of a problem, not a measurement.
-    uint32_t fails = plantrx_failures();
-    if (fails > 0) {
-        snprintf(buf, sizeof(buf), "%lu회", (unsigned long)fails);
-        rx_row_set(v_rx_fails, buf);
-    } else {
-        rx_row_hide(v_rx_fails);
-    }
-
-    snprintf(buf, sizeof(buf), "%lu회", (unsigned long)plantrx_exchanges());
-    rx_row_set(v_rx_count, buf);
-
-    // Only once a REAL prescription has landed: before that plantrx_mode_auto() is
-    // a boot default, and drawing it would put words in the server's mouth. An
-    // arrived reply is not enough to clear that bar - _empty_prescription
-    // (server/app/main.py:88-91) is a clean 200 whose mode is server policy for a
-    // device the model has never assessed, so age >= 0 alone would print exactly
-    // the words this comment refuses to. plantrx_rx_real() is the same third gate
-    // the AI-RX page's conflict chip uses (page_auto.cpp refresh_mode_conflict) and
-    // for the same reason; the two screens have to answer this question identically
-    // or one of them is lying - which is why the two words below are the two that
-    // page_auto's own mode label uses, and not a third pair. They used to read
-    // 자율제어 / 수동 here while that label said 자동 집행 / 자문 전용, so the same
-    // server bit was printed in three vocabularies across two screens.
-    // A disagreement with the panel's own switch is shown rather than resolved -
-    // the switch is the device's, and silently picking a winner hides the split.
-    if (age >= 0 && plantrx_rx_real()) {
-        bool srv_auto = plantrx_mode_auto();
-        const char *mode = srv_auto ? "자동 실행" : "판단 전용";
-        if (srv_auto == g_auto_control) snprintf(buf, sizeof(buf), "%s", mode);
-        else                            snprintf(buf, sizeof(buf), "%s (패널 불일치)", mode);
-        rx_row_set(v_rx_mode, buf);
-    } else {
-        rx_row_hide(v_rx_mode);
-    }
-}
+// They cost the thing this card exists for. The comment that justified them said it plainly: the
+// scrollable network list went from ~225px to ~84px to make room, which on this panel is two
+// networks and a scrollbar - so the page whose job is "join a different WiFi" could not show you
+// the WiFi. That is a bad trade at any level of detail.
+//
+// And the detail is no longer scarce. Everything those rows carried - last exchange, last
+// judgment, HTTP status, failure reason, consecutive failures, server mode - is in the console this
+// panel now pushes to the server, at a resolution eight rows could never reach, readable from a
+// phone. The rows were written when the alternative was a serial cable in the greenhouse.
+//
+// What a person standing in front of the panel still needs is one bit: is the server answering.
+// That is one row on the firmware page, beside the versions it serves - see page_update.cpp's
+// panel card. One fact, one place.
 
 void page_settings_refresh(void) {
     NetState st = net_state();
@@ -560,22 +380,6 @@ void page_settings_refresh(void) {
     bool video = camnet_live();
     lv_label_set_text(v_cam_video, video ? "수신 중" : "수신 없음");
 
-    // Browser URLs, and the gate is the beacon rather than the video on purpose: the
-    // address in them is only as current as the beacon that carried it, and handing
-    // a grower a stale IP to type is worse than handing them nothing. A live stream
-    // on a lapsed beacon says the row above, not a URL this card cannot vouch for.
-    if (cam_online) {
-        snprintf(buf, sizeof(buf), "http://%s/rgb/image", cam_ip);
-        lv_label_set_text(v_cam_image, buf);
-        snprintf(buf, sizeof(buf), "http://%s/rgb/stream", cam_ip);
-        lv_label_set_text(v_cam_stream, buf);
-        snprintf(buf, sizeof(buf), "rtsp://%s:8554/mjpeg/1", cam_ip);
-        lv_label_set_text(v_cam_rtsp, buf);
-    } else {
-        lv_label_set_text(v_cam_image, "-");
-        lv_label_set_text(v_cam_stream, "-");
-        lv_label_set_text(v_cam_rtsp, "-");
-    }
 
     // ESP-NOW sensor node (SCD41 + BH1750 + MLX90640 on an ESP32 devkit).
     bool node_online = sensornode_online();
@@ -657,7 +461,6 @@ void page_settings_refresh(void) {
     }
     lv_label_set_text(v_plantnet, buf);
 
-    refresh_uplink();
 
     // Rebuild the list on fresh scan results or when scan/link state changes.
     static bool prev_scanning = false;
@@ -726,14 +529,28 @@ static void settings_timer_cb(lv_timer_t *t) {
 // Builders
 // ---------------------------------------------------------------------------
 
+// KEY LEFT, VALUE RIGHT, AND THE VALUE ELLIPSISES RATHER THAN BEING CUT.
+//
+// Both labels used to be LV_SIZE_CONTENT with SPACE_BETWEEN between them, which is correct right up
+// to the point where key + value exceeds the row: then the value runs past the card's content box
+// and the card clips it mid-glyph, with no ellipsis to say it happened. An SSID can be 32 bytes and
+// a failure reason longer, so this was reachable in normal use and looked like a rendering fault.
+//
+// So the value gets the slack (flex_grow) and LV_LABEL_LONG_DOT, and its text is right-aligned so a
+// short value still sits against the right edge exactly where SPACE_BETWEEN used to put it. The key
+// stays content-sized: it is a fixed string chosen here and never the thing that overflows.
 static lv_obj_t *build_info_row(lv_obj_t *parent, const char *key,
                                 const lv_font_t *keyfont = &font_reg_12) {
     lv_obj_t *row = plain(parent);
     lv_obj_set_width(row, LV_PCT(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
-    flex_row(row, 0, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+    flex_row(row, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     label(row, key, keyfont, C_TEXT_SECONDARY);
-    return label(row, "-", &font_bold_12, C_TEXT_DARK);
+    lv_obj_t *val = label(row, "-", &font_bold_12, C_TEXT_DARK);
+    lv_obj_set_flex_grow(val, 1);
+    lv_label_set_long_mode(val, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+    return val;
 }
 
 lv_obj_t *page_settings_build(lv_obj_t *parent) {
@@ -756,45 +573,6 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     v_ip = build_info_row(c, "IP 주소");
     v_rssi = build_info_row(c, "신호 세기");
     v_wifi_mac = build_info_row(c, "MAC");
-
-    box(c, LV_PCT(100), 1, C_BORDER, 0);  // divider
-
-    // The uplink's diagnostics sit inside the WiFi card rather than in a card of
-    // their own. Two reasons. The server is reached over the very link the four
-    // rows above describe, so a grower chasing "nothing is arriving" is already
-    // looking here. And on a 800x480 panel this card is the only one with slack
-    // to give: the right column's three cards leave 298px for the camera and
-    // sensor cards, 149px each, and a fourth ~190px card there would have left
-    // them 45px apiece - one row and a scrollbar. Here the cost lands on the
-    // scrollable network list instead, ~225px down to ~84px, and it drops to
-    // ~172px when no server is configured and the rows below stay hidden. Four of
-    // the eight rows are drawn only when they have something to say, so each costs
-    // the list another 22px (a 14px line plus the 8px gap) exactly while a grower
-    // is being told something - and never in the healthy case.
-    //
-    // The section header carries the link state in its own value slot, so the
-    // state costs no extra line and the section still opens with a bold key like
-    // every other block on this page.
-    st_rx = build_info_row(c, "판단 서버", &font_bold_12);
-
-    // One container, so the unconfigured case hides eight rows with one flag.
-    w_rx_rows = plain(c);
-    lv_obj_set_width(w_rx_rows, LV_PCT(100));
-    lv_obj_set_height(w_rx_rows, LV_SIZE_CONTENT);
-    flex_col(w_rx_rows, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    v_rx_host = build_info_row(w_rx_rows, "주소");
-    v_rx_age = build_info_row(w_rx_rows, "마지막 수신");
-    v_rx_judged = build_info_row(w_rx_rows, "마지막 판단");
-    v_rx_resp = build_info_row(w_rx_rows, "응답");
-    v_rx_err = build_info_row(w_rx_rows, "실패 원인");
-    v_rx_fails = build_info_row(w_rx_rows, "연속 실패");
-    v_rx_count = build_info_row(w_rx_rows, "수신 횟수");
-    v_rx_mode = build_info_row(w_rx_rows, "서버 모드");
-
-    // Same shape as rebuild_net_list()'s "WiFi가 꺼져 있습니다": one secondary line
-    // where a list would be, rather than a list of nothing.
-    v_rx_none = label(c, "서버 주소가 없습니다", &font_bold_12, C_TEXT_SECONDARY);
-    lv_obj_add_flag(v_rx_none, LV_OBJ_FLAG_HIDDEN);  // definite start: the rows are the common case
 
     box(c, LV_PCT(100), 1, C_BORDER, 0);  // divider
 
@@ -871,9 +649,16 @@ lv_obj_t *page_settings_build(lv_obj_t *parent) {
     // This row is the video path speaking for itself, which is also the fact a
     // grower came to check.
     v_cam_video = build_info_row(e, "영상 수신");
-    v_cam_image = build_info_row(e, "RGB 사진");
-    v_cam_stream = build_info_row(e, "RGB 스트림");
-    v_cam_rtsp = build_info_row(e, "RGB RTSP");
+    // RGB 사진 / RGB 스트림 / RGB RTSP USED TO BE THREE ROWS HERE, each holding a whole URL built
+    // from the IP address two rows above. On a card this narrow that is ~35 characters in a slot
+    // sized for ten, so all three were being cut mid-path - and now that the value labels ellipsise
+    // instead of clipping, all three would read "http://192.168.10.7..." which is worse: a row that
+    // is legibly useless. They were derivable from 주소 anyway, by anyone who already knows the
+    // paths, and nobody who does not know them was going to learn them from a truncated string.
+    //
+    // What survives is the question a grower came to ask - 영상 수신, whether pictures are actually
+    // arriving - and where the camera is. The paths live in esp32cam-streamer's own log banner, and
+    // the panel now pushes that log to the server.
     v_plantnet = build_info_row(e, "식별 API");
 
     // Sensor node (ESP32 devkit): the other half. Its readings already have a

@@ -48,6 +48,7 @@
 #include "fwpull.h"
 #include "health.h"
 #include "net.h"
+#include "plantrx.h"   // plantrx_configured(), plantrx_age_s() for the panel card's 서버 row
 #include "nodeota.h"
 #include "sitecfg.h"
 #include "updatemode.h"
@@ -196,15 +197,23 @@ enum DevHintMode : uint8_t {
     HINT_NONE, HINT_ARMED, HINT_QUIET, HINT_NOOTA, HINT_SAID, HINT_GOOD, HINT_BUSY, HINT_IDLE,
 };
 
+// When the 서버 row stops saying 정상. The poll interval is the SERVER's to choose - it rides back
+// on every prescription as next_poll_s - so this cannot be a multiple of a constant here. Three
+// minutes is chosen against the longest cadence the server actually asks for (60s) being missed
+// twice: one missed poll is a lost packet and not news, three is a wire that has stopped.
+static const int32_t SRV_STALE_S = 180;
+
 struct DevCard {
     uint8_t   role;
     lv_obj_t *link;                 // 연결 value: 온라인 · 3초 전
-    lv_obj_t *ver, *ip, *up, *heap;
+    lv_obj_t *ver, *ip, *up;
+    lv_obj_t *srv;                  // 서버 value, PANEL only; NULL on the two node cards
     lv_obj_t *img_row;              // 검증 전 marker; hidden while this board's image is confirmed
     lv_obj_t *hint;
     lv_obj_t *btn, *btn_label;
     lv_obj_t *prog_track, *prog_fill;
     int8_t    link_shown;           // -1 never heard / 0 offline / 1 online; gates the colour write
+    int8_t    srv_shown = -1;       // last 서버 state drawn; gates its colour write the same way
     uint8_t   hint_mode;            // DevHintMode
 };
 
@@ -412,13 +421,47 @@ static void dev_refresh(DevCard *c) {
     if (v.known) {
         dev_fmt_uptime(buf, sizeof(buf), v.uptime_s);
         ui_set_label_text(c->up, buf);
-        // KB, because this figure is read for its trend between visits and six digits whose last
-        // three move every tick read as noise rather than as a number going down.
-        snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(v.free_heap / 1024));
-        ui_set_label_text(c->heap, buf);
     } else {
         ui_set_label_text(c->up, "-");
-        ui_set_label_text(c->heap, "-");
+    }
+
+    // The one row only the panel has. Not "is the wire up" - the 연결 row above already answers
+    // that from net_state() - but "is the far end still sending prescriptions", which is the failure
+    // the uplink is designed to hide: the local rule keeps judging and the last prescription keeps
+    // showing, so nothing on any other screen changes when the server goes away.
+    //
+    // State and freshness, and deliberately NOT the address. The address is a thing somebody set
+    // once and can read in the console or on /admin; it is also the longest string that could go in
+    // this row, on the narrowest cards in this UI. What changes, and what a person standing here can
+    // act on, is whether it answered and how long ago.
+    if (c->srv != NULL) {
+        // plantrx_age_s() and not plantrx_content_age_s(): this row answers "did the far end
+        // answer", and plantrx.h is explicit that the content age is the one a widget describing
+        // the JUDGMENT wants. A server whose model has failed still answers every poll, and that
+        // is a different fault on a different screen.
+        int32_t age = plantrx_configured() ? plantrx_age_s() : -1;
+        int8_t state;                                     // 0 none, 1 waiting, 2 fresh, 3 stale
+        if (!plantrx_configured()) state = 0;
+        else if (age < 0)          state = 1;
+        else if (age <= SRV_STALE_S) state = 2;
+        else                       state = 3;
+
+        if (state <= 1) {
+            ui_set_label_text(c->srv, state == 0 ? "미설정" : "대기 중");
+        } else {
+            char when[24];
+            dev_fmt_age(when, sizeof(when), (uint32_t)age * 1000u);
+            snprintf(buf, sizeof(buf), "%s · %s", state == 2 ? "정상" : "지연", when);
+            ui_set_label_text(c->srv, buf);
+        }
+        // Colour written only when the state changes, the way link_shown gates the row above:
+        // lv_obj_set_style_text_color invalidates whether or not the colour moved, and this runs
+        // every second.
+        if (c->srv_shown != state) {
+            c->srv_shown = state;
+            lv_obj_set_style_text_color(
+                c->srv, state == 2 ? C_BLUE : state == 3 ? C_AMBER : C_TEXT_SECONDARY, 0);
+        }
     }
 
     // Drawn only while it means something: a line reading 확정 on three cards for the life of the
@@ -650,14 +693,23 @@ void page_update_on_show(void) {
 // Builders
 // ---------------------------------------------------------------------------
 
+// KEY LEFT, VALUE RIGHT, AND THE VALUE ELLIPSISES RATHER THAN BEING CUT. Same change and same
+// reason as page_settings.cpp's build_info_row: two SIZE_CONTENT labels under SPACE_BETWEEN are
+// correct until key + value exceeds the row, and then the card clips the value mid-glyph with
+// nothing to say it happened. Three cards side by side on this panel makes each one narrow, so a
+// sixteen-hex-digit version and an IPv4 address are already close to the edge.
 static lv_obj_t *info_row(lv_obj_t *parent, const char *key, lv_obj_t **row_out = NULL) {
     lv_obj_t *row = plain(parent);
     lv_obj_set_width(row, LV_PCT(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
-    flex_row(row, 8, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER);
+    flex_row(row, 8, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     label(row, key, &font_reg_12, C_TEXT_SECONDARY);
     if (row_out != NULL) *row_out = row;
-    return label(row, "-", &font_bold_12, C_TEXT_DARK);
+    lv_obj_t *val = label(row, "-", &font_bold_12, C_TEXT_DARK);
+    lv_obj_set_flex_grow(val, 1);
+    lv_label_set_long_mode(val, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+    return val;
 }
 
 // ONE BUILDER, THREE CARDS. The boards differ in the role they carry, the badge they wear and the
@@ -693,7 +745,23 @@ static void dev_card_build(lv_obj_t *parent, uint8_t role) {
     c->ver  = info_row(cd, "버전");
     c->ip   = info_row(cd, "IP");
     c->up   = info_row(cd, "가동");
-    c->heap = info_row(cd, "남은 메모리");
+
+    // 남은 메모리 WAS HERE AND IS NOT COMING BACK. A grower cannot act on a heap figure, and the
+    // person who can read it in the console this panel pushes to the server, per second, with a
+    // low-water mark and a block count beside it. A row on a 7" screen that only a developer can
+    // use is a row the three people who use this screen have to scroll past.
+    //
+    // THE PANEL'S CARD CARRIES ONE ROW THE NODES DO NOT: whether the server is answering.
+    //
+    // Nine rows about the uplink used to live in the WiFi card on the settings page, where they
+    // squeezed the network list down to two visible networks - see the note where they were
+    // removed. This is what is left of them, and it is here rather than there because this is the
+    // page where the server is already the subject: it is the thing serving the versions in the row
+    // above. `online` on this card means WiFi is associated, which is a different question and the
+    // reason both rows exist.
+    if (role == NODE_ROLE_PANEL) {
+        c->srv = info_row(cd, "서버");
+    }
 
     // Built once with its wording and colour fixed, then only shown or hidden. The row exists to
     // say a thing that is either true or absent - there is no third text for it to hold - so
