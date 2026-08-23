@@ -145,7 +145,12 @@ static void panel_view(NodeView *v) {
     // failure message.
     v->can_ota = (esp_ota_get_next_update_partition(NULL) != NULL);
     v->busy    = updatemode_active() || fwpull_active();
-    v->phase   = NODE_PH_IDLE;    // fwpull reports in prose, not in this enum - see dev_refresh()
+    // The real phase, in the same enum the two nodes send. This read fwpull_status() only and
+    // hardcoded NODE_PH_IDLE beside it, on the grounds that a pull reports in prose - which made
+    // the panel the one card the hint line could not classify, so its own "이미 최신" painted grey
+    // beside two green ones saying the same thing. fwpull.cpp keeps the phase now (see the note on
+    // s_phase there), so all three rows are one identity in one format for this field too.
+    v->phase   = fwpull_phase();
     v->pct     = fwpull_progress();
     v->uptime_s  = (uint32_t)(esp_timer_get_time() / 1000000LL);
     v->free_heap = esp_get_free_heap_size();
@@ -504,10 +509,17 @@ static void dev_refresh(DevCard *c) {
     else if (!v.can_ota)   dev_hint(c, HINT_NOOTA, "설치 영역이 없어 업데이트 불가");
     else if (!srv)         dev_hint(c, HINT_NOOTA, "서버 주소 없음");
     // NODE_PH_CURRENT earns the green: it is not "nothing happened", it is a completed check that
-    // found this board already running the published image, and that is the answer the press was
-    // asking for. The panel never reaches it - fwpull reports in prose and has no phase enum to
-    // read - so its own already-current answer arrives in secondary, which is the honest colour
-    // for a line this file cannot classify.
+    // found this board already running what the server publishes, and that is the answer the press
+    // was asking for. NODE_SAY_AHEAD lands here too and should - it is the same finished check,
+    // reporting the other way round.
+    //
+    // All three cards reach it now. This branch used to carry an apology for the panel, which
+    // reported in prose with no phase enum to read and therefore arrived in secondary as the
+    // honest colour for a line this file could not classify - and the result on the screen was one
+    // green "이미 최신", a second green one, and the panel's own in grey. fwpull_phase() closed
+    // that, so there is no unclassifiable line left and the ladder means the same thing on every
+    // row: HINT_BUSY while something is running, HINT_GOOD for a check that came back clean, and
+    // HINT_SAID for whatever else this board last said about itself.
     else if (v.status[0] != '\0') {
         dev_hint(c, v.busy ? HINT_BUSY : (v.phase == NODE_PH_CURRENT ? HINT_GOOD : HINT_SAID),
                  v.status);
@@ -532,11 +544,24 @@ static void dev_refresh(DevCard *c) {
 // first phase it saw and the panel would restart itself five minutes later having learned nothing.
 // So this is a screen, on the top layer, over a page that is still running.
 //
-// It follows nodeota_busy_role() and nothing else. plantrx.cpp can arm a node update from a server
-// poll with nobody standing at the panel (node_pull_cam / node_pull_node), so a press is not where
-// the overlay can come from; the 1Hz refresh reads the state instead, and it does so before the
-// hidden-page early return because an update armed from outside must show up on whatever page the
-// panel happens to be sitting on.
+// It follows nodeota_flashing_role() and nothing else. plantrx.cpp can arm a node update from a
+// server poll with nobody standing at the panel (node_pull_cam / node_pull_node), so a press is not
+// where the overlay can come from; the 1Hz refresh reads the state instead, and it does so before
+// the hidden-page early return because an update armed from outside must show up on whatever page
+// the panel happens to be sitting on.
+//
+// FLASHING AND NOT BUSY, which is the difference between a screen worth covering and a nuisance.
+// This used to follow nodeota_busy_role(), and that predicate is true from the first moment of a
+// manifest fetch - so a press whose entire outcome was "이미 최신" still threw a full-screen
+// takeover up for the second or two the check took, and the commonest result of the button was a
+// popup that appeared and left with nothing to say. A takeover earns the screen when the board is
+// committed and interrupting it leaves a half-written image. An answer that fits in three words
+// belongs on the card's own hint line, which already paints NODE_PH_ASK, NODE_PH_CURRENT and
+// NODE_PH_FAIL and is the thing the grower was looking at when they pressed.
+//
+// nodeota_busy_role() keeps its meaning exactly: it still counts the fetch, because refusing a
+// second update and any_update_running() above both have to be true from the first moment one
+// board starts thinking about it.
 static lv_obj_t *w_ov, *w_ov_status, *w_ov_track, *w_ov_fill;
 static uint8_t s_ov_role = NODE_ROLE_COUNT;
 // Dismissed for THIS update only. A full-screen modal is the right shape for a report nobody asked
@@ -624,26 +649,46 @@ static void node_overlay_raise(uint8_t role) {
 }
 
 static void node_overlay_sync(void) {
-    uint8_t busy = nodeota_busy_role();
+    uint8_t flashing = nodeota_flashing_role();
 
-    // The 가리기 latch belongs to one update. Releasing it the moment the busy role changes - to
-    // another board, or to none - is what stops a grower who waved off the camera's screen from
-    // silently never seeing the sensor node's.
-    if (s_ov_hidden != NODE_ROLE_COUNT && busy != s_ov_hidden) s_ov_hidden = NODE_ROLE_COUNT;
+    // The 가리기 latch belongs to one update, and it is keyed on the FLASHING role - the same
+    // identity that raised the screen, which is no longer the busy one. Releasing it the moment
+    // that role changes - to another board, or to none - is what stops a grower who waved off the
+    // camera's screen from silently never seeing the sensor node's.
+    //
+    // Raising later in the sequence made this latch safer rather than riskier, which is worth
+    // writing down because it is the one thing the change could have broken. A dismissal can only
+    // be recorded while a role is flashing, and a single update stays flashing from its first
+    // written byte to its last (DL and DONE are both in the set), so a dismissed overlay cannot
+    // return for the update it was dismissed for. And it cannot leak into the NEXT update of the
+    // same board either, because the window this releases in is now strictly wider than it was:
+    // the phase leaves the flashing set at the reboot - nodeota.cpp's HELLO handler turns DONE
+    // into IDLE - and cannot re-enter it until a fresh command has been armed and answered, where
+    // the old busy-keyed latch had only the instant between one update ending and the next arming.
+    if (s_ov_hidden != NODE_ROLE_COUNT && flashing != s_ov_hidden) s_ov_hidden = NODE_ROLE_COUNT;
 
-    if (busy == NODE_ROLE_COUNT || busy == s_ov_hidden) {
+    if (flashing == NODE_ROLE_COUNT || flashing == s_ov_hidden) {
         node_overlay_drop();
         return;
     }
-    if (w_ov == NULL || s_ov_role != busy) node_overlay_raise(busy);
+    if (w_ov == NULL || s_ov_role != flashing) node_overlay_raise(flashing);
 
     NodeView v;
-    nodeota_view(busy, &v);
+    nodeota_view(flashing, &v);
+    // The fallback outlives the narrowing - it is not dead code now that only DL and DONE get
+    // here. st.status points at the node's own text[] from the very report that set the phase
+    // (nodeota.cpp publishes the two together in its NODE_PROG case), so a DL or DONE report whose
+    // text[] is empty arrives here with nothing to print: a board built before the shared phrases
+    // in nodeproto.h, or one sending a bare progress ping. This panel cannot make another board
+    // speak, and a blank amber line on a screen whose only job is to say "still moving" reads as
+    // the hang it is trying to rule out.
     ui_set_label_text(w_ov_status, v.status[0] != '\0' ? v.status : "진행 중");
 
-    // Hidden until the first byte lands, exactly as a card's own bar is: NODE_PH_ASK is a manifest
-    // fetch and a hash comparison, and a bar sitting at 0% through it reads as a stall on a screen
-    // whose only job is to say "still moving".
+    // Hidden whenever there is no percentage to draw, which after the narrowing means DONE rather
+    // than ASK: nodeota_view() publishes pct for NODE_PH_DL alone and says why, so the bar stands
+    // down for the seconds between the last byte and the node going quiet for its restart. A bar
+    // frozen at the end through that wait would be the one part of this screen still claiming to
+    // move.
     if (v.pct < 0) {
         if (!lv_obj_has_flag(w_ov_track, LV_OBJ_FLAG_HIDDEN)) {
             lv_obj_add_flag(w_ov_track, LV_OBJ_FLAG_HIDDEN);

@@ -398,7 +398,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         // update, and NodePhase has no word for "asked, nothing there", so it ends as a failure
         // whose text says exactly what happened.
         nlogf_always("[ota] server has no firmware published for role 'node' (404)");
-        fail("서버에 노드 펌웨어 없음");
+        fail(NODE_SAY_NOFW);
         return false;
     }
     if (status < 200 || status >= 300) {
@@ -517,7 +517,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     }
 
     nlogf_always("[ota] installing %u bytes, md5=%s", (unsigned)size, md5);
-    nodeagent_report(NODE_PH_DL, 0, "펌웨어 내려받는 중");
+    nodeagent_report(NODE_PH_DL, 0, NODE_SAY_DL);
 
     size_t got = 0;
     uint32_t last = millis();
@@ -536,7 +536,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         if (pct < next_pct && millis() - last_report < REPORT_MS) return;
         next_pct = (uint8_t)(pct + REPORT_PCT);
         last_report = millis();
-        nodeagent_report(NODE_PH_DL, pct, "펌웨어 내려받는 중");
+        nodeagent_report(NODE_PH_DL, pct, NODE_SAY_DL);
     };
 
     while (got < size) {
@@ -605,7 +605,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // it again, and a board that reinstalls a broken image in a loop burns erase cycles and hides
     // the fault. A person can press the button again once somebody has fixed the file.
     nlogf_always("[ota] installed elf=%.16s; restarting", sha);
-    nodeagent_report(NODE_PH_DONE, 100, "설치 완료 - 재시작합니다");
+    nodeagent_report(NODE_PH_DONE, 100, NODE_SAY_DONE);
 
     // A moment for that frame to be keyed before the radio goes away with the rest of the board.
     // No health.cpp on this node to tell the next boot the restart was intended - there is no crash
@@ -617,6 +617,10 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
 }
 
 void nodeota_run(const char *base_url, const char *token) {
+    // "업데이트 준비 중" and wifi_up()'s "WiFi 연결 중" stay literals here while the rest of this
+    // file's phrases come from shared/nodeproto.h, and that header says why: this node joins WiFi
+    // for an update and the other two boards are already joined, so these are steps they do not
+    // have rather than a second wording of a step they share.
     nodeagent_report(NODE_PH_ASK, NODE_PCT_NONE, "업데이트 준비 중");
 
     if (esp_ota_get_next_update_partition(NULL) == NULL) {
@@ -641,7 +645,7 @@ void nodeota_run(const char *base_url, const char *token) {
 
     if (!wifi_up()) return;   // reported and tore down its own failure
 
-    nodeagent_report(NODE_PH_ASK, NODE_PCT_NONE, "업데이트 확인 중");
+    nodeagent_report(NODE_PH_ASK, NODE_PCT_NONE, NODE_SAY_ASK);
     char sha[65], md5[33];
     // 48 for a git describe: "v0.4.3-1-g0ab2efa-dirty" is 23 characters and a three-digit patch
     // with a four-digit commit count and a sixteen-character abbreviation still fits. Anything
@@ -664,21 +668,23 @@ void nodeota_run(const char *base_url, const char *token) {
     // panel's update button replaced unreleased work with the published image.
     //
     // Only FWVER_NEWER goes on to download. SAME and OLDER are finished, successful checks with
-    // nothing to install, so they end the way the hash match below ends: NODE_PH_CURRENT, a phrase
-    // for the panel's hint line, and the radio handed straight back to ESP-NOW. FWVER_UNKNOWN
+    // nothing to install, so they end the way the hash match below ends: NODE_PH_CURRENT, one of
+    // shared/nodeproto.h's two phrases, and the radio handed straight back to ESP-NOW. Which of
+    // the two this node means is its own to choose; the words are not, and that header says why
+    // three boards each wording the same fact was worth taking away from them. FWVER_UNKNOWN
     // means one of the two strings is not a version - an empty FW_VERSION, a server that has not
     // been redeployed - and falls through to the comparison this node has always made.
     switch (fwver_cmp(FW_VERSION, ver)) {
         case FWVER_SAME:
             nlogf_always("[ota] server publishes %s and this node runs %s - nothing to install",
                          ver, FW_VERSION);
-            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신 버전입니다");
+            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_CURRENT);
             wifi_down();
             return;
         case FWVER_OLDER:
             nlogf_always("[ota] server publishes %s but this node runs the later %s - not going "
                          "back", ver, FW_VERSION);
-            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, "서버가 구버전입니다");
+            nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_AHEAD);
             wifi_down();
             return;
         case FWVER_NEWER:
@@ -704,7 +710,7 @@ void nodeota_run(const char *base_url, const char *token) {
     own_elf_hex(own);
     if (strncmp(sha, own, 16) == 0) {
         nlogf_always("[ota] already running elf=%s", own);
-        nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신 버전입니다");
+        nodeagent_report(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_CURRENT);
         wifi_down();
         return;
     }

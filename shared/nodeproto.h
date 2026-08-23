@@ -77,9 +77,43 @@ enum NodeRepKind : uint8_t {
 // written for a human to read and the panel has to decide things with it: whether to raise the
 // takeover overlay, whether the button is still offerable, whether a silence is a stall.
 //
-// The phrase that goes beside it is the node's own (text[]), for the same reason fwpull_status()
-// is the panel's own: the board that knows what happened is the board that should say it, and a
-// receiver translating an enum into words is a second place for the wording to be wrong.
+// The phrase that goes beside it is the sender's own (text[]), because the board that knows what
+// happened is the board that should say it and a receiver re-deriving words from an enum is a
+// second place for the wording to be wrong.
+//
+// That reasoning is still right and its first version was still wrong: "each board owns its
+// phrase" was read as "each board invents its phrase", and three boards describing two facts
+// produced "이미 최신", "이미 최신" and "이미 최신 버전입니다" for one of them - visibly different
+// text on three cards of one screen, for a state that is not different at all. Worse for the
+// second fact, where the panel said "서버보다 최신 버전" and the nodes said "서버가 구버전": the
+// same fact with the subject swapped, so a reader comparing two cards had to work out that they
+// agreed.
+//
+// So the WORDS live here, once, and the sender still chooses which one it means. Each card is
+// about one board, so the subject of every phrase is that board and never the server.
+//
+// An audit by phase found every one of them diverging, not only this pair, which is why the list
+// below covers the whole normal run of an update rather than the two phrases that were complained
+// about. What is deliberately NOT here: anything only one board can ever say. The sensor node
+// joins WiFi for an update and the other two are already joined, so its "WiFi 연결 중" and
+// "업데이트 준비 중" are steps the others do not have, not different words for a step they share.
+// A phrase belongs here when two boards would otherwise describe ONE fact differently.
+#define NODE_SAY_CURRENT "이미 최신"      // asked, and the server publishes the release we run
+#define NODE_SAY_AHEAD   "서버보다 최신"  // asked, and we are past what the server publishes
+#define NODE_SAY_ASK     "확인하는 중"    // fetching the manifest and comparing
+#define NODE_SAY_DL      "내려받는 중"    // writing the image into the inactive slot
+#define NODE_SAY_VERIFY  "설치 확인 중"   // image written, checking it before committing to it
+#define NODE_SAY_DONE    "다시 시작합니다" // committed; the reboot is the next thing that happens
+
+// The one failure worth sharing. Failure text is otherwise each board's own and stays that way,
+// because those phrases carry the diagnosis and the diagnoses genuinely differ - "서버 주소 없음"
+// on the panel means no address is configured, while the nodes' "서버 주소 오류" means the panel
+// sent them one they could not parse, and collapsing those two would throw away which of the two
+// things went wrong. A 404 is not like that: it is one fact, it happens to all three, and the
+// sensor node was saying "서버에 노드 펌웨어 없음" where the other two said "서버에 펌웨어 없음".
+// The card already names the board, so the extra word only made two cards disagree.
+#define NODE_SAY_NOFW    "서버에 펌웨어 없음"  // the server answered, and has nothing for this role
+
 enum NodePhase : uint8_t {
     NODE_PH_IDLE    = 0,  // nothing running; the only phase HELLO ever carries
     NODE_PH_ASK     = 1,  // fetching the manifest, deciding
@@ -89,10 +123,27 @@ enum NodePhase : uint8_t {
     NODE_PH_FAIL    = 5,  // gave up; text says why
 };
 
-// A phase the panel must keep an overlay up for. DONE is included: the node is about to vanish
-// for a reboot, and dropping the overlay one second before it goes quiet reads as a failure.
+// An update this board must not start a second of, and must not interrupt with a HELLO. ASK
+// belongs here: a manifest fetch is already an update in progress, and letting a second arm
+// during one is how two boards end up flashing at once.
 static inline bool nodeproto_phase_busy(uint8_t ph) {
     return ph == NODE_PH_ASK || ph == NODE_PH_DL || ph == NODE_PH_DONE;
+}
+
+// Whether an image is actually being written - the only thing worth covering the screen for.
+//
+// This used to be nodeproto_phase_busy() and it was the wrong question. That predicate is true
+// from the moment a manifest fetch starts, so a press whose whole outcome was "이미 최신" still
+// threw a full-screen takeover up for the second or two the check took, and the commonest result
+// of the button was a popup that appeared and left with nothing to say. A takeover is for the
+// case where the board is committed: bytes are going into the inactive slot and interrupting it
+// leaves a half-written image.
+//
+// DONE stays covered because the node is about to vanish for a reboot, and dropping the overlay
+// one second before it goes quiet reads as a failure. ASK, CURRENT and FAIL all belong on the
+// card's own hint line, which is where an answer that fits in a few words should be read.
+static inline bool nodeproto_phase_flashing(uint8_t ph) {
+    return ph == NODE_PH_DL || ph == NODE_PH_DONE;
 }
 
 #define NODE_PCT_NONE 255   // pct is meaningless (mirrors fwpull_progress()'s -1)

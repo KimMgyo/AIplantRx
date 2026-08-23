@@ -68,10 +68,23 @@ struct NodeView {
 
 void nodeota_view(uint8_t role, NodeView *out);
 
-// The role whose update is running, or NODE_ROLE_COUNT when none is. Drives the full-screen
-// overlay: one at a time is not a limitation to design around, it is the only thing that can
-// happen - a single panel arms these and refuses a second while one runs.
+// The role whose update is running, or NODE_ROLE_COUNT when none is - nodeproto_phase_busy() over
+// each board's phase, so a manifest fetch counts from its first moment. This is the "one at a
+// time" role: it is what refuses a second arm, and what makes the update page's any_update_running()
+// true. One at a time is not a limitation to design around, it is the only thing that can happen -
+// a single panel arms these and refuses a second while one runs.
+//
+// It no longer drives the overlay, which is the one thing this comment used to promise. See
+// nodeota_flashing_role() for why those turned out to be two different questions.
 uint8_t nodeota_busy_role(void);
+
+// The role whose image is actually being written - nodeproto_phase_flashing(), so NODE_PH_DL or
+// NODE_PH_DONE - or NODE_ROLE_COUNT when none is. This is what raises the full-screen overlay,
+// because a takeover is only honest once a board is committed. The commonest outcome of the
+// update button is NODE_SAY_CURRENT, and covering the whole screen for the second that answer
+// takes to arrive is a popup that appears and leaves with nothing to say; ASK, CURRENT and FAIL
+// are answers that fit on the card's own hint line, and that is where they are read.
+uint8_t nodeota_flashing_role(void);
 
 // Prints a per-role summary every ~4s. Same shape and same self-throttling as the other
 // *_debug_tick()s, so the serial console keeps being the place a developer looks first.

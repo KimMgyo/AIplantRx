@@ -117,6 +117,27 @@ static volatile int  s_progress = -1;
 // the status breaks that screen silently.
 static const char *volatile s_status = "";
 
+// The same state as a NodePhase, and the reason this file now carries two of them is that a
+// phrase is written for a person while a phase is what code can decide with. page_update.cpp
+// paints a card's hint line from the phase: an already-current answer is a finished, successful
+// check and reads green, a give-up reads as an ordinary line. It could do that for the CAM and
+// the sensor node because their reports carry NodePhase, and it could not do it for the panel,
+// because the panel reported in prose only - so this board's own "이미 최신" came out grey beside
+// two green ones saying the same thing on the same screen. Classifying the words instead would
+// mean the panel matching on its own Korean, which goes stale the first time the wording is
+// edited and is exactly what shared/nodeproto.h took the wording away from each board to stop.
+//
+// IDLE IF AND ONLY IF s_status IS EMPTY, which is the same contract stated above in the other
+// vocabulary: no pull has ever been requested. Nothing puts either of them back afterwards, so a
+// finished pull's answer stays readable on the card for as long as the board is up.
+//
+// Written AFTER s_status at every one of those sites, never before. The worker is on core 0 and
+// the panel reads both from LVGL on core 1 with no lock between them - a status line is not worth
+// one, per the note above - so a refresh can land between the two stores. In this order that
+// frame shows the new phrase in the old colour; in the other order it would show the OLD PHRASE
+// in the new colour, which is a card claiming a stale sentence is the fresh answer.
+static volatile uint8_t s_phase = NODE_PH_IDLE;
+
 static char s_why[32] = "";
 static TaskHandle_t s_task = nullptr;
 
@@ -342,7 +363,9 @@ static int read_body(Client &c, char *out, size_t cap, uint32_t start, uint32_t 
 
 // GET /v1/firmware/latest and pull the four fields that decide anything out of it. The other two
 // the server publishes - idf_ver and mtime - are for a person reading the manifest, not for this.
-// Returns false with s_status already set to something a grower can read.
+// Returns false with s_status already set to something a grower can read, and s_phase set to the
+// phase that line belongs to - every early return below ends this update, so every one of them is
+// NODE_PH_FAIL.
 //
 // `ver` is the one output that is allowed to come back empty on success, and that is not
 // laxness: a server that has not been redeployed since the version field was added sends no such
@@ -363,6 +386,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         char why[80];
         conn.last_error(why, sizeof(why));
         s_status = "서버 연결 실패";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] cannot reach %s:%u%s%s\n", s_url.host, (unsigned)s_url.port,
               why[0] ? " - " : "", why);
         return false;
@@ -385,18 +409,25 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
 
     if (status == 404) {
         // The server is up and answering, it just has nothing published. That is an operator
-        // saying "no firmware yet", not a fault, and the panel says so rather than "error".
-        s_status = "서버에 펌웨어 없음";
+        // saying "no firmware yet", not a fault, and the panel says so rather than "error". The
+        // phase is NODE_PH_FAIL all the same, because NodePhase has no word for "asked, nothing
+        // there" and this is the end of the update either way - the words carry the difference,
+        // which is what the words are for. Both node firmwares end their own 404 the same way
+        // (sensor_node/src/nodeota.cpp:395).
+        s_status = NODE_SAY_NOFW;
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] server has no published firmware (404)\n");
         return false;
     }
     if (status < 200 || status >= 300) {
         s_status = "서버 응답 오류";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] manifest HTTP %d\n", status);
         return false;
     }
     if (n < 0) {
         s_status = "서버 응답 이상";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] manifest body did not arrive whole\n");
         return false;
     }
@@ -410,6 +441,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         // is refused by Update.setMD5() far too late, after begin() has already claimed the
         // partition.
         s_status = "서버 응답 이상";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] manifest is not the shape this expects: %s\n", body);
         return false;
     }
@@ -427,7 +459,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
 }
 
 // GET /v1/firmware/image and write it into the inactive slot. Returns only on failure, with
-// s_status set; on success it restarts and never comes back.
+// s_status and s_phase set; on success it restarts and never comes back.
 static void download_and_install(const char *sha, const char *md5, size_t size) {
     SrvConn conn;
     uint32_t start = millis();
@@ -436,6 +468,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         char why[80];
         conn.last_error(why, sizeof(why));
         s_status = "서버 연결 실패";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] cannot reach %s:%u for the image%s%s\n", s_url.host,
               (unsigned)s_url.port, why[0] ? " - " : "", why);
         return;
@@ -450,6 +483,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (status != 200) {
         conn.stop();
         s_status = "서버 응답 오류";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] image HTTP %d\n", status);
         return;
     }
@@ -460,6 +494,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         // point the inactive slot is being erased for something nobody vouched for.
         conn.stop();
         s_status = "크기 불일치";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] image is %ld bytes, manifest said %u - refusing\n",
               clen, (unsigned)size);
         return;
@@ -473,6 +508,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     if (!buf) {
         conn.stop();
         s_status = "메모리 부족";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] no PSRAM for a %u byte chunk buffer\n", (unsigned)CHUNK);
         return;
     }
@@ -482,6 +518,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         heap_caps_free(buf);
         conn.stop();
         s_status = "설치 시작 실패";
+        s_phase  = NODE_PH_FAIL;
         return;
     }
     // After begin(), never before: begin() clears the expected md5 as part of its reset, so a
@@ -492,11 +529,17 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         heap_caps_free(buf);
         conn.stop();
         s_status = "설치 시작 실패";
+        s_phase  = NODE_PH_FAIL;
         return;
     }
 
     s_progress = 0;
-    s_status = "다운로드 중";
+    // NODE_PH_DL from here to the end of the write, and this is the line the overlay is keyed to:
+    // nodeproto_phase_flashing() is true from now on because from now on there are bytes going
+    // into the inactive slot. Everything above this point is a question that costs the board
+    // nothing, which is why nothing above it says DL.
+    s_status = NODE_SAY_DL;
+    s_phase  = NODE_PH_DL;
     hlogf("[fwpull] installing %u bytes, md5=%s\n", (unsigned)size, md5);
 
     size_t got = 0;
@@ -549,10 +592,22 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         Update.abort();
         s_progress = -1;
         s_status = "전송 끊김";
+        s_phase  = NODE_PH_FAIL;
         return;
     }
 
-    s_status = "설치 확인 중";
+    // Still NODE_PH_DL, following the camera (esp32cam-streamer/src/nodeagent.cpp:815): the bytes
+    // are all in but nothing is committed yet, so this is the last moment of the write and not a
+    // state of its own - NodePhase has no word for verifying, and inventing one would mean a
+    // number the two node firmwares do not send. NODE_PH_DONE waits for end() to say yes, because
+    // DONE is what tells the panel a reboot is coming and a failed verify is not followed by one.
+    //
+    // Restated rather than left standing from the DL above, and the redundant store is the point:
+    // it makes "every phrase in this file has a phase beside it" a property a grep can check, and
+    // the one site that relied on a phase set eighty lines earlier is the site where the next
+    // person adds a phrase and forgets.
+    s_status = NODE_SAY_VERIFY;
+    s_phase  = NODE_PH_DL;
     if (!Update.end(false)) {
         // No abort() here. end() has already run _abort() internally on the path that failed -
         // an md5 mismatch, or a short image - so the state is released and a second abort would
@@ -560,6 +615,7 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
         hlogf("[fwpull] install failed: %s\n", Update.errorString());
         s_progress = -1;
         s_status = "설치 실패";
+        s_phase  = NODE_PH_FAIL;
         return;
     }
 
@@ -571,7 +627,8 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
     // the fault. Update mode's five minutes are what ends the wait; a person can press the
     // button again once somebody has fixed the file.
     s_progress = 100;
-    s_status = "다시 시작합니다";
+    s_status = NODE_SAY_DONE;
+    s_phase  = NODE_PH_DONE;
     hlogf("[fwpull] installed elf=%s (%s); restarting\n", sha, s_why);
     // A moment for the panel to paint 100%, the same pause ota.cpp takes and for the same
     // reason: that number is the last thing the person in front of the screen sees.
@@ -586,11 +643,13 @@ static void download_and_install(const char *sha, const char *md5, size_t size) 
 static void pull_once(void) {
     if (WiFi.status() != WL_CONNECTED) {
         s_status = "네트워크 없음";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] no WiFi link\n");
         return;
     }
 
-    s_status = "물어보는 중";
+    s_status = NODE_SAY_ASK;
+    s_phase  = NODE_PH_ASK;
     char want_sha[65];
     char want_md5[33];
     long want_size = 0;
@@ -623,7 +682,12 @@ static void pull_once(void) {
     // note at the top of this file - so app_elf_sha256 stays the identity. That comparison is
     // untouched below, which is the compatibility story in one line: a board or a server without a
     // version behaves exactly as it did before any of this was here.
-    s_status = "확인하는 중";
+    //
+    // Both questions are ONE moment on the hint line, so nothing is restated here. This used to
+    // set "확인하는 중" over the "물어보는 중" set above, which is this board describing one fact
+    // - it is asking the server and weighing the answer - in two ways to itself, in a line that
+    // exists for a second or two. The distinction is real and it belongs in the log, which
+    // already draws it: "[fwpull] armed" and then "[fwpull] running elf=" below.
     char have_sha[65];
     hex32(esp_app_get_description()->app_elf_sha256, have_sha);
     hlogf("[fwpull] running elf=%s ver=%s\n", have_sha, FW_VERSION[0] ? FW_VERSION : "(none)");
@@ -635,7 +699,8 @@ static void pull_once(void) {
         // The rebuilt-identical-source case: same release on both sides, whatever the hashes say
         // about the two builds of it. Nothing to install, and nothing has been taken from the
         // panel to find that out - update mode is still below this line.
-        s_status = "이미 최신";
+        s_status = NODE_SAY_CURRENT;
+        s_phase  = NODE_PH_CURRENT;
         hlogf("[fwpull] running %s and the server publishes %s - same release; nothing to do\n",
               FW_VERSION, want_ver);
         return;
@@ -644,10 +709,19 @@ static void pull_once(void) {
         // This board is AHEAD of the server, which is what a build flashed over USB looks like
         // from here: it carries commits the published tag does not. Installing would be a
         // downgrade onto work nobody has released, so it does not happen - and the status says
-        // which way round it is, because "이미 최신" would tell the person at the panel they are
-        // level with the server when they are in front of it, and that is the fact they need to
-        // decide whether the release they were waiting for is actually out.
-        s_status = "서버보다 최신 버전";
+        // which way round it is, because NODE_SAY_CURRENT would tell the person at the panel they
+        // are level with the server when they are in front of it, and that is the fact they need
+        // to decide whether the release they were waiting for is actually out. NODE_SAY_AHEAD is
+        // the other way round and says so about THIS BOARD, never about the server, which is the
+        // rule shared/nodeproto.h states for all six phrases.
+        //
+        // The phase is NODE_PH_CURRENT even so, and both nodes agree (nodeota.cpp:683,
+        // nodeagent.cpp:923): the enum answers "was this a finished, successful check with
+        // nothing to install", which it was, and the phrase answers which of the two ways it
+        // finished. A phase per phrase would put the two facts in one field and then need the
+        // enum widened every time a wording is added.
+        s_status = NODE_SAY_AHEAD;
+        s_phase  = NODE_PH_CURRENT;
         hlogf("[fwpull] running %s, server publishes the older %s - not overwriting it\n",
               FW_VERSION, want_ver);
         return;
@@ -666,7 +740,8 @@ static void pull_once(void) {
     // a newer version whose image is byte-for-byte the one running has nothing to install either.
 
     if (strcmp(have_sha, want_sha) == 0) {
-        s_status = "이미 최신";
+        s_status = NODE_SAY_CURRENT;
+        s_phase  = NODE_PH_CURRENT;
         hlogf("[fwpull] already running the published image; nothing to do\n");
         return;
     }
@@ -759,6 +834,7 @@ void fwpull_request(const char *why) {
         // takeover screen for five minutes and give nothing back. Saying why on the status line
         // is the whole of the correct response.
         s_status = "서버 주소 없음";
+        s_phase  = NODE_PH_FAIL;
         hlogf("[fwpull] request (%s) but no server is configured\n", why ? why : "");
         return;
     }
@@ -781,7 +857,11 @@ void fwpull_request(const char *why) {
     net_scan_abort();
 
     s_progress = -1;
-    s_status = "물어보는 중";
+    // The same phrase and the same phase the worker sets when it picks the request up, so the
+    // quarter second before it looks (fwpull_task's vTaskDelay) reads as the check it is and not
+    // as a press that did nothing.
+    s_status = NODE_SAY_ASK;
+    s_phase  = NODE_PH_ASK;
     s_request = true;
     hlogf("[fwpull] armed (%s)\n", s_why);
 }
@@ -794,3 +874,9 @@ int fwpull_progress(void) { return s_progress; }
 // is what lets a caller tell "no pull has happened" from "a pull happened and this is how it
 // went" without watching fwpull_active() go by.
 const char *fwpull_status(void) { return s_status; }
+
+// NODE_PH_IDLE until the first fwpull_request() and the phase of whatever happened after that -
+// the same contract as fwpull_status() above, in the vocabulary the two node firmwares report in.
+// It is here so the panel's own card can be classified by the same code that classifies theirs:
+// see the note on s_phase for what reading the Korean instead would cost.
+uint8_t fwpull_phase(void) { return s_phase; }

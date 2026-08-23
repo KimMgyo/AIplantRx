@@ -411,7 +411,7 @@ void nodeota_on_recv(const NodeRepMsg *m, const uint8_t *mac) {
         // saying it.
         //
         // ON A CHANGE, and the change test is what makes it affordable. The download reports
-        // ~40 times with a moving pct and a FIXED string ("펌웨어 내려받는 중"), so comparing the
+        // ~40 times with a moving pct and a FIXED string (NODE_SAY_DL), so comparing the
         // words collapses the whole transfer to one line and leaves the percentage to the
         // progress bar, which is whose job it is. What survives is the five lines that are
         // actually events: preparing, joining WiFi, checking, downloading, and the verdict -
@@ -647,6 +647,24 @@ void nodeota_view(uint8_t role, NodeView *out) {
 uint8_t nodeota_busy_role(void) {
     for (uint8_t r = NODE_ROLE_CAM; r < NODE_ROLE_COUNT; r++) {
         if (nodeproto_phase_busy(s_st[r].phase)) return r;
+    }
+    return NODE_ROLE_COUNT;
+}
+
+// Which board is actually writing an image, or NODE_ROLE_COUNT when none is. A second loop over
+// the same array rather than a parameter on the one above, because the two questions have
+// different answers and different callers. The busy role refuses a second arm (nodeota_request
+// above) and suppresses a node's HELLO while it works, and both of those must stay true through
+// the manifest fetch; this one raises a full-screen takeover, which must not. Narrowing
+// nodeproto_phase_busy() so the overlay could share it would have let two boards flash at once,
+// and that is a far worse bug than a duplicated four-line loop.
+//
+// Not a `flashing` bool on NodeView beside `busy`, either. What the overlay needs is an identity
+// - which board the screen is about, and whether it is the same board it was a moment ago - so a
+// per-role flag would only move this loop into the caller.
+uint8_t nodeota_flashing_role(void) {
+    for (uint8_t r = NODE_ROLE_CAM; r < NODE_ROLE_COUNT; r++) {
+        if (nodeproto_phase_flashing(s_st[r].phase)) return r;
     }
     return NODE_ROLE_COUNT;
 }

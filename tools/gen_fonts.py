@@ -131,10 +131,12 @@ def hangul():
 
     And the two OTHER firmwares, which is the least obvious of the three and was found by a
     comment. The sensor node and the camera report their own progress in Korean over ESP-NOW
-    ("펌웨어 내려받는 중", sensor_node/src/nodeota.cpp) and the PANEL is what draws it: those
+    (NODE_SAY_DL and its neighbours, shared/nodeproto.h) and the PANEL is what draws it: those
     boards have no screen at all. Deriving from the panel and the server alone left 려 out, so
     every update a node performed drew that syllable of its own status line a size smaller than
-    the rest - the same bug as the server half, arriving over a different wire.
+    the rest - the same bug as the server half, arriving over a different wire. Those phrases now
+    live in shared/, which is why it is walked below, but the node sources stay in the list: they
+    still hold the steps only one board has, like the sensor node's "WiFi 연결 중".
     """
     found = set()
     for src, pat in ((os.path.join(ROOT, "src"), _LITERAL),
@@ -142,6 +144,13 @@ def hangul():
                      (os.path.join(ROOT, "sensor_node", "src"), _LITERAL),
                      (os.path.join(ROOT, "sensor_node", "include"), _LITERAL),
                      (os.path.join(ROOT, "esp32cam-streamer", "src"), _LITERAL),
+                     # shared/ holds the phrases all three boards send for one fact (see
+                     # NODE_SAY_CURRENT in shared/nodeproto.h). It is scanned for the same reason
+                     # the node firmwares are: the panel is what DRAWS those words, so a glyph
+                     # only ever written down in a shared header would be missing from the font
+                     # and reach the screen as a box. Nothing warns about that - the build
+                     # succeeds, the string is correct, and the panel renders tofu.
+                     (os.path.join(ROOT, "shared"), _LITERAL),
                      (os.path.join(ROOT, "server", "app"), _PY_LITERAL)):
         for dirpath, dirnames, filenames in os.walk(src):
             dirnames[:] = [d for d in dirnames if d not in ("fonts", "__pycache__")]

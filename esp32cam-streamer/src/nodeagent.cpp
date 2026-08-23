@@ -608,7 +608,7 @@ static bool fetch_manifest(char *sha, size_t shacap, char *md5, size_t md5cap, l
         // showing an error beside a board that is working perfectly well.
         nodeagent_logf("[ota] server has nothing published for role=%s (404)\n",
                        nodeproto_role_name(NODE_ROLE_CAM));
-        fail("서버에 펌웨어 없음");
+        fail(NODE_SAY_NOFW);
         return false;
     }
     if (status < 200 || status >= 300) {
@@ -730,7 +730,7 @@ static bool download_and_install(const char *md5, size_t size) {
     }
 
     nodeagent_logf("[ota] installing %u bytes, md5=%s\n", (unsigned)size, md5);
-    publish(NODE_PH_DL, 0, "내려받는 중");
+    publish(NODE_PH_DL, 0, NODE_SAY_DL);
 
     size_t   got = 0;
     uint32_t last = millis();
@@ -770,7 +770,7 @@ static bool download_and_install(const char *md5, size_t size) {
         if (pct >= last_prog_pct + PROG_STEP_PCT || now - last_prog_ms >= PROG_KEEPALIVE_MS) {
             last_prog_pct = pct;
             last_prog_ms = now;
-            publish(NODE_PH_DL, pct, "내려받는 중");
+            publish(NODE_PH_DL, pct, NODE_SAY_DL);
         }
 
         // The same yield point services the panel's debug verbs and the log ring, so "reboot" can
@@ -812,7 +812,7 @@ static bool download_and_install(const char *md5, size_t size) {
         return false;
     }
 
-    publish(NODE_PH_DL, 100, "설치 확인 중");
+    publish(NODE_PH_DL, 100, NODE_SAY_VERIFY);
     if (!Update.end(false)) {
         // No abort() here: end() has already run _abort() internally on the path that failed - an
         // md5 mismatch, or a short image - so the state is released and a second abort would do
@@ -828,7 +828,7 @@ static void run_update(const char *base, const char *token) {
     // The very first act, ahead of every check and every socket. The panel resends NODE_UPDATE
     // three times 700ms apart until it sees a non-idle phase, and a node that spends four seconds
     // failing to connect before it says anything collects all three resends first.
-    publish(NODE_PH_ASK, NODE_PCT_NONE, "확인하는 중");
+    publish(NODE_PH_ASK, NODE_PCT_NONE, NODE_SAY_ASK);
 
     if (esp_ota_get_next_update_partition(NULL) == NULL) {
         // NODEF_CAN_OTA already told the panel this and it should have greyed the button out, but
@@ -904,20 +904,23 @@ static void run_update(const char *base, const char *token) {
     // EVERY BRANCH HERE THAT IS NOT AN INSTALL RESUMES THE CAMERA, which is the rule the
     // stand-down above is written around: nothing to install must never be a reason for a dark
     // camera. SAME and OLDER are finished, successful checks, so they end exactly the way the hash
-    // match below ends - NODE_PH_CURRENT, a phrase for the panel's hint line, camstream_resume().
-    // FWVER_UNKNOWN means one of the two strings is not a version - an empty FW_VERSION, a server
-    // that has not been redeployed - and falls through to the comparison this board always made.
+    // match below ends - NODE_PH_CURRENT, one of shared/nodeproto.h's two phrases,
+    // camstream_resume(). Which of the two this board means is its own to choose; the words are
+    // not, and that header says why three boards each wording the same fact was worth taking away
+    // from them. FWVER_UNKNOWN means one of the two strings is not a version - an empty
+    // FW_VERSION, a server that has not been redeployed - and falls through to the comparison
+    // this board always made.
     switch (fwver_cmp(FW_VERSION, want_ver)) {
         case FWVER_SAME:
             nodeagent_logf("[ota] server publishes %s and this board runs %s - nothing to "
                            "install\n", want_ver, FW_VERSION);
-            publish(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신");
+            publish(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_CURRENT);
             camstream_resume();
             return;
         case FWVER_OLDER:
             nodeagent_logf("[ota] server publishes %s but this board runs the later %s - not "
                            "going back\n", want_ver, FW_VERSION);
-            publish(NODE_PH_CURRENT, NODE_PCT_NONE, "서버가 구버전");
+            publish(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_AHEAD);
             camstream_resume();
             return;
         case FWVER_NEWER:
@@ -943,7 +946,7 @@ static void run_update(const char *base, const char *token) {
     nodeagent_logf("[ota] running elf=%s server elf=%.16s (%ld bytes)\n",
                    have_sha, want_sha, want_size);
     if (strncmp(have_sha, want_sha, 16) == 0) {
-        publish(NODE_PH_CURRENT, NODE_PCT_NONE, "이미 최신");
+        publish(NODE_PH_CURRENT, NODE_PCT_NONE, NODE_SAY_CURRENT);
         camstream_resume();
         return;
     }
@@ -959,7 +962,7 @@ static void run_update(const char *base, const char *token) {
         return;
     }
 
-    publish(NODE_PH_DONE, 100, "다시 시작합니다");
+    publish(NODE_PH_DONE, 100, NODE_SAY_DONE);
     nodeagent_logf("[ota] installed; restarting\n");
     // Two things happen in this pause and both need it: the panel paints 100% and drops its
     // overlay on a DONE rather than on a silence, and the NODE_PROG above actually leaves the
