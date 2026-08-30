@@ -155,13 +155,17 @@ def test_the_shape_is_the_contract_the_page_reads():
     assert set(st) == {"ts", "published", "devices", "logs"}, sorted(st)
     assert set(st["published"]) == set(firmware.ROLES), sorted(st["published"])
     dev = st["devices"][0]
-    assert set(dev) == {"device", "last_seen", "uptime_ms", "flags", "roles"}, sorted(dev)
+    assert set(dev) == {"device", "last_seen", "uptime_ms", "flags", "boot", "roles"}, sorted(dev)
     assert set(dev["flags"]) == {"update_mode", "firmware_pull",
                                  "node_pull_cam", "node_pull_node"}, sorted(dev["flags"])
+    # The restart half of the card. Always all four keys, null where nothing was reported - what
+    # each of them means when it is null, and that null is not a clean bill of health, is
+    # tests/test_crash_visible.py's subject.
+    assert set(dev["boot"]) == {"reset", "crashes", "crash", "restarts"}, sorted(dev["boot"])
     assert set(_role(st, "panel")) == {
         "role", "running", "published", "current", "up_s", "heap",
         "online", "pending", "can_ota", "recv_ts"}, sorted(_role(st, "panel"))
-    return "top level, device, flags and role keys are all exactly as spelled"
+    return "top level, device, flags, boot and role keys are all exactly as spelled"
 
 
 def test_current_is_a_prefix_match_and_nothing_looser():

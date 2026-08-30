@@ -91,6 +91,46 @@ static char s_c_pc[12] = "";
 static char s_c_bt[112] = "";
 static bool s_c_have = false;
 
+// WHY EVERY RESTART IS RECORDED AND NOT ONLY THE CRASHES.
+//
+// s_crashes deliberately counts panics and watchdogs and nothing else, and the comment in
+// health_init defends that at length: a counter that ticked on our own OTA reboots would answer
+// a different question than the one it claims to. That is still right. What it cost is that a
+// board being power-cycled is INVISIBLE in the headline number - and that is not hypothetical.
+// Measured 2026-08-23 on this panel: five ESP_RST_POWERON resets inside ten minutes (21:00:33,
+// 21:02:57, 21:04:17, 21:08:20, 21:09:56) followed by one int_wdt at 21:30:06, with `crashes`
+// reading 205 across all five of them because none of them was a crash. It took paging 1,916
+// rows of retained console to see the pattern, which is not something an operator with a phone
+// can do. What CAUSED those five is still open and this comment is not the place it gets decided:
+// a supply being interrupted is one candidate, and a brownout during a flash write is another -
+// the sdkconfig has CONFIG_SPI_FLASH_BROWNOUT_RESET=1, and whether the reset that feature
+// performs surfaces as ESP_RST_POWERON rather than ESP_RST_BROWNOUT was being established when
+// this was written. Either way the pattern is worth having immediately and worth having
+// SEPARATELY from the panic count, which is all this ring claims.
+//
+// So: two questions, two records. "How often has this firmware died" is s_crashes and still
+// excludes everything intentional or external. "What has been restarting this board lately, and
+// was it the same thing each time" is this ring. A power reset belongs in the second and must
+// stay out of the first.
+//
+// Eight entries because the question is about a pattern rather than a history - five in ten
+// minutes shows up in eight, and the server keeps more (server/app/store.py device_boots) once
+// the entries have been posted. Stored as esp_reset_reason() bytes, oldest first, so the whole
+// ring is eight bytes and one NVS blob.
+//
+// WHERE THIS MAY BE WRITTEN, WHICH IS ONLY AT BOOT. Both writes happen inside health_init(),
+// before setup() brings the display or the camera up, beside the NVS writes the crash counter
+// and the probation counter already do at that moment. That placement is not tidiness: PSRAM on
+// this board is octal and shares its bus mode with flash (qio_opi), so a flash or NVS write
+// stalls PSRAM access for its duration - and a long enough stall is exactly the interrupt
+// watchdog reset this file is being read about. A per-boot write during setup is free; the same
+// write on a timer, while camnet is decoding into PSRAM on core 0, would be a diagnostic that
+// causes the fault it is meant to explain. Nothing here may move into the loop.
+static const uint8_t HIST_MAX = 8;
+static uint8_t s_hist[HIST_MAX];     // esp_reset_reason_t values, oldest first
+static uint8_t s_hist_n = 0;         // how many of s_hist are real
+static uint32_t s_boots = 0;         // boots since this board was first flashed, from NVS
+
 // Internal DRAM is the resource this board runs out of first, and it fails somewhere else.
 // The WiFi driver's coex layer creates an esp_timer the first time a scan starts; esp_timer_-
 // create() turns a failed calloc into ESP_ERR_NO_MEM, ets_timer_setfn wraps that call in an
@@ -170,10 +210,46 @@ static void revert_to(uint32_t good) {
 // The dump is NOT erased here. It is erased once the server has actually received it (see
 // health_crash_reported), because a board that crashes again before its first successful post
 // would otherwise throw away the only evidence of the first crash.
+//
+// WHAT IT HAS ACTUALLY PRODUCED SO FAR, WHICH IS NOTHING. Recorded 2026-08-23. Three crashes
+// have been counted in NVS since this function was written, and not one of them left a dump
+// this code could read - the console history has never carried a single "[health] coredump"
+// line. The three, by the counter value they wrote:
+//
+//   203 -> 204  01:42  reset=panic    on v0.4.3
+//   204 -> 205  15:11  reset=wdt      on v0.4.4, during the camera's OTA download
+//   205 -> 206  21:30  reset=int_wdt  on v0.4.5, idle greenhouse, nothing being flashed
+//
+// A HYPOTHESIS for the two watchdog resets, and it is written here as one because it has not
+// been verified: both the interrupt and the task watchdog can reset the chip from their SECOND
+// stage, which is the hardware doing it and does not run the panic handler - and the panic
+// handler is the thing that writes the dump. If that is what happened then there was never
+// anything in the partition to find and reading it harder will not help; what would help is
+// not starving the watchdogs in the first place. Whether the 01:42 panic left a dump is a
+// separate question and still unanswered.
+//
+// Which is why the reads below say what they found. Until they did, "nothing was ever written",
+// "something was written and we could not parse it" and "a dump was written by our own restart
+// and thrown away" were one silent return, and from a distance those three look identical -
+// while the first sends the next reader after the load and the second sends them after the
+// panic handler.
 static void read_coredump(void) {
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
     size_t addr = 0, size = 0;
-    if (esp_core_dump_image_get(&addr, &size) != ESP_OK || size == 0) return;
+    esp_err_t got = esp_core_dump_image_get(&addr, &size);
+    if (got != ESP_OK) {
+        // ESP_ERR_NOT_FOUND is a blank partition and the ordinary case on a board that has
+        // not crashed. The invalid-size and invalid-CRC errors are not: they mean the panic
+        // handler was interrupted mid-write, which is itself worth knowing. Reported by name
+        // rather than sorted into "normal" and "not", because that judgement belongs to
+        // whoever is reading the console about a crash, not to this line.
+        hlogf("[health] no coredump to read (%s)\n", esp_err_to_name(got));
+        return;
+    }
+    if (size == 0) {
+        hlogf("[health] coredump image present but zero-length\n");
+        return;
+    }
 
     // A dump written while we were deliberately restarting is not a crash report. Tearing the
     // scheduler down inside esp_restart() leaves a stack-canary watchpoint armed over memory
@@ -191,9 +267,17 @@ static void read_coredump(void) {
     // Heap, not stack: the summary carries a whole backtrace array and this runs on the main
     // task during setup, next to the panel driver's own allocations.
     esp_core_dump_summary_t *sum = (esp_core_dump_summary_t *)malloc(sizeof(*sum));
-    if (sum == nullptr) return;
+    if (sum == nullptr) {
+        // The dump is left where it is, unerased, so the next boot can try again with a heap
+        // that is not this one's. Said out loud because losing a crash report to the panel
+        // driver's allocations is a different problem from never having had one.
+        hlogf("[health] coredump %ub kept: no room for a %ub summary\n",
+                      (unsigned)size, (unsigned)sizeof(*sum));
+        return;
+    }
 
-    if (esp_core_dump_get_summary(sum) == ESP_OK) {
+    esp_err_t sumerr = esp_core_dump_get_summary(sum);
+    if (sumerr == ESP_OK) {
         s_c_have = true;
         snprintf(s_c_task, sizeof(s_c_task), "%s", sum->exc_task);
         snprintf(s_c_pc, sizeof(s_c_pc), "0x%08lx", (unsigned long)sum->exc_pc);
@@ -205,9 +289,15 @@ static void read_coredump(void) {
         hlogf("[health] coredump %ub: task=%s pc=%s%s\n  bt=%s\n", (unsigned)size,
                       s_c_task, s_c_pc, sum->exc_bt_info.corrupted ? " CORRUPT" : "", s_c_bt);
     } else {
-        hlogf("[health] coredump %ub present but unreadable\n", (unsigned)size);
+        hlogf("[health] coredump %ub present but unreadable (%s)\n", (unsigned)size,
+                      esp_err_to_name(sumerr));
     }
     free(sum);
+#else
+    // Said once per boot rather than left as an empty function. A build with coredumps
+    // compiled out reports crashes exactly the way a board that never crashed does, and the
+    // whole point of the lines above is that those two must not look the same.
+    hlogf("[health] coredump reading is not compiled into this image\n");
 #endif
 }
 
@@ -248,6 +338,25 @@ void health_init(void) {
         s_prefs.putUInt("crashes", s_crashes);
     }
 
+    // The ring, and the boot counter that orders it. Written for EVERY reason, our own
+    // restarts included: this record answers "what has been restarting this board lately",
+    // and an OTA reboot is part of that answer even though it is emphatically not a crash.
+    // The two records disagree on purpose - see the note above s_hist.
+    s_boots = s_prefs.getUInt("boots", 0) + 1;
+    s_prefs.putUInt("boots", s_boots);
+    size_t held = s_prefs.getBytes("hist", s_hist, sizeof(s_hist));
+    // A blob this build cannot read is dropped rather than partly believed. getBytes answers 0
+    // when the stored value does not fit the buffer, so a ring written by a future image with
+    // more entries reads as absent here: the history restarts from this boot, which loses
+    // entries and states nothing false. NVS erased or first boot lands in the same branch.
+    s_hist_n = (held <= sizeof(s_hist)) ? (uint8_t)held : 0;
+    if (s_hist_n == HIST_MAX) {
+        memmove(s_hist, s_hist + 1, HIST_MAX - 1);
+        s_hist_n = HIST_MAX - 1;
+    }
+    s_hist[s_hist_n++] = (uint8_t)s_reason;
+    s_prefs.putBytes("hist", s_hist, s_hist_n);
+
     const esp_partition_t *running = esp_ota_get_running_partition();
     s_addr = (running != nullptr) ? running->address : 0;
 
@@ -275,6 +384,13 @@ void health_init(void) {
                       (unsigned)tries, (unsigned)MAX_TRIES,
                       (unsigned long)s_addr, (unsigned long)s_good);
     }
+    hlogf("\n");
+
+    // Its own line, oldest first, because the pattern is the whole point: five "power" in a row
+    // reads as a supply problem at a glance, where five separate boot lines twenty minutes apart
+    // in a console did not. boots is what orders the entries once they are off the board.
+    hlogf("[health] boots=%lu restarts:", (unsigned long)s_boots);
+    for (uint8_t i = 0; i < s_hist_n; i++) hlogf(" %s", health_reset_name_of(s_hist[i]));
     hlogf("\n");
 
     // Registered after the reset line so that line still prints if registration ever fails, and
@@ -388,6 +504,13 @@ void health_restart(const char *why) {
 }
 
 uint32_t health_crashes(void) { return s_crashes; }
+uint32_t health_boots(void) { return s_boots; }
+uint8_t health_restart_count(void) { return s_hist_n; }
+// 0xFF is not a reset reason and health_reset_name_of maps it to "unknown", so an index past
+// the end of the ring answers "unknown" instead of reading whatever follows it.
+const char *health_restart_reason(uint8_t i) {
+    return health_reset_name_of(i < s_hist_n ? s_hist[i] : 0xFF);
+}
 bool health_have_crash(void) { return s_c_have; }
 const char *health_crash_task(void) { return s_c_task; }
 const char *health_crash_pc(void) { return s_c_pc; }

@@ -57,6 +57,21 @@ const char *health_reset_name_of(uint8_t reason);
 // exactly the state that was invisible before this existed.
 uint32_t health_crashes(void);
 
+// The last few restarts, oldest first, and the boot counter that orders them. This is the
+// SECOND question about restarts and deliberately not the one health_crashes() answers: that
+// counter excludes everything intentional or external, which is right, and the consequence is
+// that a board being power-cycled by a bad cable does not move it at all. Measured 2026-08-23:
+// five ESP_RST_POWERON resets inside ten minutes with `crashes` unchanged across all five.
+//
+// So these say what has been restarting the board lately and whether it was the same thing each
+// time, crashes and clean reboots alike, at most HIST_MAX (8) deep out of NVS. health_boots() is
+// cumulative and never resets, which is what lets the server tell one boot's entry from the
+// same-looking entry of the boot before it. An index at or past health_restart_count() reads
+// "unknown" rather than running off the ring.
+uint32_t health_boots(void);
+uint8_t health_restart_count(void);
+const char *health_restart_reason(uint8_t i);
+
 // Whether this firmware is still unconfirmed. Worth showing on the panel: a reboot in this
 // state does not keep the image.
 bool health_image_pending(void);

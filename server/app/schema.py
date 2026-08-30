@@ -17,7 +17,7 @@ Two rules shape these models.
    firmware clamps again on its side.
 """
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -60,6 +60,14 @@ class Links(BaseModel):
     wifi_rssi: int = 0
 
 
+# The device's restart ring: how many entries it can send, and the widest reason name in it.
+# Both mirror src/health.cpp - HIST_MAX is 8 and health_reset_name_of's longest answer is
+# "deepsleep" at 9 - and both are enforced rather than trusted, because this is a field on an
+# authenticated but unvalidated wire and the page renders every entry it is given.
+BOOT_RESTARTS_MAX = 8
+BOOT_REASON_BYTES = 16
+
+
 class Boot(BaseModel):
     """How the last run ended, and whether the current firmware is confirmed.
 
@@ -93,6 +101,21 @@ class Boot(BaseModel):
     crash_task: Optional[str] = None
     crash_pc: Optional[str] = None
     crash_bt: Optional[str] = None
+    # What has been restarting this board lately, oldest first, and how many times it has ever
+    # booted. A SECOND question about restarts, and deliberately not the one `crashes` answers:
+    # that counter excludes power-ons and the device's own reboots, which is right, and the
+    # consequence is that a board being power-cycled does not move it at all.
+    # Measured on the panel 2026-08-23: five ESP_RST_POWERON resets inside ten minutes with
+    # `crashes` reading 205 across every one of them, found only by paging 1,916 rows of
+    # retained console. `restarts` is what makes that pattern a field instead of an excavation.
+    #
+    # 0 and [] are what firmware predating this sends, and they read as "not reported" rather
+    # than as a claim: a board that is posting at all has booted at least once, so `boots` = 0
+    # cannot be mistaken for a real count. Both are capped rather than trusted - see
+    # BOOT_RESTARTS_MAX above.
+    boots: int = 0
+    restarts: list[Annotated[str, Field(max_length=BOOT_REASON_BYTES)]] = Field(
+        default_factory=list, max_length=BOOT_RESTARTS_MAX)
 
 
 class DeviceSpecies(BaseModel):

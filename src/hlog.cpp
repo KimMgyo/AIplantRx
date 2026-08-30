@@ -54,13 +54,86 @@ static const size_t RING_CAP = 256 * 1024;
 static const size_t LOG_LINE_MAX = 512;
 
 static char *s_ring = nullptr;
-static size_t s_head = 0;            // total bytes ever written, not an index
+
+// The absolute byte count AND the ring's sequence number, which is the whole reason the seqlock in
+// ring_take() below needs no counter of its own: a monotonic "bytes ever written" already is one.
+// Volatile because that seqlock depends on its second read actually being a second read, and for
+// the reason nodelog.cpp gives at its own cursors - the publish at the end of an append must not be
+// hoisted above the bytes it publishes. Only ever moved under s_mux.
+static volatile size_t s_head = 0;   // total bytes ever written, not an index
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_dropped_clients = 0;
 
-// Appends to the ring. Called from every task that logs, so the cursor update has to be atomic
-// with the copy - a reader computing "how far behind am I" against a half-updated head would
-// either repeat or skip a line. The critical section covers a memcpy of at most LOG_LINE_MAX bytes.
+// ---- the ring, and why the copies happen outside the lock --------------------------------------
+//
+// THIS PANEL RESET ONCE WITH reset=int_wdt AND THIS RING WAS THE CAUSE. The interrupt watchdog
+// fires when interrupts stay disabled past CONFIG_ESP_INT_WDT_TIMEOUT_MS, which is 300 here, with
+// CONFIG_ESP_INT_WDT_CHECK_CPU1=y so both cores are watched. ring_take() used to hold
+// taskENTER_CRITICAL across a memcpy of up to PUSH_CHUNK bytes OUT of PSRAM. Espressif documents
+// that combination as a failure mode rather than a risk: with the RGB panel in bounce-buffer mode
+// an extended portENTER_CRITICAL can cause an interrupt watchdog reset, and PSRAM is unreachable
+// while flash is being written.
+//
+// THIS BOARD IS THAT CONFIGURATION ON EVERY COUNT, which is worth writing down because each half
+// of it lives in a different file:
+//   the ring is in PSRAM                    hlog_init() below, MALLOC_CAP_SPIRAM
+//   flash and PSRAM share the octal bus     platformio.ini:54, qio_opi - so a flash write takes
+//                                           the PSRAM path down with it, not just the flash one
+//   the RGB panel is in bounce mode         main.cpp:91 sets the bounce buffer to frameWidth * 10,
+//                                           ten scanlines, and scripts/patch_rgb_bounce.py turns
+//                                           its cache-invalidate ON precisely because the bounce
+//                                           engine streams ~30MB/s of framebuffer out of that
+//                                           same PSRAM continuously
+//   and that gives a hard deadline          ten lines out of 480 at ~39Hz is 533us to refill a
+//                                           bounce buffer before the DMA underruns
+// lvgl_v8_port.cpp:339 is the far end of the same story: a missed refresh-finish notify costs a
+// dropped or torn frame, which is why that wait is bounded instead of portMAX_DELAY.
+//
+// THE PATH IS CROSS-CORE, WHICH IS WHY IT DID NOT LOOK LIKE A DISPLAY BUG. hlog_task runs on core
+// 0 (hlog_init below); the LVGL task and the RGB interrupt are on core 1 (ARDUINO_RUNNING_CORE=1,
+// include/lvgl_v8_port.h:52). taskENTER_CRITICAL masks interrupts on its OWN core only, so core 0
+// never masked the RGB ISR directly. It did two other things instead. It contended for the octal
+// bus and for the 32KB D-cache the bounce refill reads through - 4KB is 128 cache lines evicted
+// out of a 533us budget. And a flash write on core 1 has to stall core 0 before it may disable the
+// cache, so a critical section here sets how long core 1 spins with its OWN interrupts off waiting
+// for that handshake. That is how a log reader on the quiet core masks the display interrupt on
+// the busy one, and why the watchdog that caught it watches both.
+//
+// AND THE RING GOT 16x BIGGER THIS SESSION, which is what turned a footnote into a reset. At the
+// old 16KB the whole ring was four PUSH_CHUNKs and the read window was rarely full; at 256KB the
+// push reads a full 4KB every time. Quoted at 40MB/s (see the note below) that is 102us of
+// interrupts off, 19% of the bounce deadline before any contention at all - and the panel's own
+// [camnet] counters measured PSRAM access running 27x slow in the 90 seconds before the reset,
+// which puts the same copy into the milliseconds.
+//
+// THE 256KB RING STAYS. It is the reason the console is readable from a phone an hour away, which
+// is the entire point of this file. What is fixed here is the interrupt latency, not the size.
+//
+// THE THROUGHPUT FIGURE, NAMED SO IT CAN BE ARGUED WITH: 40MB/s, i.e. 25ns a byte. It is an
+// assumption and not a measurement on this board. The bus peak is 80MB/s - octal, eight data lines
+// at CONFIG_SPIRAM_SPEED=80 - and the bounce engine is already taking ~30MB/s of it continuously,
+// so 40 is the honest middle rather than the brochure number. Every microsecond figure above and
+// below scales linearly if it is wrong; the ORDERING does not, and the ordering is the actual fix.
+
+// Appends to the ring. The cursor update still has to be atomic with the copy - a reader computing
+// "how far behind am I" against a half-updated head would either repeat or skip a line - and here
+// that is still done the blunt way, with the copy inside the lock. Deliberately, on both counts.
+//
+// s_head IS THE PUBLISH. "Every byte below s_head is written" is the invariant ring_take() reads
+// against, and it holds only because the copy completes before s_head moves. Reserving under the
+// lock and copying outside it would make s_head mean "reserved" instead, and since every task in
+// this firmware logs, the commits behind it would land out of order - a reader could no longer tell
+// a written byte from a reserved one without a second cursor and a completion protocol. The way to
+// avoid that protocol is a blocking mutex, and that is worse than the bug it fixes: a ring whose
+// whole purpose is that logging never waits on the uplink must not make one logging task wait on
+// another instead.
+//
+// SO THE WINDOW STAYS, AND LOG_LINE_MAX IS WHAT BOUNDS IT. 512 bytes, worst case ~1KB of bus
+// traffic because PSRAM is write-back and write-allocate, so a store to a line that is not resident
+// fills it before dirtying it: ~26us at 40MB/s, 4.9% of the 533us bounce deadline. Against the
+// 102us and 19% that ring_take() used to cost, that is one eighth of the exposure - and it is the
+// eighth that cannot be removed, which is the whole reason it is the one that stays. If it ever has
+// to go, the lever is a smaller LOG_LINE_MAX, not a reordering of these six lines.
 static void ring_put(const char *p, size_t n) {
     if (s_ring == nullptr || n == 0) return;
     if (n > RING_CAP) { p += n - RING_CAP; n = RING_CAP; }
@@ -79,6 +152,28 @@ static void ring_put(const char *p, size_t n) {
 // `from`. A client that fell more than a ring behind is snapped forward to the oldest byte still
 // held, because handing it stale bytes that have since been overwritten would be a lie about
 // what the board said.
+//
+// A SEQLOCK, with the PSRAM copy between two short critical sections of integer work. Each of them
+// protects exactly one thing:
+//
+//   the first    PUBLISHES the window. Reading s_head and moving `from` off an already-overwritten
+//                position happen atomically, so no reader ever measures its distance against a
+//                half-updated head. That is the guarantee the old single critical section existed
+//                for, and it is unchanged - it just no longer has a memcpy nailed to it.
+//   the second   VALIDATES it. What was copied is [start, start+n), and that is intact if and only
+//                if start is still no older than the oldest byte the ring holds. Which is the SAME
+//                predicate as `lost` above, applied after the fact instead of before it.
+//
+// So the torn read is DETECTED rather than prevented, and detection is sufficient because this file
+// already has an answer to "the bytes you asked for are gone": snap forward and count it. A writer
+// that laps the ring mid-copy is therefore treated as precisely what it is - a reader that fell
+// behind - and gets the same snap and the same increment as one that fell behind slowly.
+//
+// IT RETURNS 0 RATHER THAN RETRYING. Both callers come back on their own (push_once() breaks its
+// fill loop and waits out its gap, hlog_task() reads again in 20ms), and a retry loop here would be
+// an unbounded one sitting in the middle of a log reader. It could not spin anyway: lapping 256KB
+// at the measured 15KB a minute takes seventeen minutes, and the copy it would have to beat takes
+// 102us.
 static size_t ring_take(size_t *from, char *out, size_t max) {
     if (s_ring == nullptr) return 0;
 
@@ -87,18 +182,36 @@ static size_t ring_take(size_t *from, char *out, size_t max) {
     size_t oldest = (head > RING_CAP) ? head - RING_CAP : 0;
     bool lost = (*from < oldest);
     if (lost) *from = oldest;
+    size_t start = *from;
+    size_t n = head - start;
+    taskEXIT_CRITICAL(&s_mux);
 
-    size_t n = head - *from;
+    if (lost) s_dropped_clients++;
     if (n > max) n = max;
-    size_t at = *from % RING_CAP;
+    if (n == 0) return 0;
+
+    size_t at = start % RING_CAP;
     size_t first = RING_CAP - at;
     if (first > n) first = n;
     memcpy(out, s_ring + at, first);
     if (n > first) memcpy(out + first, s_ring, n - first);
-    *from += n;
+
+    // The re-check, and the only new rule in this file. `torn` means a writer wrapped past the
+    // start of what was just copied, so those bytes belong to some later line now and handing them
+    // over would be exactly the lie the snap-forward above exists to avoid. Written as a
+    // subtraction and not as `start + RING_CAP < head2` because s_head is an absolute byte count
+    // that wraps at 2^32 - about 194 days at 15KB a minute - and unsigned subtraction of two
+    // monotonic counters stays correct across that wrap where an addition would not.
+    taskENTER_CRITICAL(&s_mux);
+    size_t head2 = s_head;
+    bool torn = (head2 - start) > RING_CAP;
+    *from = torn ? (head2 - RING_CAP) : (start + n);   // torn implies head2 > RING_CAP: no underflow
     taskEXIT_CRITICAL(&s_mux);
 
-    if (lost) s_dropped_clients++;
+    if (torn) {
+        s_dropped_clients++;
+        return 0;
+    }
     return n;
 }
 
@@ -359,7 +472,17 @@ static void push_once(void) {
         if (got == 0) break;
         n += got;
     }
-    if (n == 0) return;
+    if (n == 0) {
+        // Nothing to send. Either the ring had nothing new, in which case `at` never moved and this
+        // is a no-op, or ring_take() found the window overwritten under it and snapped past it.
+        // COMMITTING THAT SNAP IS WHAT KEEPS THE DROP COUNTED ONCE: bytes the ring no longer holds
+        // cannot be POSTed by any later push, so a cursor still parked below them would make the
+        // next push rediscover the same loss and count it a second time. This is not the cursor
+        // advance that line 482 guards - that one is about a chunk the server may not have taken
+        // yet, and this is about bytes that no longer exist to send.
+        s_push_cursor = at;
+        return;
+    }
 
     uint32_t start = millis();
 
@@ -549,9 +672,12 @@ static void hlog_task(void *arg) {
             client.setNoDelay(true);
             // Hands over the whole ring first, so the first thing a client sees is how the
             // board got into its current state rather than only what it does next.
-            cursor = (s_head > RING_CAP) ? s_head - RING_CAP : 0;
+            // One read of s_head, not two: it is volatile now (see the note at its definition), so
+            // two reads could straddle a writer and print a byte count the cursor does not match.
+            size_t head = s_head;
+            cursor = (head > RING_CAP) ? head - RING_CAP : 0;
             client.printf("--- smartfarm panel console, %u bytes of history ---\r\n",
-                          (unsigned)(s_head - cursor));
+                          (unsigned)(head - cursor));
         }
 
         if (client && !client.connected()) client.stop();

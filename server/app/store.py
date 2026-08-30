@@ -84,6 +84,19 @@ CONSOLE_READ_MAX = 320
 # itself could have shown, and the pane's own DOM cap, beyond which the page discards anyway.
 CONSOLE_TAIL_BYTES = 256 * 1024
 
+# Boot entries kept per device, and how many of them the operator view asks for. The device can
+# only ever name eight (src/health.cpp HIST_MAX), so the ceiling here is not about what arrives -
+# it is how much of a board's restart history survives on the server after the board itself has
+# forgotten it. Thirty-two is four rings deep, which covers a bad night without becoming a table
+# nobody prunes: at one row per boot a healthy panel adds one every few weeks.
+#
+# BOOT_READ is what /v1/admin/state draws and is one ring exactly. The question the page answers
+# is "has this been happening a lot, and was it the same reason each time", and that is a pattern
+# in the last handful - five power-ons in ten minutes is visible in eight rows and no clearer in
+# thirty-two, on a phone screen that has to hold the rest of the page too.
+BOOT_KEEP = 32
+BOOT_READ = 8
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
     id            INTEGER PRIMARY KEY,
@@ -251,6 +264,43 @@ CREATE TABLE IF NOT EXISTS device_fw (
     recv_ts  INTEGER NOT NULL,
     PRIMARY KEY (device, role)
 );
+
+-- One row per boot of one panel: what ended the run before it, and when this server first heard
+-- about it. The device keeps the last eight in NVS and re-sends the whole ring on every poll
+-- (src/health.cpp, HIST_MAX); this table is where those entries accumulate past the eight the
+-- board can still name.
+--
+-- WHY THIS IS NOT A COUNTER. `telemetry.crashes` is the device's own cumulative panic count and
+-- it deliberately excludes power-ons and the device's own reboots - a counter that ticked on
+-- every OTA restart would answer a different question than the one it claims to. The cost of
+-- that correctness is that a board being power-cycled does not move it at all. Measured on the
+-- panel 2026-08-23: five ESP_RST_POWERON resets inside ten minutes with
+-- `crashes` reading 205 across every one of them, and the only way anybody saw the pattern was
+-- paging 1,916 rows of retained console. So a power reset belongs in a record and still must not
+-- count as a crash, and these are two records because they are two questions.
+--
+-- `seq` is the device's own cumulative boot number, which is what makes this row identifiable
+-- rather than just plausible: five consecutive "power" entries are five different boots and
+-- nothing else about them differs. The insert is INSERT OR IGNORE on (device, seq), so the ring
+-- arriving again on the next poll changes nothing.
+--
+-- `first_seen` is the server's receipt clock on the FIRST poll that named this seq, and it is
+-- the closest thing to a boot time that exists: the board's own clock reads 0 until NTP lands
+-- and a power cut leaves it nothing to measure the gap with. For the boot that is currently
+-- running it is accurate to within one poll (~1 min). For an older entry it is when the board
+-- next managed to report - so a boot that never reached the network is listed, dated by the
+-- poll that finally carried it, and the ordering below is by first_seen for the same reason: a
+-- board whose NVS was erased restarts `seq` at 1, and reading by seq would then rank a
+-- three-week-old entry above tonight's.
+CREATE TABLE IF NOT EXISTS device_boots (
+    device     TEXT    NOT NULL,
+    seq        INTEGER NOT NULL,
+    reason     TEXT    NOT NULL,
+    first_seen INTEGER NOT NULL,
+    PRIMARY KEY (device, seq)
+);
+CREATE INDEX IF NOT EXISTS ix_device_boots_seen
+    ON device_boots (device, first_seen);
 
 -- The panel's console, stored as the chunks it arrived in rather than as lines. A chunk is a
 -- slice of the board's byte ring and may begin or end mid-line; splitting it here would mean
@@ -454,6 +504,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     the column stays behind on every database that already had it - unwritten,
     unread, and harmless because _row_to_dict keys off the column name and
     never off its position.
+
+    The one index below is here rather than in _SCHEMA, and the placement is the whole reason it
+    is not up there with the others: _SCHEMA is executescript'd BEFORE this runs, so an index
+    whose WHERE clause names a migrated column would fail to compile on every database that
+    predates the column - which is every deployed one, and it would fail on connect rather than
+    on use. After the loop above, the column is guaranteed to exist.
     """
     for table, cols in _ADDED_COLS:
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -467,6 +523,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     raise
                 continue
             log.info("%s: added column %s", table, name)
+
+    # last_crash_report scans backwards for the newest poll that carried a panic record, and on a
+    # board that has never crashed that is otherwise every telemetry row it has ever written -
+    # ~600k of them at a 2s poll over the fortnight this table retains, on a page the operator
+    # view refreshes every five seconds. Partial, so the index holds one entry per crash report
+    # and not one per poll: a crash is rare and the ordinary row must not pay for it.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_telemetry_crash ON telemetry (device, id)"
+        " WHERE crash_task IS NOT NULL"
+    )
 
 
 def init_db() -> None:
@@ -583,6 +649,36 @@ def last_telemetry(device: str) -> Optional[dict]:
         (device,),
     ).fetchone()
     return _row_to_dict(row) if row is not None else None
+
+
+def last_crash_report(device: str) -> Optional[dict]:
+    """The newest poll from this device that carried the panic handler's own record, if any.
+
+    NOT the newest poll's copy of those columns, and the difference is the whole function. The
+    device sends crash_task/pc/bt only until a post carrying them is answered and then erases its
+    dump (src/health.cpp health_crash_reported), so in the ordinary case exactly ONE row in this
+    table has them and every row after it has NULL. Reading them off the latest row would show a
+    crash record for one five-second refresh of the operator page and never again - which is
+    indistinguishable from the state this was written to end, where the one diagnostic that names
+    the crash was stored and never read back out.
+
+    So this looks for the last row that HAS one, and hands back its receipt time with it. The
+    time is not decoration: this table retains a fortnight, and a backtrace from twelve days ago
+    beside a reboot from tonight is worse than no backtrace at all.
+
+    None means this device has never posted a crash record - which is NOT the same claim as
+    "this board has never crashed" (see schema.Boot: firmware predating the field posts nothing,
+    and a watchdog reset may leave no dump to post). reset_reason and crashes answer that.
+    """
+    row = _conn().execute(
+        "SELECT recv_ts, crash_task, crash_pc, crash_bt FROM telemetry"
+        " WHERE device=? AND crash_task IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (device,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"ts": int(row["recv_ts"]), "task": row["crash_task"],
+            "pc": row["crash_pc"], "bt": row["crash_bt"]}
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
@@ -1204,6 +1300,70 @@ def all_device_fw() -> list[dict]:
     return out
 
 
+def save_device_boots(device: str, boots: int, restarts: list[str], recv_ts: int) -> int:
+    """Fold one poll's restart ring into device_boots and say how many entries were new.
+
+    The device re-sends its whole ring on every poll, so almost every call here inserts nothing:
+    INSERT OR IGNORE against (device, seq) is what makes a re-send free, and it is also what
+    makes `first_seen` mean what the table says it means - the first poll that named this boot,
+    not the most recent one to mention it.
+
+    `boots` is the device's cumulative boot count and names the NEWEST entry; the ring is oldest
+    first, so the entry i steps from the end has seq boots-i. A ring longer than the device
+    should be able to send is truncated to the newest BOOT_READ rather than trusted, and a ring
+    claiming more entries than there have been boots is clamped at seq 1 - both are impossible
+    from src/health.cpp and neither may put a negative boot number in the table.
+
+    Returns 0 for a device that reports no ring at all, which is every firmware predating the
+    field. That is not an error and not an empty history: it is a board that cannot say, and the
+    operator view reads the absence as exactly that.
+    """
+    if boots <= 0 or not restarts:
+        return 0
+    rows = [str(r) for r in restarts[-BOOT_READ:]]
+    base = boots - len(rows) + 1
+    if base < 1:
+        rows = rows[1 - base:]
+        base = 1
+    conn = _conn()
+    cur = conn.executemany(
+        "INSERT OR IGNORE INTO device_boots (device, seq, reason, first_seen)"
+        " VALUES (?,?,?,?)",
+        [(device, base + i, r, int(recv_ts)) for i, r in enumerate(rows)],
+    )
+    added = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    # Pruned on the insert rather than on the write counter, and by first_seen rather than by
+    # seq: a board whose NVS was erased restarts its counter at 1, and a prune that trusted seq
+    # would keep three-week-old entries and delete tonight's. Same shape as save_frame's.
+    if added:
+        conn.execute(
+            "DELETE FROM device_boots WHERE device=? AND rowid NOT IN"
+            " (SELECT rowid FROM device_boots WHERE device=?"
+            "  ORDER BY first_seen DESC, seq DESC LIMIT ?)",
+            (device, device, BOOT_KEEP),
+        )
+    return added
+
+
+def recent_device_boots(device: str, limit: int = BOOT_READ) -> list[dict]:
+    """This board's last restarts, newest first.
+
+    Newest first because the page's first line is "what happened most recently", and ordered by
+    first_seen for the reason the table's own comment gives: seq is the device's counter and an
+    erased NVS starts it again, so the server's receipt clock is the only ordering that cannot
+    put a stale entry at the top. seq breaks ties within a poll - a board that reports eight
+    entries on its first ever poll dates all eight to the same second, and they still happened
+    in a known order.
+    """
+    rows = _conn().execute(
+        "SELECT seq, reason, first_seen FROM device_boots WHERE device=?"
+        " ORDER BY first_seen DESC, seq DESC LIMIT ?",
+        (device, max(1, int(limit))),
+    ).fetchall()
+    return [{"seq": int(r["seq"]), "reason": str(r["reason"]),
+             "first_seen": int(r["first_seen"])} for r in rows]
+
+
 def peek_device_flags(device: str) -> dict:
     """What is armed for this device, WITHOUT consuming any of it.
 
@@ -1243,12 +1403,21 @@ def peek_device_flags(device: str) -> dict:
 def known_devices() -> list[dict]:
     """Every device this server has ever heard from, freshest first.
 
-    A UNION over both tables the panel writes, not a GROUP BY over `telemetry` alone, and that is
+    A UNION over every table the panel writes, not a GROUP BY over `telemetry` alone, and that is
     load-bearing rather than thorough: save_telemetry is gated on scheduler.telemetry_is_sane, so
     a panel whose sensor node is dead answers its poll, reports its firmware and writes no
     telemetry row at all. Listing from telemetry alone would hide precisely the board an operator
     is most likely to be looking for - the one that stopped reading its sensors - and the update
     button they would want to press on it.
+
+    device_boots is the third arm and it is here for the sharper version of the same argument. A
+    board that is restarting repeatedly is a strong candidate for a board whose sensor node has
+    stopped answering too, and its restart ring is stored outside the sanity gate precisely so
+    that history survives; a device list that could not see this table would then hold the one
+    record explaining the reboots while the board itself was missing from the page. Its last_seen
+    is MAX(first_seen), which is a receipt time of a real poll from that device and so a true
+    lower bound - stale on a healthy board, because a board that is not rebooting adds no rows
+    here, and superseded by the fresher arms whenever either of them has anything to say.
 
     `uptime_ms` therefore comes only from `telemetry` and is 0 for a device that has never
     written a row there, which is the same "not reported" that field's own default means (see
@@ -1262,22 +1431,42 @@ def known_devices() -> list[dict]:
     rowid is monotonic in insert order and recv_ts is stamped at insert, so the newest id is also
     the newest receipt.
 
-    The outer MAX() over the two arms is a merge and not a comparison of like values: each device
-    contributes at most one row per arm, so MAX(last_seen) is "whichever table heard from it more
-    recently" and MAX(uptime_ms) is the telemetry arm's value against the fw arm's placeholder 0.
+    The outer MAX() over the three arms is a merge and not a comparison of like values: each
+    device contributes at most one row per arm, so MAX(last_seen) is "whichever table heard from
+    it most recently" and MAX(uptime_ms) is the telemetry arm's value against the other two arms'
+    placeholder 0. The same merge carries `reset_reason` and `crashes`, whose placeholder on both
+    non-telemetry arms is NULL rather
+    than 0 - MAX ignores NULLs, so the telemetry arm's value wins where there is one and NULL
+    survives where there is not. 0 would have been a lie in exactly the way _TELEMETRY_ADDED_COLS
+    already says it would: "power" and 0 are what a HEALTHY board reports.
+
+    Those two ride along here rather than in a call of their own because they are the two boot
+    fields that are ALWAYS present on a device that has written any telemetry at all, so they
+    belong on the row that is already being read. The panic record does not travel with them and
+    cannot: it is present on one row in the table and NULL on every row after it, so the newest
+    row's copy is the wrong answer for it. See last_crash_report.
     """
     rows = _conn().execute(
-        "SELECT device, MAX(last_seen) AS last_seen, MAX(uptime_ms) AS uptime_ms FROM ("
-        "  SELECT device, MAX(id) AS newest, recv_ts AS last_seen, uptime_ms"
+        "SELECT device, MAX(last_seen) AS last_seen, MAX(uptime_ms) AS uptime_ms,"
+        " MAX(reset_reason) AS reset_reason, MAX(crashes) AS crashes FROM ("
+        "  SELECT device, MAX(id) AS newest, recv_ts AS last_seen, uptime_ms,"
+        "         reset_reason, crashes"
         "    FROM telemetry GROUP BY device"
         "  UNION ALL"
-        "  SELECT device, 0 AS newest, MAX(recv_ts) AS last_seen, 0 AS uptime_ms"
+        "  SELECT device, 0 AS newest, MAX(recv_ts) AS last_seen, 0 AS uptime_ms,"
+        "         NULL AS reset_reason, NULL AS crashes"
         "    FROM device_fw GROUP BY device"
+        "  UNION ALL"
+        "  SELECT device, 0 AS newest, MAX(first_seen) AS last_seen, 0 AS uptime_ms,"
+        "         NULL AS reset_reason, NULL AS crashes"
+        "    FROM device_boots GROUP BY device"
         ") GROUP BY device ORDER BY last_seen DESC, device"
     ).fetchall()
     return [
         {"device": r["device"], "last_seen": int(r["last_seen"]),
-         "uptime_ms": int(r["uptime_ms"])}
+         "uptime_ms": int(r["uptime_ms"]),
+         "reset_reason": r["reset_reason"],
+         "crashes": None if r["crashes"] is None else int(r["crashes"])}
         for r in rows
     ]
 
@@ -1322,7 +1511,7 @@ def stats() -> dict[str, Any]:
     conn = _conn()
     out: dict[str, Any] = {"path": str(db_path())}
     for table in ("telemetry", "prescriptions", "frames", "llm_calls", "device_flags",
-                  "node_logs", "device_fw", "device_console"):
+                  "node_logs", "device_fw", "device_boots", "device_console"):
         out[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
     # The -wal sidecar holds everything written since the last checkpoint, so
     # the main file alone reads as 4KB on a busy database and makes the disk

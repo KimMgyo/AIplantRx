@@ -1279,6 +1279,20 @@ static bool build_request(const char *device) {
         badd(&b, ",\"crash_pc\":\"%s\"", health_crash_pc());
         badd(&b, ",\"crash_bt\":\"%s\"", health_crash_bt());
     }
+    // And the restart ring, which answers the question `crashes` refuses to. That counter skips
+    // power-ons and our own reboots on purpose, so a panel being power-cycled moves nothing in
+    // it - measured 2026-08-23 as five ESP_RST_POWERON resets in ten minutes
+    // with `crashes` reading 205 throughout. `restarts` is what ended each of the last eight
+    // runs, oldest first and every reason included; `boots` is cumulative and is what lets the
+    // server tell this boot's entry from the identical-looking entry before it. Sent on every
+    // poll rather than once, because the poll that would have carried it once is exactly the
+    // one a board in a restart loop fails to complete.
+    badd(&b, ",\"boots\":%lu", (unsigned long)health_boots());
+    badd(&b, ",\"restarts\":[");
+    for (uint8_t i = 0; i < health_restart_count(); i++) {
+        badd(&b, "%s\"%s\"", i ? "," : "", health_restart_reason(i));
+    }
+    badd(&b, "]");
     bend(&b, '}');
     badd(&b, ",");
     // WHAT THREE BOARDS ARE RUNNING, and why this is back after being deleted.

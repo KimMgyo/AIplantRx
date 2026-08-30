@@ -52,14 +52,69 @@ static volatile bool s_want = false;        // consumer -> puller: keep the next
 static volatile uint32_t s_dbg_kept = 0;    // tapped bytes this debug window
 
 // ---- decode throttle / core-0 fairness -------------------------------------
-// The decode is the puller's one expensive act: ~31ms of JPEGDEC Huffman/IDCT
-// plus ~4800 scattered PSRAM stores, all on core 0 beside the WiFi/lwIP driver.
-// Left ungated on a sender that keeps its window full, the pull loop never hits
-// its one vTaskDelay (only the no-data path at :126 sleeps), so core 0's idle
-// task - which the lwIP RX path and the task watchdog run behind - is starved.
-// Two gates fix that: a floor between decodes so a fast sender can't drive more
-// than ~25fps of them, and dropping the decode to a keep-alive rate whenever the
-// monitor canvas is off screen and nothing draws the RGB frame.
+// The decode is the puller's one expensive act: JPEGDEC Huffman/IDCT plus ~4800
+// scattered PSRAM stores, all on core 0 beside the WiFi/lwIP driver. Left ungated
+// on a sender that keeps its window full, the pull loop never hits its one
+// vTaskDelay (only the no-data path at :273 sleeps), so core 0's idle task -
+// which the lwIP RX path and the task watchdog run behind - is starved.
+// Three gates fix that: a floor between decodes so a fast sender can't drive more
+// than ~25fps of them, a budget that widens that floor in proportion to what a
+// decode actually costs once one costs anything much, and dropping the decode to a
+// keep-alive rate whenever the monitor canvas is off screen and nothing draws the
+// RGB frame.
+//
+// WHAT A DECODE COSTS, MEASURED.
+//
+// 2.8ms, and not the ~31ms this note claimed for the life of the flat floor. Two
+// healthy windows, 2026-08-23, monitor page up and the feed being watched:
+//
+//   16.9fps  69.2KB/s  scan=343  decode=2839  idle=53475  us/frame
+//
+// and a second at 17:09 that reads decode=2795 idle=44059 on the same feed, so
+// 2.8ms is the steady state and not one lucky window.
+//
+// So the steady state is a 2.8ms decode inside the sender's ~59ms frame: ~5% duty,
+// ~50ms of the frame handed back to core 0, and the 40ms floor below never binds
+// because the sender's own frame is longer than it. The old ~31ms figure does not
+// reproduce on this build; it survives here as the number the flat floor was sized
+// against, and it is also the number the core-1 experiment at :216 was measured
+// against, so treat that experiment's absolute values as a different baseline than
+// today's while its conclusion stands.
+//
+// WHY A PROPORTIONAL BUDGET ON TOP OF THE FLOOR.
+//
+// Because the cost is not stable, and the board died in the window where it was
+// not. The five windows before an int_wdt reset - v0.4.5, 2026-08-23, idle
+// greenhouse, nothing being flashed, health counter 205 -> 206:
+//
+//   18.5fps  76.0KB/s  scan=469  decode=65784  idle=2045  us/frame
+//   20.1fps  82.8KB/s  scan=438  decode=40674  idle=6729
+//   19.6fps  80.8KB/s  scan=434  decode=47201  idle=2033
+//   19.1fps  77.5KB/s  scan=410  decode=48261  idle=2014
+//   12.4fps  51.7KB/s  scan=431  decode=76416  idle=2202   <- last line before it died
+//
+// 40-76ms against a 2.8ms steady state is a 27x EXCURSION, not a baseline - and
+// idle falling 53ms -> 2ms per frame is the same event seen from the other side.
+// Whatever stalls the decode that hard is not this file's to fix, and it is not
+// JPEGDEC: a cost dominated by scattered PSRAM stores going 27x slower in bursts is
+// the PSRAM bus being taken away, and on this board it is. PSRAM here is octal and
+// shares the SPI controller with flash, and Espressif document that PSRAM is
+// disabled for the duration of a flash write - so anything that writes flash or NVS
+// while the panel is merely displaying buys a stall of exactly this shape, and a
+// long enough one is itself an int_wdt. That writer is being hunted elsewhere; what
+// this file must survive is the consequence. At 76ms of decode inside a 59-80ms
+// frame there is nothing left for core 0's idle task, and the flat floor cannot
+// help because 40ms is SHORTER than the work it was meant to space out - the decode
+// alone overruns it, so the test is already satisfied by the time it is reached.
+// updatemode.cpp records the same shape from the other direction: 22.8ms -> 66.1ms
+// per decoded frame and a task-watchdog reset 2.6s later.
+//
+// So the floor keeps the normal feed and a proportional budget bounds the
+// excursion. After a decode costing C the next one waits until C + C/GAP_DIVISOR
+// has passed since this one STARTED; the decode's own runtime counts against that
+// interval, so what is reserved is a gap of C/GAP_DIVISOR after it. Below ~30ms of
+// decode the floor is the larger of the two and this term does nothing whatsoever -
+// which, at 2.8ms a decode, is all of the time.
 //
 // s_viewing defaults true: until the monitor page reports otherwise the safe
 // assumption is that someone is watching. page_monitor.cpp drives it off the same
@@ -67,8 +122,30 @@ static volatile uint32_t s_dbg_kept = 0;    // tapped bytes this debug window
 static volatile bool s_viewing = true;
 // ~25fps ceiling on decodes while viewing. The native inline rate is ~16-20fps
 // (see the decode-cost note below), so this only caps a pathologically fast
-// sender and never touches the normal feed.
+// sender and never touches the normal feed. Still true at 2.8ms per decode, and
+// still the whole gate there; what it cannot do is bound an excursion, because a
+// decode dearer than the floor satisfies the floor by itself. Hence the divisor.
 static const uint32_t DECODE_MIN_INTERVAL_MS = 40;
+// The gap owed to core 0 after a decode, as a divisor of that decode's own cost:
+// 3 reserves a third of the cost, so a decode holds at most 3/4 of the wall clock
+// and a quarter of it is left for the idle task, lwIP RX and the watchdog however
+// dear the decode gets. Three, for two reasons that both come from measurement.
+//
+// It must not touch the feed. This term only exceeds the 40ms floor above 30ms of
+// decode (40 * 3/4), which is more than ten times the 2.8ms steady state, so in
+// normal operation it is not merely slack but inert. Even at the old ~31ms figure
+// it asks for a 41ms interval, still inside the sender's 50-59ms frame, so every
+// frame would still decode and the preview rate would be untouched. A divisor of 1
+// - half the clock - would demand 62ms at that cost, overshoot the sender's frame
+// and halve a preview the board could plainly afford.
+//
+// It must leave enough. The reset above happened with ~4% of the frame outside the
+// decode. A quarter is six times that, and it is the floor rather than the target:
+// dropping a frame can only lengthen the interval, never shorten it, so the
+// sustained duty cycle lands at or under 3/4 and the idle share at or over a
+// quarter. The single frame that discovers a new cost is the one exception, and it
+// is documented at the gate itself.
+static const uint32_t DECODE_GAP_DIVISOR = 3;
 // While the canvas is hidden, decode this rarely - just often enough to keep
 // camframe's last_ms inside LIVE_TIMEOUT_MS so camnet_live() stays true, and to
 // hand aijudge's 3-minute thumbnail peek a recent frame. ~2fps drops decode load
@@ -76,6 +153,44 @@ static const uint32_t DECODE_MIN_INTERVAL_MS = 40;
 // uplink request (plantrx.cpp:753) and aijudge's evidence peek (aijudge.cpp:294),
 // both of which would stop the moment last_ms went stale.
 static const uint32_t DECODE_HIDDEN_INTERVAL_MS = 500;
+
+// The cost the budget reacts to, in microseconds. Not an average of any kind: an
+// excursion is a handful of frames long, and a mean is the wrong instrument for
+// something that rare. A 3/4-weighted running mean fed one 76ms frame on top of a
+// 2.8ms history reads 21ms - under the 30ms engage threshold - so the whole
+// excursion would pass with the budget still asleep, which is precisely the
+// failure being fixed. So: attack instantly, release gradually. Each decode raises
+// this to its own cost if it is dearer, and otherwise decays it by a quarter.
+//
+// Decaying per DECODE rather than per millisecond is what keeps this honest about
+// "recent": from 76ms it is back under the 30ms threshold in four decoded frames
+// and back at the steady state in about eleven, so a decode that went long an hour
+// ago has been divided by 0.75 some tens of thousands of times and throttles
+// nothing. It also cannot feed on itself - a gated frame is not a decode, so it
+// neither raises this nor decays it, and the budget can only be sustained by
+// decodes that really are still expensive.
+static volatile uint32_t s_decode_cost_us = 0;
+// Frames this debug window whose decode the budget or the hidden rate dropped.
+// Printed rather than kept internal: idle falling through a floor is now something
+// this file ACTS on, and the [camnet] line is what made the starvation diagnosable
+// in the first place, so the reaction belongs beside the three numbers that caused
+// it instead of being inferred from them.
+static volatile uint32_t s_dbg_gated = 0;
+
+static void decode_cost_note(uint32_t us) {
+    uint32_t decayed = s_decode_cost_us - s_decode_cost_us / 4;
+    s_decode_cost_us = (us > decayed) ? us : decayed;
+}
+
+// The interval the next decode must wait for, measured from the start of the last
+// one. Whole milliseconds: the floor is in milliseconds, the gate is compared
+// against millis(), and a decode cheap enough for the microseconds to matter is a
+// decode this function is not gating anyway.
+static uint32_t decode_gate_ms(void) {
+    uint32_t cost_ms = s_decode_cost_us / 1000;
+    uint32_t budget_ms = cost_ms + cost_ms / DECODE_GAP_DIVISOR;
+    return (budget_ms > DECODE_MIN_INTERVAL_MS) ? budget_ms : DECODE_MIN_INTERVAL_MS;
+}
 
 // Puller task only. Kept out of the scan loop so the common path is one test.
 //
@@ -103,9 +218,14 @@ static void jpeg_keep(const uint8_t *src, size_t len) {
 // 9.5fps and 6.9fps against 15.7fps inline. Neither core has idle time to
 // overlap into — core 0 runs the WiFi stack and this puller, core 1 is LVGL
 // blitting at 30fps — so a split only adds a copy and pays for being preempted
-// mid-decode (measured decode time doubled from 31ms to 60ms on core 1). If a
-// future revision frees up a core, revisit; until then inline is both simpler
-// and faster.
+// mid-decode (measured decode time doubled from 31ms to 60ms on core 1). That
+// 31ms is not what a decode costs on this build: it measures 2.8ms today, and the
+// 40-76ms in the throttle note above is an excursion, not a return to it. So read
+// those three rates as one comparison taken under one baseline, whatever that
+// baseline was, rather than as figures to hold today's build against — the finding
+// is what stands, and it stands on the ratio: a split adds a copy and pays for
+// preemption, and both alternatives lost by a third or more. If a future revision
+// frees up a core, revisit; until then inline is both simpler and faster.
 //
 // Pull one MJPEG session: connect, request the endpoint, then carve complete
 // JPEGs out of the byte stream by scanning for SOI (FF D8) .. EOI (FF D9). This
@@ -202,24 +322,48 @@ static void pull_session(NetPuller *np, const IPAddress &ip) {
                 // through it. Kept ahead of and independent of the decode gate below
                 // so throttling or skipping the decode never starves the uplink.
                 if (s_want) jpeg_keep(np->jpeg_buf, got);
-                // Gate the decode. Viewing: at most ~25fps. Hidden: ~2fps keep-alive
-                // so camnet_live() and aijudge's peek stay fed while the ~31ms decode
-                // stops hammering core 0. A skipped frame leaves jpeg_buf untouched,
-                // so the next SOI just reuses it.
+                // Gate the decode. Viewing: the ~25fps floor, widened to
+                // decode_gate_ms() whenever a decode has just cost more than ~30ms,
+                // so an excursion cannot spend the whole frame in the decoder.
+                // Hidden: ~2fps keep-alive so camnet_live() and aijudge's peek stay
+                // fed while the decode stops touching core 0 at all. A skipped frame
+                // leaves jpeg_buf untouched, so the next SOI just reuses it.
+                //
+                // The gate is a skip and NOT a sleep, deliberately: the socket keeps
+                // draining at the sender's rate, so the frame that finally decodes is
+                // the freshest one rather than the head of a backlog, the tap above
+                // still sees every frame, and the sender's window never closes. The
+                // price is quantisation - the interval can only land on a frame
+                // boundary, so the realised gap rounds UP to the next one and the duty
+                // cycle settles at or under the 3/4 the divisor asks for, never over.
+                // Simulated against the sender's measured 59ms frame: a sustained 50ms
+                // decode gates every second frame for 8.5fps at 43% duty, a sustained
+                // 76ms one the same 8.5fps at 64%. The exception is the single frame
+                // that DISCOVERS a new cost - it runs against the old gate, so the
+                // first frame of an excursion can overrun its share, and the gate
+                // closes behind it. One 76ms frame is not a watchdog reset; the five
+                // four-second windows of them above were.
                 uint32_t now_ms = millis();
-                uint32_t floor_ms = s_viewing ? DECODE_MIN_INTERVAL_MS
-                                              : DECODE_HIDDEN_INTERVAL_MS;
-                if (last_decode_ms == 0 || now_ms - last_decode_ms >= floor_ms) {
+                uint32_t gate_ms = s_viewing ? decode_gate_ms()
+                                             : DECODE_HIDDEN_INTERVAL_MS;
+                if (last_decode_ms == 0 || now_ms - last_decode_ms >= gate_ms) {
                     last_decode_ms = now_ms;
                     uint32_t t_dec = micros();
                     camframe_submit(np->cf, np->jpeg_buf, got);
-                    s_us_decode += micros() - t_dec;
+                    // This decode's own cost sizes the next gate. Measured, not
+                    // predicted: whatever made this frame dear is still true one frame
+                    // later, and one frame is as far ahead as this can usefully see.
+                    uint32_t cost_us = micros() - t_dec;
+                    s_us_decode += cost_us;
+                    decode_cost_note(cost_us);
+                } else {
+                    s_dbg_gated++;
                 }
                 s_dbg_frames++;
                 in_frame = false;
                 // Hand core 0 back to its idle task for a tick on every complete
                 // frame, decoded or not: the loop otherwise only sleeps on an empty
-                // socket (:152), so a full send window kept it from ever yielding and
+                // socket (:273), so a full send window kept it from ever yielding and
                 // starved lwIP RX and the task watchdog on this core. Same rationale
                 // as the yields in ota.cpp:94-99 / fwpull.cpp:441-450.
                 vTaskDelay(pdMS_TO_TICKS(2));
@@ -293,7 +437,7 @@ bool camnet_live(void) {
 }
 
 // Monitor page -> puller. A plain volatile store: the puller reads it once per
-// frame to pick the decode floor, and a stale read costs at most one frame at the
+// frame to pick the decode gate, and a stale read costs at most one frame at the
 // wrong rate, so no fence or mutex is warranted.
 void camnet_set_viewing(bool viewing) {
     s_viewing = viewing;
@@ -346,17 +490,54 @@ void camnet_debug_tick(void) {
     // an IP is ours.
     char ip[20];
     camprov_cam_ip(ip, sizeof(ip));
-    uint32_t f = s_dbg_frames ? s_dbg_frames : 1;
+    // Read the pair once and together: the puller bumps gated immediately before
+    // frames, so a read that straddles those two lines can see gated == frames + 1.
+    uint32_t frames = s_dbg_frames, gated = s_dbg_gated;
+    uint32_t f = frames ? frames : 1;
+    // decode is per DECODED frame, not per pulled frame. s_us_decode only accrues on
+    // frames that reached the decoder, so dividing it by everything that arrived would
+    // report a fraction of the true cost exactly when the gate is dropping frames -
+    // that is, during the excursion this number exists to expose. It would also have
+    // divided the hidden-canvas windows by ten. Same class of error as the stale
+    // counter noted at the bottom of this function: a decode figure that describes no
+    // frame that was ever decoded.
+    uint32_t decoded = (frames > gated) ? frames - gated : 0;
+    uint32_t d = decoded ? decoded : 1;
     hlogf("[camnet] %.1ffps %.1fKB/s | scan=%lu decode=%lu idle=%lu us/frame "
                   "| tap=%luB | %s | cam=%s ip=%s\n",
-                  span ? (s_dbg_frames * 1000.0f / span) : 0.0f,
+                  span ? (frames * 1000.0f / span) : 0.0f,
                   span ? (s_dbg_bytes / (float)span) : 0.0f,
                   (unsigned long)(s_us_scan / f),
-                  (unsigned long)(s_us_decode / f),
+                  (unsigned long)(s_us_decode / d),
                   (unsigned long)(s_us_idle / f),
                   (unsigned long)s_dbg_kept,
                   camnet_live() ? "LIVE" : "offline",
                   camprov_cam_online() ? "online" : "offline", ip);
+
+    // When the gate is holding the feed down, say so and say why, on the line under
+    // the three numbers that caused it. Silent in normal operation by construction:
+    // at the 2.8ms steady state the budget sits on its floor and the sender's frame
+    // is longer than the floor, so nothing gets gated and nothing prints. A line here
+    // at all means either a decode went ten times long - the state that preceded the
+    // int_wdt reset, now readable while it is happening rather than reconstructible
+    // from a crash counter afterwards - or the sender has started outrunning 25fps.
+    // The hidden path is excluded: it gates ~90% of frames on purpose and would say
+    // nothing but that.
+    uint32_t gate_ms = decode_gate_ms();
+    if (s_viewing && (gated || gate_ms > DECODE_MIN_INTERVAL_MS)) {
+        hlogf("[camnet] decode gate holding the feed: cost=%lums -> gate=%lums "
+              "(floor %lums), %lu of %lu frames gated, %.1ffps decoded. %s\n",
+              (unsigned long)(s_decode_cost_us / 1000), (unsigned long)gate_ms,
+              (unsigned long)DECODE_MIN_INTERVAL_MS,
+              (unsigned long)gated, (unsigned long)frames,
+              span ? (decoded * 1000.0f / span) : 0.0f,
+              gate_ms > DECODE_MIN_INTERVAL_MS
+                  ? "That is the proportional budget: core 0 is kept at >=1/4 of the "
+                    "wall clock, which at this decode cost ungated measured ~4% and "
+                    "took an int_wdt reset."
+                  : "That is just the ~25fps floor - the sender is offering frames "
+                    "faster than the decode is allowed to run.");
+    }
 
     // The timing trio resets with the counters it is divided by. It did not, so
     // `s_us_decode / frames_this_window` was microseconds-since-boot over frames in
@@ -364,6 +545,6 @@ void camnet_debug_tick(void) {
     // that was ever decoded. It read 6,030,642 us/frame on a link running 20fps,
     // which is 52ms of budget - the number was six thousand percent of the whole
     // frame time and nobody could have acted on it.
-    s_dbg_bytes = s_dbg_frames = s_dbg_kept = 0;
+    s_dbg_bytes = s_dbg_frames = s_dbg_kept = s_dbg_gated = 0;
     s_us_scan = s_us_decode = s_us_idle = 0;
 }

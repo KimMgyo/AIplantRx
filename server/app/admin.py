@@ -1,4 +1,5 @@
-"""The operator's page: which board is running what, and the one button that changes it.
+"""The operator's page: which board is running what, why it last rebooted, and the one button
+that changes the first of those.
 
 Everything an update needed before this existed lived in two places that are no use from a
 phone - a curl against /v1/firmware/latest for what is published, and the panel's own firmware
@@ -7,6 +8,17 @@ arming a pull remotely (main.request_update_mode) is that the greenhouse is an h
 that endpoint was unusable from the only device an operator has out there. So this file answers
 one question - is each board running the published image, and if not, arm it - and answers it in
 a browser.
+
+It answers a SECOND question now, and it was added for the same reason as the first: the answer
+existed and was unreachable from a phone. The panel has been reporting its reset reason, a
+cumulative crash count and the panic handler's own record of the last crash for releases;
+store.py has been writing every one of them to disk; nothing ever read them back out. Three
+crashes went by - a panic, a task watchdog and an interrupt watchdog, on three different
+firmwares - and taught nobody anything, because the one diagnostic that names a crash was
+invisible unless you queried SQLite by hand. A fourth question came with it: the crash counter
+deliberately excludes power-ons, so a supply that dropped five times in ten minutes moved no
+number on this page at all and was found only by paging 1,916 rows of console. The device's NVS
+restart ring is what fixes that, and it is drawn beside the count rather than folded into it.
 
 Two things about its shape follow from that and are not accidents:
 
@@ -55,6 +67,11 @@ _FLAG_KEYS = ("update_mode", "firmware_pull", "node_pull_cam", "node_pull_node")
 # needs the deeper history has GET /v1/nodelog, which is what its limit= is for.
 _LOG_ROWS = 60
 
+# How many restart entries ride along per device. store.BOOT_READ is one of the device's own
+# rings exactly (eight, src/health.cpp HIST_MAX), which is the span the question is about: five
+# power-ons in ten minutes is visible in eight rows and no clearer in thirty.
+_BOOT_ROWS = store.BOOT_READ
+
 # Stable card order on the page: the panel first, because it is the board that carries the other
 # two, then cam, then node. all_device_fw() answers newest-recv_ts-first, which is the right order
 # for a table of raw rows and the wrong one for a page - a cam that happened to report a second
@@ -92,15 +109,45 @@ def _role_entry(row: dict, published: str) -> dict:
     }
 
 
-def _device_entry(device: str, last_seen: int, uptime_ms: int,
-                  rows: list[dict], published: dict[str, str]) -> dict:
+def _device_entry(known: dict, rows: list[dict], published: dict[str, str]) -> dict:
+    """One board's card: what is armed for it, what it runs, and why it last restarted.
+
+    `known` is a store.known_devices() row, or that same shape built by hand for a device with
+    firmware on file and no telemetry left to date it. It is taken as the row rather than as
+    three positional fields because of what the boot half contains: reset_reason and crashes are
+    None for a device that has written no telemetry, and a signature spelling them out as ints
+    would invite a 0 or a "power" that claims the board came up cleanly - which is the one thing
+    schema.Boot exists to stop guessing at.
+    """
+    device = str(known["device"])
     flags = store.peek_device_flags(device)
     rows = sorted(rows, key=lambda r: _ROLE_ORDER.get(str(r["role"]), len(_ROLE_ORDER)))
     return {
         "device": device,
-        "last_seen": int(last_seen),
-        "uptime_ms": int(uptime_ms),
+        "last_seen": int(known["last_seen"]),
+        "uptime_ms": int(known["uptime_ms"]),
         "flags": {key: bool(flags.get(key)) for key in _FLAG_KEYS},
+        # Why this board rebooted, which is the question the operator page could not answer at
+        # all until now: the device has been posting reset reasons, a crash count and the panic
+        # handler's own record for releases, store.py has been storing every one of them, and
+        # nothing ever read them back out. Three crashes went by teaching us nothing.
+        #
+        # All four keys are always present, null where nothing was reported, for the reason
+        # _FLAG_KEYS gives above - a key that comes and goes has the page rendering blanks with
+        # no error anywhere. `reset` and `crashes` come off the newest telemetry row; `crash` is
+        # the last poll that actually carried a dump, which is a different row and usually a much
+        # older one (see store.last_crash_report); `restarts` is the board's own NVS ring, which
+        # is the only one of the four that shows a power-cycling supply, because `crashes`
+        # deliberately does not count power-ons.
+        #
+        # Null does NOT mean healthy. schema.Boot says what it means: "nothing new to report",
+        # not "nothing ever crashed" - and the page must say it in those terms.
+        "boot": {
+            "reset": known["reset_reason"],
+            "crashes": known["crashes"],
+            "crash": store.last_crash_report(device),
+            "restarts": store.recent_device_boots(device, _BOOT_ROWS),
+        },
         "roles": [_role_entry(r, published.get(str(r["role"]), "")) for r in rows],
     }
 
@@ -131,17 +178,23 @@ def admin_state() -> dict[str, Any]:
     devices: list[dict] = []
     for known in store.known_devices():
         name = str(known["device"])
-        devices.append(_device_entry(name, known["last_seen"], known["uptime_ms"],
-                                     by_device.pop(name, []), pub_elf))
+        devices.append(_device_entry(known, by_device.pop(name, []), pub_elf))
 
     # A device with firmware rows and no telemetry left to date it. The two tables expire on
     # completely different terms - telemetry is pruned at TELEMETRY_TTL_S, device_fw is one row
     # per board that is only ever overwritten - so a panel that has been unplugged for longer
     # than a fortnight still has a version on file and nothing to say when it was last seen.
     # Dropping it would take the board off the page at exactly the moment somebody is looking
-    # for it; last_seen 0 says "no telemetry retained" and the roles carry their own recv_ts.
+    # for it; last_seen 0 says "no telemetry retained" and the roles carry their own recv_ts. The
+    # boot fields are None for the same reason and say the same thing - the rows that carried
+    # them have expired - except `restarts`, which _device_entry reads from device_boots and
+    # which does NOT expire with telemetry: one row per boot outlives the fortnight, so a board
+    # that has been off the air for three weeks can still say what kept restarting it.
     for name in sorted(by_device, key=lambda n: -max(int(r["recv_ts"]) for r in by_device[n])):
-        devices.append(_device_entry(name, 0, 0, by_device[name], pub_elf))
+        devices.append(_device_entry(
+            {"device": name, "last_seen": 0, "uptime_ms": 0,
+             "reset_reason": None, "crashes": None},
+            by_device[name], pub_elf))
 
     return {
         "ts": scheduler.now(),

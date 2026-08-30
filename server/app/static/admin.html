@@ -50,6 +50,18 @@ button[disabled] { background: #d3d6da; color: #71777f; }
 .why { font-size: 13px; color: #5b6169; margin: 6px 0 0; }
 .note { font-size: 13px; margin: 8px 0 0; padding: 8px 10px; border-radius: 8px;
         background: #fff5e2; color: #6b4400; }
+/* The panic record. Folded away in a <details> because it is the one thing on this card an
+   operator does not read - they read it to somebody else, or paste it into a decoder - so it
+   must be present and must not push the reason and the count off a phone screen. 44px on the
+   summary for the same reason every other control here is 44px: it is a tap target. */
+details.crash { margin: 8px 0 0; }
+details.crash > summary { min-height: 44px; display: flex; align-items: center;
+                         font-size: 13px; color: #5b6169; cursor: pointer; }
+/* pre-wrap, not pre: a backtrace is eight hex words and a horizontal scrollbar on a phone hides
+   most of them behind a gesture. Same reasoning as #con below. */
+pre.bt { margin: 4px 0 0; padding: 8px 10px; border-radius: 8px; background: #f4f5f7;
+         font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         white-space: pre-wrap; word-break: break-all; }
 ol#logs { list-style: none; margin: 0; padding: 0; max-width: 900px; }
 ol#logs li { background: #fff; border-radius: 8px; padding: 7px 10px; margin-bottom: 6px;
              font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace; word-break: break-word; }
@@ -123,8 +135,29 @@ var TITLE = { panel: "스크린", cam: "카메라 노드", node: "센서 노드"
 // it yet". This is the mapping that makes an armed pull visible: the flag lives on the panel's row
 // for all three boards, because the panel is the only one of them this server can reach.
 var ARMED = { panel: "update_mode", cam: "node_pull_cam", node: "node_pull_node" };
+// The reset reasons src/health.cpp's health_reset_name_of can send, glossed. The raw token is
+// kept beside the gloss on purpose: it is what the board prints in its own console and what
+// somebody grepping for this reboot will search for, so translating it away would leave the page
+// and the console describing the same event in two vocabularies. An unlisted reason renders as
+// the bare token rather than as "알 수 없음" - a firmware that grows a case must not have its new
+// answer hidden behind this page's ignorance of it.
+var RESET_KO = {
+  power: "전원 투입", ext: "외부 리셋", sw: "소프트웨어 재시작", panic: "패닉",
+  int_wdt: "인터럽트 워치독", task_wdt: "태스크 워치독", wdt: "워치독",
+  deepsleep: "딥슬립 복귀", brownout: "전압 강하", sdio: "SDIO", unknown: "알 수 없음"
+};
+// How many of the same reason in the ring is worth a sentence of its own. Three, because two of
+// anything is a coincidence and the case this exists for was five: a supply that dropped five
+// times in ten minutes moved no number on this page, because the crash counter deliberately
+// does not count power-ons, and it was found only by paging 1,916 rows of console.
+var REPEAT_NOTE_AT = 3;
 
 var notes = {};      // "device|role" -> the sentence a press left behind
+// Which boards' crash records the operator has unfolded. #cards is rebuilt from scratch every
+// five seconds, so a <details> whose state lived only in the DOM would snap shut under the thumb
+// of somebody in the middle of reading a backtrace out loud - the same failure the log list's
+// signature below exists to avoid, with a shorter fuse.
+var crashOpen = {};
 var logSig = null;   // identity of the log rows currently in the DOM
 var timer = null;
 
@@ -165,6 +198,106 @@ function fmtAge(sec) {
 // firmware log already print. It is enough to tell two builds apart by eye and short enough to sit
 // on a phone line; the full hash is in /v1/firmware/latest for anybody who needs to diff it.
 function shortVer(hex) { return hex ? hex.slice(0, 12) : "모름"; }
+
+// "전원 투입 (power)". Both halves, for the reason RESET_KO's comment gives.
+function resetText(r) {
+  if (!r) return "";
+  return RESET_KO[r] ? RESET_KO[r] + " (" + r + ")" : r;
+}
+
+// A span of seconds as a duration rather than an age - "10분 사이" against fmtAge's "10분 전".
+function fmtSpan(sec) {
+  if (sec < 60) return sec + "초";
+  if (sec < 3600) return Math.floor(sec / 60) + "분";
+  if (sec < 86400) return Math.floor(sec / 3600) + "시간";
+  return Math.floor(sec / 86400) + "일";
+}
+
+// The one sentence the restart list is for, or "" when there is nothing to say. The list itself
+// answers "what happened"; this answers "has it been happening a lot, and was it the same reason
+// each time", which is the question that took 1,916 rows of console to answer by hand.
+//
+// The span is stated ONLY when the entries were first heard at different times. Every entry a
+// board reports on its first poll after a reflash is stamped with that one poll's receipt time,
+// so their span is zero seconds - and "8회가 0초 사이" would be this page inventing a crisis out
+// of one honest timestamp. Absent a span the count still stands on its own.
+function restartNote(rs) {
+  var n = {}, top = rs[0].reason;
+  for (var i = 0; i < rs.length; i++) {
+    n[rs[i].reason] = (n[rs[i].reason] || 0) + 1;
+    if (n[rs[i].reason] > n[top]) top = rs[i].reason;
+  }
+  if (n[top] < REPEAT_NOTE_AT) return "";
+  // rs is newest first, so the last entry is the oldest one in the ring.
+  var span = rs[0].first_seen - rs[rs.length - 1].first_seen;
+  var s = "최근 재시작 " + rs.length + "번 중 " + n[top] + "번이 " + resetText(top) +
+          (span > 0 ? ", " + fmtSpan(span) + " 사이에 일어났습니다." : "입니다.");
+  if (top === "power") {
+    // Said plainly, and stopped short of a diagnosis. The FACT is worth saying because no other
+    // number on this card can: a power-on is not a crash, `crashes` is right not to count it, and
+    // repeated power-ons are therefore invisible everywhere else. The CAUSE is not settled - a
+    // supply that keeps dropping and a brownout during one of the board's own flash writes both
+    // arrive here as ESP_RST_POWERON - and a page that told the operator to go and buy a power
+    // supply would be spending their afternoon on a guess.
+    s += " 전원이 다시 들어오면서 부팅된 것으로 보고되었습니다. 크래시 횟수에는 잡히지 않으니 " +
+         "전원 공급과 보드 로그를 함께 확인하세요.";
+  }
+  return s;
+}
+
+// Why this board last rebooted, as the head card's second half. Ordered for one operator on a
+// phone asking exactly that: the reason and the count are the headline, the recent-restart list
+// is the pattern behind them, and the panic record is folded away as detail because it is read
+// out to somebody else rather than read here.
+//
+// EVERY absence is spelled out, and none of them may read as a clean bill of health. The device
+// sends its crash record only until a post carrying it is answered and then erases its copy
+// (src/health.cpp health_crash_reported), and a watchdog reset may leave no dump to send at all -
+// so "no crash record" means nothing new was reported, NOT that nothing ever crashed. That is
+// what server/app/schema.py's Boot block says, and it is said here in the same terms rather than
+// as a green badge this page has no right to draw.
+function bootBlock(dev) {
+  var b = dev.boot || {};
+  var out = ['<dl class="rows">'];
+  out.push('<div class="row"><dt>마지막 재시작</dt><dd>' +
+           (b.reset ? esc(resetText(b.reset)) : "보고 없음") + '</dd></div>');
+  out.push('<div class="row"><dt>누적 크래시</dt><dd>' +
+           (b.crashes === null || b.crashes === undefined
+              ? "보고 없음" : esc(String(b.crashes)) + "회") + '</dd></div>');
+  out.push('</dl>');
+
+  var rs = b.restarts || [];
+  if (rs.length) {
+    out.push('<p class="why">최근 재시작 (새 것부터, 서버가 처음 들은 시각)</p>');
+    out.push('<dl class="rows">' + rs.map(function (r) {
+      return '<div class="row"><dt>' + esc(resetText(r.reason)) +
+             '</dt><dd class="age" data-ts="' + r.first_seen + '"></dd></div>';
+    }).join("") + '</dl>');
+    var note = restartNote(rs);
+    if (note) out.push('<p class="note">' + esc(note) + '</p>');
+  } else {
+    // Not an empty history: a board whose firmware predates the restart ring sends no ring, and
+    // saying "재시작 없음" would turn a firmware that cannot answer into a board that never
+    // rebooted - which is the same mistake this whole card was added to stop making.
+    out.push('<p class="why">이 펌웨어는 재시작 목록을 보고하지 않습니다. ' +
+             '위의 마지막 재시작과 누적 크래시만 알 수 있습니다.</p>');
+  }
+
+  var c = b.crash;
+  if (c) {
+    out.push('<details class="crash" data-dev="' + esc(dev.device) + '"' +
+             (crashOpen[dev.device] ? " open" : "") + '><summary>크래시 기록 · ' +
+             esc(c.task) + ' · <span class="age" data-ts="' + c.ts + '"></span> 보고</summary>' +
+             '<dl class="rows">' +
+             '<div class="row"><dt>죽은 태스크</dt><dd>' + esc(c.task) + '</dd></div>' +
+             '<div class="row"><dt>예외 PC</dt><dd>' + esc(c.pc) + '</dd></div>' +
+             '</dl><pre class="bt">' + esc(c.bt || "") + '</pre></details>');
+  } else {
+    out.push('<p class="why">새로 보고된 크래시 기록이 없습니다. ' +
+             '지금까지 크래시가 없었다는 뜻은 아닙니다.</p>');
+  }
+  return out.join("");
+}
 
 function armEndpoint(device, role) {
   var d = encodeURIComponent(device);
@@ -259,6 +392,9 @@ function render(st) {
       head += '<p class="why">이 보드의 펌웨어는 아직 버전을 보고하지 않습니다. ' +
               '한 번 업데이트하면 이 페이지에 카드가 나타납니다.</p>';
     }
+    // After the firmware note and not before it, because that note is about this card being
+    // empty and the boot block is the card's content.
+    head += bootBlock(dev);
     out.push(head + '</section>');
     dev.roles.forEach(function (role) { out.push(roleCard(dev, role)); });
   });
@@ -320,6 +456,16 @@ document.getElementById("forget").addEventListener("click", function () {
 });
 
 document.getElementById("cards").addEventListener("click", function (ev) {
+  // The crash record's fold, remembered before the button branch because it is not a button. A
+  // `toggle` event would be the obvious listener and does not bubble, so this delegates on the
+  // click that causes it: at click time the element still holds its OLD state, so the value to
+  // remember is the negation of it.
+  var sum = ev.target.closest("details.crash > summary");
+  if (sum) {
+    var det = sum.parentNode;
+    crashOpen[det.getAttribute("data-dev")] = !det.open;
+    return;
+  }
   var btn = ev.target.closest("button[data-role]");
   if (!btn || btn.disabled) return;
   var dev = btn.getAttribute("data-dev"), role = btn.getAttribute("data-role");

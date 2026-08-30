@@ -700,6 +700,14 @@ async def telemetry(t: Telemetry) -> Prescription:
     # claiming a version nobody reported.
     if t.images:
         store.save_device_fw(t.device, t.images, scheduler.now())
+    # The restart ring, on the same terms and for the same reason: a fact the device reported,
+    # stored outside the sanity gate. save_telemetry is behind telemetry_is_sane, and a board
+    # that is rebooting repeatedly is a strong candidate for a board whose sensors are not
+    # answering either - so gating this would drop exactly the restart history of the board it
+    # exists to explain. Idempotent by design: the device re-sends its whole ring every poll and
+    # store.save_device_boots ignores the entries it already has.
+    if t.boot is not None:
+        store.save_device_boots(t.device, t.boot.boots, t.boot.restarts, scheduler.now())
     armed, pull = store.take_update_mode(t.device)
     if armed:
         log.info("update mode: handing the flag to %s (%s)", t.device,
