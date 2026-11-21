@@ -6,6 +6,8 @@
 #include "net.h"
 #include "nodes.h"
 #include "settings.h"
+#include "identify.h"
+#include "aitalk.h"
 #include <math.h>
 #include <time.h>
 
@@ -25,9 +27,12 @@ static struct {
     uint32_t seq[2], lanes_sig, tick, cam_t, slow_t;
     bool th_have;
     ThermalGrid grid;
+    uint32_t prof_since;            // the profile this screen was built with
+    uint32_t ai_gen, ai_age_t;
+    lv_img_dsc_t thumb;
 } M;
 
-static int text_w(const lv_font_t *f, const char *t) {
+int text_w(const lv_font_t *f, const char *t) {
     lv_point_t p;
     lv_txt_get_size(&p, t, f, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     return p.x;
@@ -150,9 +155,13 @@ static void run_update() {
     const Profile &p = g_prof;
     const char *t;
     Col c{P->ok_text, LV_OPA_COVER};
-    if (!s.live) {
+    const char *alert = ai_alert();
+    if (!s.live && !*alert) {
         t = "센서 노드를 기다리는 중";
         c = P->text2;
+    } else if (*alert) {
+        t = alert;
+        c = Col{P->warn_text, LV_OPA_COVER};
     } else if (!isnan(s.soil_pct) && s.soil_pct < p.soil_lo) {
         t = s.water ? "흙이 말라서 물 주는 중" : "흙이 말랐어요";
         c = Col{P->warn_text, LV_OPA_COVER};
@@ -272,6 +281,44 @@ static void vtick(lv_timer_t *) {
 }
 
 // Everything else. Each call below changes (and redraws) only what differs.
+// ---------------------------------------------------------------- AI note card (UI.md 6.3)
+
+static void age(char *o, size_t n, uint32_t at) {
+    time_t t = time(nullptr);
+    uint32_t now = t > 1700000000 ? (uint32_t)t : millis() / 1000;
+    uint32_t d = now > at ? now - at : 0;
+    if (d < 60) strlcpy(o, "방금", n);
+    else if (d < 3600) snprintf(o, n, "%lu분 전", (unsigned long)(d / 60));
+    else snprintf(o, n, "%lu시간 전", (unsigned long)(d / 3600));
+}
+
+static void ai_card() {
+    bool fresh = ai_gen() != M.ai_gen;
+    if (!fresh && lv_tick_elaps(M.ai_age_t) < 30000) return;   // the age in the bubble moves on
+    M.ai_gen = ai_gen();
+    M.ai_age_t = lv_tick_get();
+    AiNote n = ai_note();
+    if (!n.state) return;   // nothing said yet: the grey placeholder stays, with no model or bubble
+    char b[400];
+    if (n.state == 1) {
+        snprintf(b, sizeof b, "%s|", n.text);
+        set_text(M.ai_text, b);
+        set_text(M.ai_meta, "쓰는 중");
+    } else {
+        set_text(M.ai_text, n.marked);
+        snprintf(b, sizeof b, "Bonsai 2 · %.1f초", n.ms / 1000.0f);
+        set_text(M.ai_meta, b);
+    }
+    set_col(M.ai_text, P->text);
+    char a[24];
+    age(a, sizeof a, n.at);
+    snprintf(b, sizeof b, "%s · %s", n.why, n.state == 1 ? "방금" : a);
+    lv_obj_t *l = lv_obj_get_child(M.ai_why, 0);
+    set_text(l, b);
+    lv_obj_set_style_text_color(l, n.warn ? P->warn_text : P->text.c, 0);
+    show(M.ai_why, true);
+}
+
 static void slow_update() {
     M.tick++;
     char buf[48];
@@ -279,6 +326,12 @@ static void slow_update() {
     bool moved = set_text(M.time, buf);
     fmt_date(buf, sizeof buf);
     moved |= set_text(M.date, buf);
+    ai_card();
+    // A plant was found while the result sheet was already closed: build again with the new profile.
+    if (g_prof.since != M.prof_since && !sheet_open() && !find_busy()) {
+        M.prof_since = g_prof.since;
+        lv_async_call([](void *) { ui_rebuild_main(); }, nullptr);
+    }
     if (moved) lv_obj_align_to(M.date, M.time, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
     bool up[4] = {net_state() == NET_UP, llm_ok(), node_info(ROLE_CAM).online, node_info(ROLE_NODE).online};
     for (int i = 0; i < 4; i++) set_col(M.icons[i], up[i] ? P->status : P->text3);
@@ -338,16 +391,14 @@ static void slow_update() {
 static void gear_ev(lv_event_t *) { ui_show_settings(0); }
 
 static void find_ev(lv_event_t *) {
-    if (!node_info(ROLE_CAM).online)
-        sheet_info("식물 찾기", "카메라를 찾는 중이에요. 카메라가 켜지면 사진을 찍어 PlantNet과 AI가 식물을 알아봅니다.");
-    else if (!g_set.plantnet_key.length())
-        sheet_info("식물 찾기", "설정 > PlantNet에 API 키를 넣으면 식물을 찾을 수 있어요.");
-    else
-        sheet_info("식물 찾기", "카메라와 PlantNet 키가 준비됐어요. 식물 찾기는 다음 펌웨어에 들어갑니다.");
+    char why[160];
+    if (find_busy() || find_start(why, sizeof why)) find_sheet_open();
+    else sheet_info("식물 찾기", why);
 }
 
 static void kind_ev(lv_event_t *) {
-    sheet_info("종류 바꾸기", "식물을 한 번 찾으면 PlantNet 후보와 최근 식물 중에서 고를 수 있어요.");
+    if (find_busy()) find_sheet_open();
+    else kind_sheet_open();
 }
 
 // ---------------------------------------------------------------- build
@@ -425,7 +476,17 @@ lv_obj_t *main_build() {
     // plant
     const Profile &p = g_prof;
     lv_obj_t *ph = fill(L, 0, 30, 68, 68, P->plat, 18);
-    lv_obj_center(labelc(ph, &i40, lv_color_hex(0x30D158), F7_LEAF_ARROW_CIRCLEPATH));
+    const uint16_t *th = p.identified ? find_thumb() : nullptr;
+    if (th) {   // the picture taken when the plant was found (identify.cpp)
+        lv_obj_set_style_clip_corner(ph, true, 0);
+        M.thumb.header.cf = LV_IMG_CF_TRUE_COLOR;
+        M.thumb.header.w = 68;
+        M.thumb.header.h = 68;
+        M.thumb.data_size = 68 * 68 * 2;
+        M.thumb.data = (const uint8_t *)th;
+        lv_img_set_src(lv_img_create(ph), &M.thumb);
+    } else lv_obj_center(labelc(ph, &i40, lv_color_hex(0x30D158), F7_LEAF_ARROW_CIRCLEPATH));
+    M.prof_since = p.since;
     M.name = label(L, &f_b32, P->text, p.identified ? p.name_ko : "식물을 찾아 주세요");
     lv_obj_set_style_text_letter_space(M.name, -1, 0);
     lv_obj_set_pos(M.name, 82, 27);

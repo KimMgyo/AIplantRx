@@ -103,6 +103,8 @@ static int n_ok() {
     return k;
 }
 
+static volatile bool relay = false;   // the S3 upload relay is running (see relay_start)
+
 // ---------------------------------------------------------------- sensor node
 
 static NodeView s_view;                 // written by node_task, copied by the drawing loop
@@ -202,6 +204,10 @@ static void node_task(void *) {
     uint32_t t_state = 0, t_th = 0;
     for (;;) {
         uint32_t now = millis();
+        if (relay) {   // the S3 upload relay gets the (single) core to itself
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
         AipPeer p;
         bool found = !aipnode_ota_busy() && aipnode_wifi_up() && aipnode_peer("node", &p, 20000);
         if (found) strlcpy(s_node_ip, p.ip.toString().c_str(), sizeof s_node_ip);
@@ -345,7 +351,6 @@ static size_t relay_log_n = 0;
 static uint32_t relay_banner_ms = 0;
 static int relay_selftest = 0;
 static uint32_t relay_found_baud = 0;
-static volatile bool relay = false;
 static uint32_t relay_t = 0, relay_up = 0, relay_down = 0, relay_baud = 115200, pending_baud = 0, relay_count = 0;
 static Slip slip_pc, slip_s3;
 
@@ -382,6 +387,9 @@ static int sync_test(int tries) {
 
 static void relay_start() {
     relay = true;
+    // One core: with Wi-Fi, the node polling and the HTTP server also running, esptool's 4 KB blocks
+    // stalled long enough for "The chip stopped responding" (2026-11-21, twice at 460800 and 115200).
+    vTaskPrioritySet(nullptr, 10);
     relay_count++;
     relay_t = millis();
     relay_up = relay_down = pending_baud = 0;
@@ -498,6 +506,7 @@ static void relay_loop() {
     }
     if (now - relay_t > 8000) {  // esptool finished or gave up
         relay = false;
+        vTaskPrioritySet(nullptr, 1);
         Serial0.updateBaudRate(115200);
         Serial.setTxTimeoutMs(USB_TX_TIMEOUT_MS);
         delay(2000);  // let the S3 app boot before the C3 talks to it again

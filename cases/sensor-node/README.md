@@ -6,7 +6,7 @@ PC 케이스 상판의 140 mm 팬(라디에이터) 자리에 거꾸로 매달려
 
 ![커넥터 면](out/preview/node_connector_face.png)
 
-배선도: [out/wiring.html](out/wiring.html) (SVG: out/wiring.svg, 생성: wiring.py)
+배선도와 devkit 핀 지도: [out/wiring.html](out/wiring.html) (SVG: out/wiring.svg, out/devkit_pins.svg, 생성: wiring.py)
 ![센서면](out/preview/node_sensor_face.png)
 ![센서면 비스듬히](out/preview/node_sensor_face_3q.png)
 ![내부](out/preview/node_inside_3q.png)

@@ -417,21 +417,23 @@ class Cam:
                 log("cam", "no .jpg/.png in %s: using rgb.png" % Cfg.photos)
         return RGB
 
-    def jpeg(self, path, w, h):
-        key = (path, os.path.getmtime(path), w, h)
+    def jpeg(self, path, w, h, q=12):
+        # q is the OV2640's jpeg_quality (4..63, lower = better); 12 ~ Pillow quality 70.
+        quality = max(20, min(95, int(100 - q * 2.5)))
+        key = (path, os.path.getmtime(path), w, h, quality)
         if key not in self.cache:
             im = Image.open(path)
             im.draft("RGB", (max(w, h), max(w, h)))
             im = ImageOps.exif_transpose(im).convert("RGB")
             im = ImageOps.fit(im, (w, h), Image.Resampling.LANCZOS)
             b = io.BytesIO()
-            im.save(b, "JPEG", quality=85)
+            im.save(b, "JPEG", quality=quality)
             self.cache[key] = b.getvalue()
             while len(self.cache) > 12:
                 self.cache.popitem(last=False)
         return self.cache[key]
 
-    def capture(self, size):
+    def capture(self, size, q=12):
         w, h = SIZES[size]
         with self.lock:
             t0 = time.time()
@@ -439,7 +441,7 @@ class Cam:
             n = self.captures
             src = self.source(n)
             fail = Cfg.capture_fail > 0 and n % Cfg.capture_fail == 0
-            body = None if fail else self.jpeg(src, w, h)
+            body = None if fail else self.jpeg(src, w, h, q)
             time.sleep(max(0.0, 1.5 + random.uniform(-0.1, 0.3) - (time.time() - t0)))
             took = time.time() - t0
         if fail:
@@ -604,7 +606,7 @@ class Node:
         f += 5.0 * np.exp(-(((GX - hx) / 3.0) ** 2 + ((GY - hy) / 2.0) ** 2))
         f += self.rng.normal(0, 0.08, f.shape)
         raw = np.round(f * 100).astype("<i2")
-        box = np.sort(raw[6:18, 8:24], axis=None)          # columns 8..23, rows 6..17
+        box = np.sort(raw[4:15, 9:23], axis=None)          # columns 9..22, rows 4..14 (INTERFACES.md 2)
         self.thermal = raw.tobytes()
         self.th = (int(box[box.size // 2]) / 100.0, int(raw.max()) / 100.0, int(raw.min()) / 100.0)
 
@@ -995,7 +997,13 @@ class CamHandler(Handler):
         size = (self.query.get("size") or ["uxga"])[0].lower() or "uxga"
         if size not in SIZES:
             return self.send(400, "size must be uxga or sxga")
-        body = self.cam.capture(size)
+        try:
+            q = int((self.query.get("q") or ["12"])[0])
+        except ValueError:
+            return self.send(400, "q must be 4..63")
+        if not 4 <= q <= 63:
+            return self.send(400, "q must be 4..63")
+        body = self.cam.capture(size, q)
         if body is None:
             return self.send(503, "capture failed")
         self.send(200, body, "image/jpeg")

@@ -1,4 +1,6 @@
 #include "fwupdate.h"
+#include "identify.h"
+#include "nodes.h"
 #include "app.h"
 #include "lvgl_v8_port.h"
 #include "net.h"
@@ -191,10 +193,12 @@ static bool check() {
     http_cfg(c, FWU_MANIFEST_URL);
     c.event_handler = on_http;
     c.user_data = &b;
+    if (!tls_lock(60000)) { free(b.buf); set_state(FWU_FAIL, "다른 연결이 끝나지 않음"); return false; }
     esp_http_client_handle_t h = esp_http_client_init(&c);
     esp_err_t err = esp_http_client_perform(h);
     int code = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
+    tls_unlock();
     char e[64] = "";
     bool ok = false;
     if (err != ESP_OK) snprintf(e, sizeof e, "연결 실패 · %s", esp_err_to_name(err));
@@ -268,6 +272,8 @@ static bool partition_sha_ok(const esp_partition_t *p, uint32_t size) {
 static void install() {
     if (s_info.state != FWU_AVAILABLE) return;
     Serial.printf("[fwu] installing %s (%u bytes)\n", s_info.latest, (unsigned)s_size);
+    cam_set_wanted(false);   // free core 0 and the radio for the download
+    nodes_pause(true);
     s_info.pct = 0;
     set_state(FWU_INSTALLING);
     progress_ui(0, "받는 중");
@@ -280,6 +286,8 @@ static void install() {
     oc.http_config = &hc;
     esp_https_ota_handle_t h = nullptr;
     uint32_t t0 = millis();
+    bool locked = !e[0] && tls_lock(60000);
+    if (!e[0] && !locked) strlcpy(e, "다른 연결이 끝나지 않음", sizeof e);
     if (!e[0]) {
         esp_err_t err = esp_https_ota_begin(&oc, &h);
         if (err != ESP_OK) snprintf(e, sizeof e, "받기 시작 실패 · %s", esp_err_to_name(err));
@@ -312,9 +320,12 @@ static void install() {
         if (err != ESP_OK) snprintf(e, sizeof e, "이미지 확인 실패 · %s", esp_err_to_name(err));
     }
     if (h) esp_https_ota_abort(h);
+    if (locked) tls_unlock();
     if (e[0]) {
         Serial.printf("[fwu] install failed: %s\n", e);
         set_state(FWU_FAIL, e);
+        nodes_pause(false);
+        cam_set_wanted(true);
         if (lvgl_port_lock(200)) { ui_update_overlay_close(); lvgl_port_unlock(); }
         return;
     }
@@ -340,6 +351,8 @@ static void task(void *) {
     uint32_t next = FIRST_CHECK_MS;
     for (;;) {
         if (s_req_install) { s_req_install = false; install(); }
+        // Not while a plant is being found: two TLS connections do not fit in internal RAM.
+        if (!s_req_check && (int32_t)(millis() - next) >= 0 && find_busy()) next = millis() + 60000;
         if (s_req_check || (int32_t)(millis() - next) >= 0) {
             s_req_check = false;
             bool ok = check();

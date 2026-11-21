@@ -28,6 +28,6 @@ cases/*/research/
 /dist/
 
 # Real plant photos for the fake CAM's /capture (fake_nodes.py --photos); kept local, see the README there
-firmware/s3/tools/photos/*.jpg
-firmware/s3/tools/photos/*.jpeg
-firmware/s3/tools/photos/*.png
+firmware/s3/tools/photos/**/*.jpg
+firmware/s3/tools/photos/**/*.jpeg
+firmware/s3/tools/photos/**/*.png

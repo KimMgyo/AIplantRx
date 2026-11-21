@@ -16,3 +16,18 @@ struct LlmTest {
 void llm_test_start();
 LlmTest llm_test();
 bool llm_ok();          // the last request succeeded, within 10 minutes
+
+// One chat completion constrained to a JSON schema (prompts.h). Requests go one at a time (the server has
+// one slot, UI.md 6.1): a caller waits up to wait_ms for the previous one. content gets the model's JSON
+// text; on failure err gets a short Korean reason and the result is false.
+#include <WString.h>
+bool llm_chat(const char *system, const char *user, const char *schema_json, const char *schema_name, int max_tokens,
+              float temperature, String &content, char *err, size_t errn, uint32_t timeout_ms = 20000,
+              uint32_t wait_ms = 30000);
+
+// Streamed chat completion with a GBNF grammar (the AI note, UI.md 6.3). piece() gets each new bit of text
+// as it arrives; all gets the whole text. Gives up when nothing has arrived after first_ms.
+typedef void (*llm_piece_fn)(const char *piece, void *user);
+bool llm_stream(const char *system, const char *user, const char *grammar, int max_tokens, float temperature, float top_p,
+                llm_piece_fn piece, void *arg, String &all, char *err, size_t errn, uint32_t first_ms = 4000,
+                uint32_t total_ms = 20000);

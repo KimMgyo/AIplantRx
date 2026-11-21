@@ -9,6 +9,8 @@
 #include "app.h"
 #include "devsrv.h"
 #include "fwupdate.h"
+#include "identify.h"
+#include "aitalk.h"
 #include "lvgl_v8_port.h"
 #include "net.h"
 #include "nodes.h"
@@ -51,6 +53,7 @@ void setup() {
     gpio_install_isr_service(0);
     Serial.printf("\n=== AIplantRx S3 %s ===\n", FW_VERSION);
     settings_load();
+    find_init();          // LittleFS: the main screen reads the plant picture from it
 
     board = new Board();
     board->init();
@@ -87,6 +90,7 @@ void setup() {
     devsrv_init();
     devsrv_serial_init();
     fwu_init();
+    ai_init();
     delay(200);
     if (bl) bl->on();
     Serial.printf("[boot] ui ready, heap int=%u psram=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

@@ -25,3 +25,9 @@ uint32_t net_gen();             // bumps whenever state or scan results change
 
 // Join a network. The saved one is replaced only after this one gives us an address.
 void net_join(const char *ssid, const char *pass);
+
+// One TLS connection at a time. Each needs ~40 KB of internal RAM for mbedTLS (the prebuilt framework
+// allocates it there), and two at once (Pl@ntNet upload + the update check, 2026-11-21) ran it out:
+// mbedtls_ssl_setup -0x7F00. Pl@ntNet, the LLM and the firmware update take this first.
+bool tls_lock(uint32_t wait_ms);
+void tls_unlock();

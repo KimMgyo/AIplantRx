@@ -4,7 +4,7 @@
 Settings g_set;
 Profile g_prof;
 
-static const uint8_t PROFILE_VER = 1;
+static const uint8_t PROFILE_VER = 2;
 
 void profile_default(Profile &p) {
     memset(&p, 0, sizeof(p));
@@ -16,6 +16,8 @@ void profile_default(Profile &p) {
     p.ec_lo = 0.8f; p.ec_hi = 1.4f; p.ph_lo = 5.5f; p.ph_hi = 6.5f;
     p.light_on_h = 6; p.light_off_h = 18;
     p.nutr_days = 14; p.nutr_ml = 10; p.water_ml = 100;
+    p.water_days = 3;
+    strlcpy(p.group, "tropical_foliage", sizeof(p.group));
 }
 
 void settings_load() {

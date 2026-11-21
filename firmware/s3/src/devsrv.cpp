@@ -1,5 +1,6 @@
 #include "devsrv.h"
 #include "fwupdate.h"
+#include "nodes.h"
 #include "app.h"
 #include "lvgl_v8_port.h"
 #include "net.h"
@@ -68,8 +69,8 @@ static void h_info() {
     // Why the last boot happened and how close each task came to its stack end, so a crash can be told
     // apart from a power dip without a USB cable (1 power-on, 3 software, 4 panic, 5/6/7 watchdogs,
     // 9 brownout).
-    static const char *TASKS[] = {"lvgl", "cam", "jpeg", "node", "disc", "net", "dev", "llm", "fwu"};
-    char st[160] = "";
+    static const char *TASKS[] = {"lvgl", "cam", "jpeg", "node", "disc", "net", "dev", "llm", "fwu", "find", "ai"};
+    char st[200] = "";
     int k = 0;
     for (const char *t : TASKS) {
         TaskHandle_t h = xTaskGetHandle(t);
@@ -77,13 +78,13 @@ static void h_info() {
     }
     char fw[200];
     fwu_json(fw, sizeof fw);
-    char b[780];
+    char b[860];
     snprintf(b, sizeof b,
-             "{\"name\":\"%s\",\"ver\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap_int\":%u,\"heap_int_min\":%u,\"psram\":%u,\"uptime_s\":%lu,"
+             "{\"name\":\"%s\",\"ver\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap_int\":%u,\"heap_int_min\":%u,\"psram\":%u,\"psram_big\":%u,\"uptime_s\":%lu,"
              "\"reset\":%d,\"stack_free\":{%s},\"fw\":%s}",
              APP_HOST, FW_VERSION, net_ip().c_str(), net_rssi(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned long)(millis() / 1000), (int)esp_reset_reason(), st, fw);
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), (unsigned long)(millis() / 1000), (int)esp_reset_reason(), st, fw);
     s_srv.send(200, "application/json", b);
 }
 
@@ -208,9 +209,11 @@ static void srv_task(void *) {
             s_srv.begin();
             ArduinoOTA.setHostname(APP_HOST);
             ArduinoOTA.setMdnsEnabled(false);       // net.cpp owns mDNS
-            ArduinoOTA.onStart([]() { s_ota = 0; });
+            // The video decode shares core 0 with this task: with it running, a 4.6 MB espota took over 6 min
+            // instead of 44 s (2026-11-21). Stop the camera and the node polling for the upload.
+            ArduinoOTA.onStart([]() { s_ota = 0; cam_set_wanted(false); nodes_pause(true); });
             ArduinoOTA.onProgress([](unsigned d, unsigned t) { s_ota = t ? d * 100 / t : 0; });
-            ArduinoOTA.onError([](ota_error_t) { s_ota = -1; });
+            ArduinoOTA.onError([](ota_error_t) { s_ota = -1; cam_set_wanted(true); nodes_pause(false); });
             ArduinoOTA.onEnd([]() { s_ota = 100; });
             ArduinoOTA.begin();
             MDNS.enableArduino(3232);

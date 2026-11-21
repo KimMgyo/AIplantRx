@@ -17,7 +17,18 @@ tip_ko: one complete Korean sentence of care advice, under 50 characters.)P";
 static const char PROMPT_PROFILE_SCHEMA[] = R"P({"type":"object","additionalProperties":false,"required":["korean_name","group","temp_day_c","temp_night_c","humidity_pct","soil_moisture_pct","soil_ec_ms_cm","soil_ph","light_on","light_off","water_interval_days","water_ml","nutrient_interval_days","nutrient_ml","tip_ko"],"properties":{"korean_name":{"type":"string","maxLength":20},"group":{"type":"string","enum":["succulent","tropical_foliage","fern_humid","herb","leafy_veg","fruiting_veg","temperate_foliage","flowering"]},"temp_day_c":{"$ref":"#/$defs/r"},"temp_night_c":{"$ref":"#/$defs/r"},"humidity_pct":{"$ref":"#/$defs/r"},"soil_moisture_pct":{"$ref":"#/$defs/r"},"soil_ec_ms_cm":{"$ref":"#/$defs/r"},"soil_ph":{"$ref":"#/$defs/r"},"light_on":{"type":"string","pattern":"^([01][0-9]|2[0-3]):[0-5][0-9]$"},"light_off":{"type":"string","pattern":"^([01][0-9]|2[0-3]):[0-5][0-9]$"},"water_interval_days":{"type":"integer","minimum":1,"maximum":30},"water_ml":{"type":"integer","minimum":10,"maximum":500},"nutrient_interval_days":{"type":"integer","minimum":1,"maximum":60},"nutrient_ml":{"type":"integer","minimum":0,"maximum":50},"tip_ko":{"type":"string","maxLength":80}},"$defs":{"r":{"type":"object","additionalProperties":false,"required":["min","max"],"properties":{"min":{"type":"number"},"max":{"type":"number"}}}}})P";
 
 // 2. Short introduction for the result sheet (UI.md 3), asked right after the profile is applied.
-static const char PROMPT_INTRO_SYSTEM[] = R"P(Write a short Korean introduction of the given plant for a visitor looking at a small indoor plant box: 2 plain sentences, at most 100 characters in total.
+static const char PROMPT_INTRO_SYSTEM[] = R"P(Write a short Korean introduction of the given plant for a visitor looking at a small indoor plant box: 2 plain sentences, at most 100 characters in total. Never write the plant's name (it is shown right above): start with what kind of plant it is, for example 열대 관엽식물로.
 Use only facts you are certain of: what kind of plant it is (use the given group), how it looks, or how it is commonly used or grown. Do not name its plant family, its origin or any number. If unsure, describe its care needs from the given profile instead. Correct, natural Korean; no lists, emoji or greeting.)P";
 
 static const char PROMPT_INTRO_SCHEMA[] = R"P({"type":"object","additionalProperties":false,"required":["intro_ko"],"properties":{"intro_ko":{"type":"string","maxLength":120}}})P";
+
+// 4. AI note (UI.md 6.3): one to three sentences about what just happened, streamed into the main card.
+// The user message is a JSON object (trigger, plant, values, targets, recent device runs, what was said).
+// The grammar keeps it to one line of 12-100 characters.
+static const char PROMPT_TALK_SYSTEM[] = R"P(You are the voice of a small indoor plant box, talking to visitors in Korean. The message is JSON: trigger (why you speak now), the plant, current readings, targets, recent device runs and what you said recently.
+Write 1 to 3 short Korean sentences in polite 해요체, at most 100 characters, one line.
+Never write the plant's name (the screen shows it; the model misspells it): say 이 식물 or leave it out. The first sentence must be about the trigger. Use only numbers from trigger and the current readings, or simple differences between them (never numbers from "said"), 1 to 3 numbers, with their units (°C, %, ml, ppm). Do not repeat or start like anything in "said". The box has only a light, a water pump, a fertiliser pump and a pH pump: never mention a heater, humidifier, fan or air conditioner. Suggest only things a person can do. No emoji, no lists.)P";
+
+// One line of 12-100 characters with no Chinese or Japanese characters (the model slipped "今晚肥料"
+// into a Korean note on 2026-11-21).
+static const char TALK_GRAMMAR[] = "root ::= [^\\n\\u3040-\\u30FF\\u3400-\\u4DBF\\u4E00-\\u9FFF]{12,100}";

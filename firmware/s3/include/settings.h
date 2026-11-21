@@ -35,6 +35,14 @@ struct Profile {
     uint8_t light_on_h, light_on_m, light_off_h, light_off_m;
     uint8_t nutr_days, nutr_ml;
     uint16_t water_ml;
+    // v2 (2026-11-21, identify.cpp)
+    uint8_t water_days;         // watering by the calendar when the soil probe is out
+    bool llm;                   // targets from the LLM (full control); false: default profile rules
+    char group[20];             // care group key (prompts.h), "" unknown
+    char genus[32];
+    char family_ko[24];
+    char tip[128];              // one-line care tip (LLM)
+    char intro[256];            // the result sheet's introduction
 };
 
 extern Settings g_set;

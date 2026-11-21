@@ -1,4 +1,5 @@
 #include "nodes.h"
+#include <freertos/idf_additions.h>
 #include "app.h"
 #include "net.h"
 #include "perf.h"
@@ -121,6 +122,9 @@ static uint16_t *s_dst;                 // decode target, one frame
 static int s_dst_w, s_dst_h;
 
 void cam_set_wanted(bool on) { s_cam_wanted = on; }
+
+static volatile bool s_node_paused;
+void nodes_pause(bool on) { s_node_paused = on; }
 bool cam_live() { return s_cam_ok_ms && millis() - s_cam_ok_ms < 3000; }
 const uint16_t *cam_take(uint32_t *seq) { return s_cam.take(seq); }
 uint32_t cam_seq() { return s_cam.seq; }
@@ -358,7 +362,7 @@ static void node_task(void *) {
     Http h;
     for (;;) {
         NodeInfo n = node_info(ROLE_NODE);
-        if (!n.online || net_state() != NET_UP) { h.drop(); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+        if (!n.online || net_state() != NET_UP || s_node_paused) { h.drop(); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
         uint32_t t0 = millis();
         if (millis() - last_state > 1000) {
             last_state = millis();
@@ -393,8 +397,10 @@ void nodes_init() {
         s_jpg[k].buf = (uint8_t *)ps_malloc_or_null(JCAP);
         if (s_jpg[k].buf) xQueueSend(s_jfree, &k, 0);
     }
+    // Not in PSRAM: lwIP asserts that a task opening a TCP connection has an internal stack
+    // (lwip_hook_tcp_isn, seen 2026-11-21). Only the decoder, which never touches the network, can.
     xTaskCreatePinnedToCore(cam_fetch_task, "cam", 8192, nullptr, 2, nullptr, 0);
     // Below the fetch, Wi-Fi and the sensor node: it only uses the time they leave.
-    xTaskCreatePinnedToCore(cam_decode_task, "jpeg", 6144, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCoreWithCaps(cam_decode_task, "jpeg", 6144, nullptr, 1, nullptr, 0, MALLOC_CAP_SPIRAM);
     xTaskCreatePinnedToCore(node_task, "node", 8192, nullptr, 2, nullptr, 0);
 }

@@ -4,6 +4,7 @@
 #include "ui.h"
 #include "app.h"
 #include "fwupdate.h"
+#include "aitalk.h"
 #include "llm.h"
 #include "net.h"
 #include "nodes.h"
@@ -488,7 +489,21 @@ static void page_aitalk(lv_obj_t *c) {
     snprintf(b, sizeof b, "%u분마다", g_set.ai_idle_min);
     val(row(pl, "아무 일 없을 때"), b);
     hdr(c, "최근 기록");
-    val(row(plat(c), "아직 한 말이 없어요"), "");
+    AiNote *hist = (AiNote *)ps_malloc_or_null(sizeof(AiNote) * 12);   // 13 KB: PSRAM, only while building
+    int n = hist ? ai_history(hist, 12) : 0;
+    lv_obj_t *hp = plat(c);
+    if (!n) val(row(hp, "아직 한 말이 없어요"), "");
+    for (int i = 0; i < n; i++) {
+        char t[16];
+        time_t tt = hist[i].at;
+        struct tm tm;
+        localtime_r(&tt, &tm);
+        snprintf(t, sizeof t, "%02d:%02d", tm.tm_hour, tm.tm_min);
+        char title[64];
+        snprintf(title, sizeof title, "%s · %s", t, hist[i].why);
+        row(hp, title, hist[i].text);
+    }
+    free(hist);
     foot(c, "오늘 한 말을 모두 남깁니다. 같은 일이 생겨도 그때 값을 보고 새로 씁니다.");
     hdr(c, "바로 말할 때");
     pl = plat(c);
@@ -551,6 +566,7 @@ static uint32_t page_sig() {
             break;
         }
         case PG_AI: s = s * 31 + llm_test().state; break;
+        case PG_AITALK: s = s * 31 + ai_gen(); break;
         case PG_UPDATE: s = s * 31 + fwu_gen(); [[fallthrough]];
         case PG_DEVICES: case PG_CONTROL: case PG_LIGHT: case PG_WATER:
             for (int k = 0; k < 3; k++) s = s * 31 + node_info((Role)k).online;

@@ -28,6 +28,9 @@ int nodes_online();
 
 // Camera (320x240 RGB565). nullptr until the first frame.
 void cam_set_wanted(bool on);          // the main screen is visible
+// Stops the sensor node polling (8 Hz thermal) for a while: a big TLS upload needs the internal RAM
+// that its lwIP buffers take (identify.cpp).
+void nodes_pause(bool on);
 bool cam_live();
 const uint16_t *cam_take(uint32_t *seq);
 uint32_t cam_seq();             // sequence of the newest frame, without taking it

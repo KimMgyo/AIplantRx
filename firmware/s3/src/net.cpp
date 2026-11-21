@@ -170,3 +170,21 @@ void net_init() {
     if (g_set.wifi_on && g_set.ssid.length()) begin(g_set.ssid, g_set.pass);
     xTaskCreatePinnedToCore(net_task, "net", 4096, nullptr, 3, nullptr, 0);
 }
+
+static SemaphoreHandle_t s_tls;
+
+bool tls_lock(uint32_t wait_ms) {
+    if (!s_tls) {
+        static portMUX_TYPE m = portMUX_INITIALIZER_UNLOCKED;
+        portENTER_CRITICAL(&m);
+        if (!s_tls) s_tls = xSemaphoreCreateMutex();
+        portEXIT_CRITICAL(&m);
+    }
+    bool ok = xSemaphoreTake(s_tls, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
+    // mbedTLS needs two ~16 KB contiguous buffers in internal RAM: log what is there when it starts.
+    Serial.printf("[tls] %s, internal free %u, largest %u\n", ok ? "lock" : "busy",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return ok;
+}
+
+void tls_unlock() { xSemaphoreGive(s_tls); }

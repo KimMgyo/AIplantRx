@@ -19,7 +19,7 @@
 | `POST /ota` | `{"url":"https://...","sha256":"64자","size":N,"version":"1.0.2"}` → 202. 기기가 직접 받아 크기와 SHA-256을 확인한 뒤 재시작. 새 펌웨어는 120초 안에 Wi-Fi에 붙어야 확정, 아니면 롤백. 진행은 `/info`의 `ota` |
 | `GET /reboot` | 다시 시작 |
 
-`ota.state`: `idle`, `starting`, `downloading`, `verifying`, `restarting`, `fail`, `espota`.
+`ota.state`: `idle`, `starting`, `downloading`, `verifying`, `restarting`, `fail`, `espota`. `ota.pct`는 쉬고 있을 때 -1. `reset`은 `esp_reset_reason()`(1 전원, 3 소프트웨어, 4 패닉, 5·6·7 워치독, 9 전압 부족). 받는 동안(`ota.state`가 `idle`·`fail`이 아닐 때)은 UDP 알림을 멈춘다. 다시 켜진 새 펌웨어는 확정될 때까지 `pending`이 true.
 
 ## 2. 센서 노드 (role `node`)
 
@@ -52,15 +52,17 @@
 }
 ```
 
+- `leaf_c`: 열화상 32×24 중 식물 상자(열 9~22, 행 4~14, S3가 그리는 상자와 같음) 칸들의 중앙값. `th_max`, `th_min`은 전체 격자의 최고·최저.
 - `day`: 지금 조명 시간표의 낮 구간인지(온도 목표를 낮·밤 중 무엇으로 볼지).
 - `light`, `water`, `nutr`, `ph_pump`: 지금 켜져 있는지. `capture`: 촬영용 흰색 조명 중(펌프는 이때 돌지 않는다).
-- `events`: 오늘(KST 0시부터) 펌프가 돈 기록. `kind`는 `water`, `nutr`, `ph`. 조명은 시간표로 그리므로 넣지 않는다.
-- `sensors`: 센서마다 마지막 읽기가 성공했는지. 12V가 빠지면 `soil`이 false가 된다.
+- `events`: 오늘(KST 0시부터) 펌프가 돈 기록, 오래된 것부터 최대 16개(넘으면 오래된 것을 버림). `kind`는 `water`, `nutr`, `ph`. 조명은 시간표로 그리므로 넣지 않는다.
+- `last_water`: 마지막 물 주기를 시작한 시각. `next_water`: 시간표로 물을 줄 때(흙 센서가 빠졌을 때 `water_interval_days`마다 `water_ml`)의 다음 시각, 흙 수분으로 줄 때는 0.
+- `sensors`: 센서마다 마지막 읽기가 성공했는지. 12V가 빠지면 `soil`이 false가 된다. 수위 플로트를 달면 `"tank": true`(물 있음)/`false`를 더한다(미정).
 - `profile`: 지금 돌리고 있는 프로필(아래 PUT /profile 내용 그대로, 펌웨어 안전 범위로 자른 값). `grade`는 `llm` 또는 `default`.
 
 ### GET /thermal
 
-MLX90640 32×24, int16 리틀엔디언, 0.01°C 단위, 행 순서. 1,536바이트. S3가 8Hz, C3가 4초마다 읽는다.
+MLX90640 32×24, int16 리틀엔디언, 0.01°C 단위, 행 순서. 1,536바이트. S3가 8Hz, C3가 4초마다 읽는다. 열화상이 응답하지 않으면 503.
 
 ### PUT /profile
 
@@ -78,22 +80,26 @@ S3가 식물을 찾은 뒤 보낸다. 센서 노드는 하드웨어 안전 범�
 }
 ```
 
+필수: `grade`, 범위 여섯 개(`[lo, hi]`), `light_on`, `light_off`, 물·물약의 주기와 양. 나머지(`name_ko`, `sci`, `family`, `score`, `t`)는 선택. 빠진 필수 필드나 잘못된 형식은 400.
+
+센서 노드가 다시 자르는 하드웨어 안전 범위(LLM_ARCHITECTURE.md 4): 온도 10~32, 습도 20~95, 흙 수분 10~80, EC 0.3~3.0, pH 5.0~7.5, 조명 8~16시간(`light_on`을 두고 `light_off`를 옮김), 물 1~21일·20~300ml, 물약 3~30일·0~20ml. 최저가 최고보다 크면 서로 바꾼다.
+
 `t`는 S3의 현재 시각(센서 노드에 RTC가 없어서 NTP가 안 될 때 쓴다). 권한: `llm`이면 물·양액·pH 모두 정상 제어, `default`면 물은 흙이 아주 마를 때만, 양액·pH는 멈춤(ARCHITECTURE.md 4.2).
 
 ### POST /pump
 
-`{"pump":"water"|"nutr"|"ph","ml":20}` 또는 `{"pump":"water","s":3}`. 안전 상한(1회 최대 시간, 하루 최대 양) 안에서만 돌리고 정한 양이나 시간이 지나면 스스로 끈다. 펌프는 한 번에 하나만. 다른 펌프가 돌거나 `capture` 중이면 409. 응답 `{"ok":true,"ms":3000}`.
+`{"pump":"water"|"nutr"|"ph","ml":20}` 또는 `{"pump":"water","s":3}`. 안전 상한(1회 최대 시간, 하루 최대 양) 안에서만 돌리고 정한 양이나 시간이 지나면 스스로 끈다. 펌프는 한 번에 하나만. 다른 펌프가 돌거나 `capture` 중이면 409. 응답 `{"ok":true,"ms":3000,"ml":39}`. 안전 상한을 넘는 요청은 상한까지만 돌린다. 409인 경우: 다른 펌프가 도는 중, `capture` 중, 그 펌프의 하루 상한을 다 씀, OTA 중. pH 펌프는 pH를 낮추는 쪽 한 방향만 넣는다.
 
 ### POST /light
 
-`{"mode":"capture"}`: 흰색 최대, 펌프를 멈추고, 30초가 지나면 스스로 `schedule`로 돌아간다. `{"mode":"schedule"}`: 프로필 시간표대로. `{"mode":"on"|"off"}`: 수동(다음 시간표 경계까지).
+`{"mode":"capture"}`: 흰색 최대, 펌프를 멈추고, 30초가 지나면 스스로 `schedule`로 돌아간다. `{"mode":"schedule"}`: 프로필 시간표대로. `{"mode":"on"|"off"}`: 수동(다음 시간표 경계까지). 응답 `{"ok":true,"mode":"capture","light":true}`.
 
 ## 3. CAM (role `cam`)
 
 | 요청 | 내용 |
 | --- | --- |
 | `GET /frame` | 화면용 QVGA(320×240) JPEG. S3가 최대 12fps로 읽는다. 같은 프레임을 두 번 줄 수 있다(S3가 걸러 냄) |
-| `GET /capture?size=uxga` | 식별용 사진. `uxga`(1600×1200, 기본) 또는 `sxga`. 1~3초 걸린다. 실패하면 503 |
+| `GET /capture?size=sxga&q=12` | 식별용 사진. `size`는 `uxga`(1600×1200, 기본) 또는 `sxga`(1280×1024), `q`는 OV2640 JPEG 품질(4~63, 낮을수록 좋음, 기본 12). S3는 `sxga`, `q=12`로 부른다(짧은 변 1024px로 PlantNet에 충분하고, 먼 서버로 올리는 시간이 UXGA의 약 1/3). 1~3초 걸린다. 실패하면 503, 모르는 값은 400. 찍는 동안 `/frame`은 기다린다(서버 작업이 하나) |
 
 ## 4. C3 (role `oled`)
 

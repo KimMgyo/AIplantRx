@@ -56,6 +56,19 @@ static lv_obj_t *sheet_cap(lv_obj_t *par, const char *t, bool hi, lv_event_cb_t 
     return c;
 }
 
+lv_obj_t *sheet_begin(int x, int y, int w, int h) {
+    dim_layer();
+    return sheet_box(x, y, w, h);
+}
+
+lv_obj_t *sheet_circle(lv_obj_t *par, const char *icon, bool hi, lv_event_cb_t cb) {
+    lv_obj_t *c = fill(par, 0, 0, 34, 34, hi ? P->sheet_cap_hi : P->sheet_cap, 17);
+    lv_obj_center(labelc(c, &i16, hi ? P->cap_hi_text : (P->glass ? lv_color_white() : P->cap_text), icon));
+    lv_obj_set_ext_click_area(c, 8);
+    make_button(c, cb, nullptr);
+    return c;
+}
+
 // ---------------------------------------------------------------- information
 
 void sheet_info(const char *title, const char *body) {

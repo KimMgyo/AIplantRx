@@ -210,6 +210,17 @@ void ui_init() {
     ui_show_main();
 }
 
+void ui_rebuild_main() {
+    // The active screen cannot be deleted: a blank one holds the display meanwhile.
+    lv_obj_t *tmp = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(tmp, P->screen, 0);
+    bool on_main = lv_scr_act() == g_main;
+    if (on_main) lv_scr_load(tmp);
+    main_destroy();
+    if (on_main) ui_show_main();
+    lv_obj_del(tmp);
+}
+
 void ui_go_main() { if (lv_scr_act() != g_main) ui_show_main(); }
 void ui_go_settings(int page) { ui_show_settings(page); }
 

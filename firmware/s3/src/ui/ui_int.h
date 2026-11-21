@@ -45,6 +45,18 @@ typedef void (*text_done_cb)(const char *text, void *user);
 void sheet_text(const char *title, const char *initial, bool password, text_done_cb done, void *user);
 bool sheet_open();
 void sheet_close();
+// A sheet of any size over the dimmed screen (the box is returned; sheet_close() removes it).
+lv_obj_t *sheet_begin(int x, int y, int w, int h);
+// 34 px round button on a sheet (visionOS .vcirc); hi = the accent one.
+lv_obj_t *sheet_circle(lv_obj_t *par, const char *icon, bool hi, lv_event_cb_t cb);
+// The find-plant sheet (find_sheet.cpp): progress, then the result (UI.md 3).
+void find_sheet_open();
+// "Change kind": Pl@ntNet's other candidates and earlier plants.
+void kind_sheet_open();
+// Main screen again with the current profile (after a plant was found).
+void ui_rebuild_main();
+
+int text_w(const lv_font_t *f, const char *t);
 
 // Korean date and time strings.
 void fmt_time(char *out, size_t n);
