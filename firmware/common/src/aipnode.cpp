@@ -41,7 +41,7 @@ static SemaphoreHandle_t s_mu;
 static volatile bool s_reboot;
 
 static volatile int s_ota_pct = -1;
-static char s_ota_state[12] = "idle", s_ota_err[64] = "", s_ota_ver[24] = "";
+static char s_ota_state[12] = "idle", s_ota_err[96] = "", s_ota_ver[24] = "";
 static char s_ota_url[512], s_ota_sha[65];
 static uint32_t s_ota_size;
 static volatile bool s_ota_busy;
@@ -218,7 +218,7 @@ static bool partition_sha_ok(const esp_partition_t *p, uint32_t size, const char
 }
 
 static void ota_task(void *) {
-    char e[64] = "";
+    char e[96] = "";
     aipnode_logf("[node] OTA %s (%u bytes) from %s\n", s_ota_ver, (unsigned)s_ota_size, s_ota_url);
     if (C.before_ota && !C.before_ota()) strlcpy(e, "refused", sizeof e);
     const esp_partition_t *dst = esp_ota_get_next_update_partition(nullptr);
@@ -228,7 +228,7 @@ static void ota_task(void *) {
     hc.timeout_ms = 20000;
     hc.crt_bundle_attach = esp_crt_bundle_attach;
     hc.buffer_size = 4096;        // GitHub's last redirect is a ~900-character signed URL
-    hc.buffer_size_tx = 4096;
+    hc.buffer_size_tx = 2048;     // the request line with that URL; 2 KB less to find on the C3
     hc.max_redirection_count = 5;
     hc.keep_alive_enable = true;
     esp_https_ota_config_t oc = {};
@@ -261,6 +261,10 @@ static void ota_task(void *) {
     }
     if (h) esp_https_ota_abort(h);
     if (e[0]) {
+        // Memory is the usual suspect on the C3 (TLS in internal RAM, no PSRAM): say what was left.
+        size_t el = strlen(e);
+        snprintf(e + el, sizeof e - el, " (heap %u, min %u)", (unsigned)esp_get_free_heap_size(),
+                 (unsigned)esp_get_minimum_free_heap_size());
         aipnode_logf("[node] OTA failed: %s\n", e);
         ota_set("fail", e);
         s_ota_pct = -1;

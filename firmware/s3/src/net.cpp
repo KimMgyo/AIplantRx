@@ -3,6 +3,7 @@
 #include "settings.h"
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <mbedtls/platform.h>
 #include <time.h>
 
 static volatile NetState s_state = NET_IDLE;
@@ -159,7 +160,28 @@ static void net_task(void *) {
     }
 }
 
+// mbedTLS memory. The prebuilt library allocates everything in internal RAM (CONFIG_MBEDTLS_INTERNAL_MEM_
+// ALLOC), and a TLS connection needs two ~16.7 KB contiguous record buffers there. With the camera stream
+// running, internal RAM was 75 KB free but no two such blocks: mbedtls_ssl_setup -0x7F00, the GitHub
+// check failed (2026-11-21). The library keeps MBEDTLS_PLATFORM_MEMORY, so the allocator can be swapped
+// at run time: big blocks (record buffers, certificate chains) go to PSRAM, small ones (bignums, contexts)
+// stay internal where the handshake math is fast. IDF supports TLS buffers in PSRAM on the S3
+// (CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC); the AES/SHA DMA drivers bounce external buffers themselves.
+static const size_t TLS_PSRAM_FROM = 4096;
+
+static void *tls_calloc(size_t n, size_t size) {
+    size_t total = n * size;
+    void *p = nullptr;
+    if (total >= TLS_PSRAM_FROM) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!p && total < TLS_PSRAM_FROM) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p;
+}
+
+static void tls_free(void *p) { heap_caps_free(p); }
+
 void net_init() {
+    mbedtls_platform_set_calloc_free(tls_calloc, tls_free);
     s_mx = xSemaphoreCreateMutex();
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
@@ -181,7 +203,7 @@ bool tls_lock(uint32_t wait_ms) {
         portEXIT_CRITICAL(&m);
     }
     bool ok = xSemaphoreTake(s_tls, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
-    // mbedTLS needs two ~16 KB contiguous buffers in internal RAM: log what is there when it starts.
+    // Internal RAM when a TLS connection starts (its big buffers are in PSRAM since 2.1.2, see tls_calloc).
     Serial.printf("[tls] %s, internal free %u, largest %u\n", ok ? "lock" : "busy",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return ok;

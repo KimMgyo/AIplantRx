@@ -310,7 +310,7 @@ int fwu_devices(FwuDev *out, int max) {
 }
 
 // POST /ota to one board (INTERFACES.md 1), then wait for it to come back announcing the new version.
-static bool update_board(Dev &d) {
+static bool update_board_once(Dev &d) {
     NodeInfo ni = node_info(d.role);
     if (!ni.online) return false;
     Serial.printf("[fwu] %s: %s -> %s\n", d.key, ni.ver, d.ver);
@@ -383,6 +383,17 @@ static bool update_board(Dev &d) {
     d.state = DEV_FAIL;
     s_gen++;
     return false;
+}
+
+// The C3 downloads with 10-20 KB of RAM to spare (TLS in internal RAM, no PSRAM): its first download
+// from GitHub failed at 4 % ("download: ESP_FAIL", heap minimum 2.3 KB) and the same one went through
+// right after (2026-11-22). One more try costs a few seconds.
+static bool update_board(Dev &d) {
+    if (update_board_once(d)) return true;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    if (!node_info(d.role).online) return false;
+    Serial.printf("[fwu] %s: trying once more\n", d.key);
+    return update_board_once(d);
 }
 
 // ---------------------------------------------------------------- install
