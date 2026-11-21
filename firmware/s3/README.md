@@ -31,6 +31,7 @@ pio run -e s3-relay -t upload --upload-port <C3 COM>     # C3 USB 중계 (ARCHIT
 | | aipx-download | ROM 다운로드 모드로 재시작(C3 중계가 esptool SYNC를 보면 보냄) |
 | GET /set?llm_url=&llm_key=&pn_key= | | AI 서버 주소·키, PlantNet 키 저장 |
 | GET /set?theme=0..2, ?screen=main, ?screen=settings&page=N | | 테마, 화면 전환(시험 스크립트용) |
+| GET /update[?check=1 또는 ?install=1] | | 펌웨어 업데이트 상태(/info의 fw와 같음), 지금 확인, 찾은 버전 설치 |
 | GET /reboot | reboot | 다시 시작 |
 
 /info의 reset은 마지막 재시작 이유(1 전원, 3 소프트웨어, 4 패닉, 5·6·7 워치독, 9 전압 부족), stack_free는 작업별 스택 여유(바이트)다. 크래시는 플래시의 coredump 파티션에도 남는다(esptool read_flash 0xFF0000 0x10000).
@@ -62,6 +63,7 @@ S3도 같은 포트로 {"role":"panel",...}을 알린다.
 | src/main.cpp | 부팅 순서. 이후는 작업(task)만: LVGL은 core 1, 나머지는 core 0. Arduino loop 작업은 지운다. PANEL_CORE로 패널 인터럽트의 코어를 고른다(기본 1) |
 | src/net.cpp | Wi-Fi(새 네트워크는 연결된 뒤에만 저장), NTP(KST), mDNS |
 | src/nodes.cpp | 기기 찾기, CAM(받기와 디코딩이 두 작업으로 겹쳐 돈다, 화면 버퍼 3개), 센서 상태, 열화상 격자(32×24, 그림은 메인 화면이 그릴 때 보간) |
+| src/fwupdate.cpp | GitHub Releases 업데이트: manifest 확인, HTTPS로 받기(인증서 묶음, 리디렉션), 크기·SHA-256 검사, 새 펌웨어 자기 점검과 롤백, 자동 확인·설치 |
 | src/llm.cpp | llama-server 연결 시험. Bonsai 2는 chat_template_kwargs enable_thinking=false를 꼭 보낸다 |
 | src/devsrv.cpp | 개발 도구, espota |
 | src/perf.cpp | /perf 측정 |
@@ -100,8 +102,17 @@ tools/perf_run.py, 가짜 노드(카메라 QVGA JPEG 8.5KB, 열화상 32×24)를
 
 남은 한계: 다크 본문 스크롤은 시간 대부분(31ms)이 화면 배경과 그 위 카드의 불투명 채우기다. PSRAM 쓰기 속도가 한계라 디자인을 바꾸지 않으면 더 줄기 어렵다. 패널 인터럽트를 core 0으로 옮기면(PANEL_CORE 0) 그리기가 10~15% 빨라지지만 Wi-Fi·디코딩과 같은 코어를 써서 기본은 1로 둔다. 무선 상태가 나쁠 때는(ping 50ms 안팎) 카메라 받기가 120ms까지 늘어 영상이 8fps로 떨어진다.
 
+## 원격 업데이트 (GitHub Releases, 2026-11-21 시험)
+
+- 릴리스: 저장소 루트에서 `python tools/release.py <버전> --notes "..."`. platformio.ini의 FW_VERSION을 바꾸고 빌드한 뒤, 이미지와 manifest.json을 KimMgyo/AIplantRx 릴리스로 올린다(KimMgyo 계정 토큰 사용). `--prerelease`로 올리면 보드는 보지 않는다.
+- S3는 부팅 1분 뒤와 6시간마다 `releases/latest/download/manifest.json`을 읽는다. 받기는 HTTPS(프레임워크 인증서 묶음, GitHub 리디렉션 두 번), 크기와 SHA-256을 manifest와 맞춘 뒤에야 부팅 칸을 바꾼다.
+- 새 펌웨어는 확인 대기로 부팅해 2분 안에 UI가 돌고 Wi-Fi에 붙으면 스스로 확정한다. 아니면 이전 칸으로 돌아가고, 돌아온 쪽이 설정과 /update에 되돌린 버전을 보여 준다.
+- 시험 결과: v2.0.1 → v2.0.2 자동 설치. 메인 화면에서 10분(가동 602초) 손이 안 닿자 시작, 4.3MB를 약 80초에 받고 검증한 뒤 재시작(재시작 이유 3), 21초 뒤 확정. 받는 동안 내부 RAM 최저 41KB. 롤백: 확정하지 않는 시험 빌드(-DFWU_TEST_NO_CONFIRM)를 espota로 올리니 부팅 뒤 2분에 2.0.2로 돌아가고 "2.0.3-rbtest → 이전 버전"이 표시됨.
+- 주의: 확정 전인 펌웨어 위에 또 올리면(espota 포함) 두 칸 모두 확정 안 된 펌웨어가 되어 돌아갈 곳이 없어진다. 새 펌웨어는 확정(/update의 pending=false)을 본 뒤에 다음 것을 올린다.
+- espota로 2.0.0-dev → 2.0.1을 올릴 때 한 번 재시작 이유가 패닉(4)으로 남았다(옛 펌웨어가 OTA를 끝내고 재시작하던 중). GitHub 경로와 그 뒤 espota에서는 다시 나오지 않았다.
+
 ## 아직 없는 것
 
 - 식물 찾기(PlantNet → LLM 프로필)와 AI 한마디 생성: CAM·센서 노드 새 펌웨어와 PlantNet 키가 있어야 시험할 수 있어 다음 단계.
-- 다른 기기 OTA(POST /ota)와 GitHub Releases 확인.
+- 다른 기기 OTA(POST /ota).
 

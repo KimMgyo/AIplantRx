@@ -218,8 +218,8 @@ sequenceDiagram
 | 상황 | 방법 |
 | --- | --- |
 | 개발 | espota(같은 Wi-Fi). S3는 `pio run -e s3-ota -t upload` |
-| 현장 | S3 설정 "업데이트 확인" → GitHub Releases manifest.json(기기별 버전·주소·SHA-256·크기) → 기기에 POST /ota. S3 자신은 마지막 |
-| 복구 | OTA 칸 2개, 부팅 60초 안 자기 점검 통과해야 확정, 아니면 롤백 |
+| 현장 | `python tools/release.py <버전>`이 빌드하고 manifest.json(기기별 버전·주소·SHA-256·크기)과 함께 GitHub 릴리스를 만든다. S3는 부팅 1분 뒤와 6시간마다 releases/latest의 manifest를 확인하고, 자동 업데이트가 켜져 있으면 메인 화면을 10분 동안 아무도 만지지 않을 때 설치한다(설정 > 소프트웨어 업데이트에서 끄거나 바로 설치). 다른 기기는 S3가 POST /ota로 알려 줄 예정, S3 자신은 마지막 |
+| 복구 | OTA 칸 2개. 새 펌웨어는 부팅 뒤 2분 안에 UI가 돌고 Wi-Fi에 다시 붙어야 확정되고, 아니면(죽거나 Wi-Fi를 못 잡으면) 이전 펌웨어로 돌아간다 |
 | 마지막 수단 | C3 USB(C3, S3 중계), 센서 노드 USB-C(devkit, CAM 중계). 중계도 안 되면 케이스를 열고 USB-UART |
 | Wi-Fi 바꾸기 | S3가 먼저 연결 확인 → 각 기기에 POST /wifi → S3 이동. 2분 넘게 못 붙은 기기는 설정 AP(AIPLANT-이름)로 바뀌고 S3가 붙어서 넣어 준다 |
 
