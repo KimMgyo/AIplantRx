@@ -9,7 +9,8 @@
 //       GET  /info     who am I, uptime, reset reason, memory, Wi-Fi, OTA state + the device's fields
 //       POST /wifi     {"ssid","pass"}: try that network; saved only once it gives an address, else
 //                      back to the old one after 30 s
-//       POST /ota      {"url","sha256","size"[,"version"]}: download over HTTPS, check size and SHA-256,
+//       POST /ota      {"url","sha256","size"[,"version"]}: download (https:// from GitHub, or http:// from
+//                      the S3's /fw/<dev>.bin, which needs no TLS on the board), check size and SHA-256,
 //                      switch the boot partition, restart
 //       GET  /reboot
 //   - Rollback: a new image boots pending and is confirmed once Wi-Fi is up (and self_check() agrees)

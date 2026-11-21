@@ -51,3 +51,9 @@ void fwu_install_now();     // only does something in FWU_AVAILABLE
 int fwu_vercmp(const char *a, const char *b);
 // {"state":"available","latest":"2.0.2","pct":0,"pending":false,"rolled_back":"","auto":true,"err":""}
 void fwu_json(char *out, size_t n);
+// Where the last checked release keeps a board's image ("c3", "cam", "node"), for GET /fw/<dev>.bin.
+bool fwu_dev_source(const char *key, char *url, size_t n, uint32_t *size);
+// GET /fw/<dev>.bin (devsrv.cpp): fetches that image from GitHub here (TLS in PSRAM) and passes it on
+// over plain HTTP, so a board without PSRAM need not do TLS. The board checks the SHA-256 itself.
+class WebServer;
+void fwu_serve_image(const char *key, WebServer &srv);

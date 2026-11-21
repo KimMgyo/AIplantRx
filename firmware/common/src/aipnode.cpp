@@ -217,6 +217,71 @@ static bool partition_sha_ok(const esp_partition_t *p, uint32_t size, const char
     return ok && !strcasecmp(hex, want);
 }
 
+// A LAN download over plain HTTP from the S3, which fetches the image from GitHub itself (S3 fwupdate.cpp,
+// GET /fw/<dev>.bin). No TLS here: the C3 has no PSRAM, and a GitHub download left it 2 KB of RAM and
+// failed more often than not (2026-11-22). The image is still checked against the manifest's SHA-256
+// before it may boot. Fills e on failure; on success the new partition is set to boot.
+static void download_plain(const esp_partition_t *dst, char *e, size_t ecap) {
+    esp_http_client_config_t hc = {};
+    hc.url = s_ota_url;
+    hc.timeout_ms = 20000;
+    hc.buffer_size = 2048;
+    hc.buffer_size_tx = 1024;
+    esp_http_client_handle_t c = esp_http_client_init(&hc);
+    uint8_t *buf = (uint8_t *)malloc(4096);
+    esp_ota_handle_t oh = 0;
+    bool began = false;
+    uint32_t got = 0;
+    do {
+        if (!c || !buf) { strlcpy(e, "no memory", ecap); break; }
+        esp_err_t err = esp_http_client_open(c, 0);
+        if (err != ESP_OK) { snprintf(e, ecap, "connect: %s", esp_err_to_name(err)); break; }
+        int64_t len = esp_http_client_fetch_headers(c);
+        int st = esp_http_client_get_status_code(c);
+        if (st != 200) { snprintf(e, ecap, "http %d", st); break; }
+        if (len > 0 && (uint64_t)len != s_ota_size) { snprintf(e, ecap, "size %lld, expected %u", (long long)len, (unsigned)s_ota_size); break; }
+        err = esp_ota_begin(dst, OTA_WITH_SEQUENTIAL_WRITES, &oh);
+        if (err != ESP_OK) { snprintf(e, ecap, "begin: %s", esp_err_to_name(err)); break; }
+        began = true;
+        int idle = 0;
+        while (got < s_ota_size) {
+            int n = esp_http_client_read(c, (char *)buf, 4096);
+            if (n < 0) { snprintf(e, ecap, "read failed at %u", (unsigned)got); break; }
+            if (n == 0) {   // a read timeout, or the sender closed early
+                if (esp_http_client_is_complete_data_received(c) || ++idle > 3) {
+                    snprintf(e, ecap, "stopped at %u/%u", (unsigned)got, (unsigned)s_ota_size);
+                    break;
+                }
+                continue;
+            }
+            idle = 0;
+            err = esp_ota_write(oh, buf, n);
+            if (err != ESP_OK) { snprintf(e, ecap, "write: %s", esp_err_to_name(err)); break; }
+            got += n;
+            int pct = (int)((uint64_t)got * 100 / s_ota_size);
+            s_ota_pct = pct > 99 ? 99 : pct;
+        }
+    } while (0);
+    free(buf);
+    if (c) {
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    if (began && e[0]) esp_ota_abort(oh);
+    if (began && !e[0]) {
+        esp_err_t err = esp_ota_end(oh);   // flushes the last block and checks the image's own hash
+        if (err != ESP_OK) snprintf(e, ecap, "image: %s", esp_err_to_name(err));
+    }
+    if (!e[0]) {
+        ota_set("verifying");
+        if (!partition_sha_ok(dst, s_ota_size, s_ota_sha)) strlcpy(e, "sha256 mismatch", ecap);
+    }
+    if (!e[0]) {
+        esp_err_t err = esp_ota_set_boot_partition(dst);
+        if (err != ESP_OK) snprintf(e, ecap, "boot: %s", esp_err_to_name(err));
+    }
+}
+
 static void ota_task(void *) {
     char e[96] = "";
     aipnode_logf("[node] OTA %s (%u bytes) from %s\n", s_ota_ver, (unsigned)s_ota_size, s_ota_url);
@@ -234,12 +299,17 @@ static void ota_task(void *) {
     esp_https_ota_config_t oc = {};
     oc.http_config = &hc;
     esp_https_ota_handle_t h = nullptr;
-    if (!e[0]) {
+    bool plain = !strncmp(s_ota_url, "http://", 7);
+    if (!e[0] && plain) {
+        ota_set("downloading");
+        download_plain(dst, e, sizeof e);
+    }
+    if (!e[0] && !plain) {
         ota_set("downloading");
         esp_err_t err = esp_https_ota_begin(&oc, &h);
         if (err != ESP_OK) snprintf(e, sizeof e, "begin: %s", esp_err_to_name(err));
     }
-    if (!e[0]) {
+    if (!e[0] && !plain) {
         esp_err_t err;
         while ((err = esp_https_ota_perform(h)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
             int pct = (int)((uint64_t)esp_https_ota_get_image_len_read(h) * 100 / s_ota_size);
@@ -250,11 +320,11 @@ static void ota_task(void *) {
         else if (!esp_https_ota_is_complete_data_received(h) || (uint32_t)got != s_ota_size)
             snprintf(e, sizeof e, "size %d/%u", got, (unsigned)s_ota_size);
     }
-    if (!e[0]) {
+    if (!e[0] && !plain) {
         ota_set("verifying");
         if (!partition_sha_ok(dst, s_ota_size, s_ota_sha)) strlcpy(e, "sha256 mismatch", sizeof e);
     }
-    if (!e[0]) {
+    if (!e[0] && !plain) {
         esp_err_t err = esp_https_ota_finish(h);
         h = nullptr;
         if (err != ESP_OK) snprintf(e, sizeof e, "image: %s", esp_err_to_name(err));
@@ -342,6 +412,7 @@ static void fill_info(JsonObject o) {
     ota["state"] = s_ota_state;
     ota["pct"] = s_ota_pct;
     ota["err"] = s_ota_err;
+    ota["http"] = true;   // takes http:// image URLs (the S3's /fw/<dev>.bin), not only https://
     if (C.info_extra) C.info_extra(o);
 }
 
@@ -373,7 +444,8 @@ static esp_err_t h_ota(httpd_req_t *req) {
     if (aipnode_read_body(req, b, sizeof b) < 0 || deserializeJson(d, b)) return aipnode_send_text(req, "400 Bad Request", "need {\"url\",\"sha256\",\"size\"}");
     const char *url = d["url"] | "", *sha = d["sha256"] | "";
     uint32_t size = d["size"] | 0;
-    if (strncmp(url, "https://", 8) || strlen(url) >= sizeof s_ota_url || strlen(sha) != 64 || !size)
+    bool scheme_ok = !strncmp(url, "https://", 8) || !strncmp(url, "http://", 7);
+    if (!scheme_ok || strlen(url) >= sizeof s_ota_url || strlen(sha) != 64 || !size)
         return aipnode_send_text(req, "400 Bad Request", "bad url, sha256 or size");
     strlcpy(s_ota_url, url, sizeof s_ota_url);
     strlcpy(s_ota_sha, sha, sizeof s_ota_sha);

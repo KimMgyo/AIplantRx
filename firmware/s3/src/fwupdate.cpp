@@ -8,6 +8,7 @@
 #include "ui.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <esp_app_desc.h>
 #include <esp_crt_bundle.h>
@@ -199,6 +200,77 @@ static void http_cfg(esp_http_client_config_t &c, const char *url) {
     c.user_agent = "AIplantRx-S3/" FW_VERSION;
 }
 
+bool fwu_dev_source(const char *key, char *url, size_t n, uint32_t *size) {
+    bool ok = false;
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    for (const Dev &d : s_dev)
+        if (d.have && !strcmp(d.key, key)) {
+            strlcpy(url, d.url, n);
+            *size = d.size;
+            ok = true;
+        }
+    xSemaphoreGive(s_mu);
+    return ok;
+}
+
+void fwu_serve_image(const char *key, WebServer &srv) {
+    static char url[512];
+    uint32_t size = 0;
+    if (!fwu_dev_source(key, url, sizeof url, &size)) {
+        srv.send(404, "text/plain", "no image for that board in the last release");
+        return;
+    }
+    if (!tls_lock(20000)) {
+        srv.send(503, "text/plain", "another TLS connection is running");
+        return;
+    }
+    esp_http_client_config_t hc;
+    http_cfg(hc, url);
+    esp_http_client_handle_t c = esp_http_client_init(&hc);
+    // esp_http_client_open() does not follow redirects by itself (only perform() does): GitHub answers
+    // with two before the image.
+    int st = -1;
+    for (int hop = 0; c && hop < 6; hop++) {
+        if (esp_http_client_open(c, 0) != ESP_OK) break;
+        esp_http_client_fetch_headers(c);
+        st = esp_http_client_get_status_code(c);
+        if (st < 300 || st >= 400) break;
+        esp_http_client_flush_response(c, nullptr);
+        if (esp_http_client_set_redirection(c) != ESP_OK) { st = -1; break; }
+    }
+    uint32_t sent = 0, t0 = millis();
+    if (st == 200) {
+        srv.setContentLength(size);
+        srv.send(200, "application/octet-stream", "");
+        WiFiClient cl = srv.client();
+        uint8_t *buf = (uint8_t *)ps_malloc_or_null(8192);
+        int idle = 0;
+        while (buf && sent < size) {
+            int n = esp_http_client_read(c, (char *)buf, 8192);
+            if (n < 0) break;
+            if (n == 0) {
+                if (esp_http_client_is_complete_data_received(c) || ++idle > 3) break;
+                continue;
+            }
+            idle = 0;
+            if (cl.write(buf, n) != (size_t)n) break;   // the board went away
+            sent += n;
+        }
+        free(buf);
+    } else {
+        char m[48];
+        snprintf(m, sizeof m, "GitHub answered %d", st);
+        srv.send(502, "text/plain", m);
+    }
+    if (c) {
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    tls_unlock();
+    Serial.printf("[fwu] passed on %s: %lu of %lu bytes in %lu ms\n", key, (unsigned long)sent, (unsigned long)size,
+                  (unsigned long)(millis() - t0));
+}
+
 static bool check() {
     set_state(FWU_CHECKING);
     if (net_state() != NET_UP) { set_state(FWU_FAIL, "Wi-Fi 없음"); return false; }
@@ -313,14 +385,31 @@ int fwu_devices(FwuDev *out, int max) {
 static bool update_board_once(Dev &d) {
     NodeInfo ni = node_info(d.role);
     if (!ni.online) return false;
-    Serial.printf("[fwu] %s: %s -> %s\n", d.key, ni.ver, d.ver);
     d.state = DEV_SENDING;
     d.pct = 0;
     s_gen++;
     char url[48];
+    // A board that takes http:// image URLs (/info "ota":{"http":true}) gets the image through this S3,
+    // which does the TLS: the C3 has no PSRAM and its own GitHub downloads mostly failed (2026-11-22).
+    bool via_s3 = false;
+    {
+        WiFiClient c;
+        HTTPClient h;
+        h.setConnectTimeout(3000);
+        h.setTimeout(3000);
+        snprintf(url, sizeof url, "http://%s:%u/info", ni.ip, ni.port);
+        if (h.begin(c, url) && h.GET() == 200) {
+            JsonDocument i;
+            if (!deserializeJson(i, h.getString())) via_s3 = i["ota"]["http"] | false;
+        }
+        h.end();
+    }
+    char src[80];
+    snprintf(src, sizeof src, "http://%s/fw/%s.bin", WiFi.localIP().toString().c_str(), d.key);
+    Serial.printf("[fwu] %s: %s -> %s %s\n", d.key, ni.ver, d.ver, via_s3 ? "through the S3" : "from GitHub");
     snprintf(url, sizeof url, "http://%s:%u/ota", ni.ip, ni.port);
     JsonDocument b;
-    b["url"] = d.url;
+    b["url"] = via_s3 ? src : d.url;
     b["sha256"] = d.sha;
     b["size"] = d.size;
     b["version"] = d.ver;

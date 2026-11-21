@@ -206,6 +206,10 @@ static void srv_task(void *) {
             s_srv.on("/set", h_set);
             s_srv.on("/perf", h_perf);
             s_srv.on("/update", h_update);
+            // Board images through the S3 (fwupdate.cpp update_board): no TLS on the board.
+            s_srv.on("/fw/c3.bin", []() { fwu_serve_image("c3", s_srv); });
+            s_srv.on("/fw/cam.bin", []() { fwu_serve_image("cam", s_srv); });
+            s_srv.on("/fw/node.bin", []() { fwu_serve_image("node", s_srv); });
             s_srv.begin();
             ArduinoOTA.setHostname(APP_HOST);
             ArduinoOTA.setMdnsEnabled(false);       // net.cpp owns mDNS
