@@ -10,7 +10,8 @@ over from the latest release (same version and image), so they do not reinstall.
 1. Writes each new version into that firmware's platformio.ini (-DFW_VERSION) and builds it.
 2. Copies the images to dist/v<release>/, downloads the carried-over ones, writes manifest.json:
        {"release", "api", "published", "devices": {"s3": {"version", "file", "url", "size", "sha256"}, ...}}
-3. Commits the version changes, tags v<release>, pushes main and the tag, creates the release.
+3. Commits the version changes (only those platformio.ini files), tags v<release>, pushes main and the
+   tag, creates the release. Uncommitted changes under firmware/ stop it before anything is built.
 
 The S3 reads https://github.com/KimMgyo/AIplantRx/releases/latest/download/manifest.json ("latest" = the
 newest release that is not a pre-release, so --prerelease publishes without the boards seeing it) and
@@ -120,6 +121,10 @@ def main():
 
     env = owner_env()
     if not a.dry_run:
+        # The tag must describe what was built: firmware changes are committed first, by hand.
+        dirty = run(["git", "status", "--porcelain", "--", "firmware"], capture=True).strip()
+        if dirty:
+            sys.exit("uncommitted changes under firmware/ (commit them first):\n" + dirty)
         if run(["git", "tag", "--list", tag], capture=True).strip() or \
                 subprocess.run(["gh", "release", "view", tag, "-R", REPO], env=env, capture_output=True).returncode == 0:
             sys.exit(f"{tag} already exists")
@@ -162,9 +167,11 @@ def main():
         print(f"dry run: {out}")
         return
 
-    run(["git", "add", "-A"])
-    if run(["git", "status", "--porcelain"], capture=True).strip():
-        run(["git", "commit", "-q", "-m", f"Release {tag}"])
+    # Only the version lines this script wrote; anything else in the tree is not part of the release.
+    inis = [os.path.join(DEVICES[d][0], "platformio.ini") for d in build]
+    run(["git", "add", "--", *inis])
+    if run(["git", "diff", "--cached", "--name-only"], capture=True).strip():
+        run(["git", "commit", "-q", "-m", f"Release {tag}", "--", *inis])
     run(["git", "tag", "-a", tag, "-m", f"AIplantRx {tag}"])
     helper = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
     run(["git", *helper, "push", "origin", "main", tag], env=env)

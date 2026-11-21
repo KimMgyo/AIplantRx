@@ -94,12 +94,26 @@ S3가 식물을 찾은 뒤 보낸다. 센서 노드는 하드웨어 안전 범�
 
 `{"mode":"capture"}`: 흰색 최대, 펌프를 멈추고, 30초가 지나면 스스로 `schedule`로 돌아간다. `{"mode":"schedule"}`: 프로필 시간표대로. `{"mode":"on"|"off"}`: 수동(다음 시간표 경계까지). 응답 `{"ok":true,"mode":"capture","light":true}`.
 
+### CAM 중계 (개발·복구용, S3는 쓰지 않음)
+
+| 요청 | 내용 |
+| --- | --- |
+| TCP 4000 | esptool 중계. 연결되면 CAM을 다운로드 모드로 리셋하고 115200으로 바이트를 넘긴다. 끊기면 CAM을 다시 켠다 |
+| `GET /cam/log` | CAM 콘솔 출력 최근 4KB (text) |
+| `POST /cam/reset` | CAM 다시 켜기. 중계 중이면 409 |
+| `POST /cam/send` | 본문 한 줄을 CAM 콘솔로 |
+| `POST /cam/wifi` | devkit에 저장된 네트워크를 CAM 콘솔로 넘김 |
+
+`/info`의 `cam_link`: `{"bridge","bridges","last_up","last_down","rx_bytes","rx_age_s","swap"}`. 자세한 내용은 firmware/node/README.md.
+
 ## 3. CAM (role `cam`)
 
 | 요청 | 내용 |
 | --- | --- |
 | `GET /frame` | 화면용 QVGA(320×240) JPEG. S3가 최대 12fps로 읽는다. 같은 프레임을 두 번 줄 수 있다(S3가 걸러 냄) |
 | `GET /capture?size=sxga&q=12` | 식별용 사진. `size`는 `uxga`(1600×1200, 기본) 또는 `sxga`(1280×1024), `q`는 OV2640 JPEG 품질(4~63, 낮을수록 좋음, 기본 12). S3는 `sxga`, `q=12`로 부른다(짧은 변 1024px로 PlantNet에 충분하고, 먼 서버로 올리는 시간이 UXGA의 약 1/3). 1~3초 걸린다. 실패하면 503, 모르는 값은 400. 찍는 동안 `/frame`은 기다린다(서버 작업이 하나) |
+
+`/info`의 `camera`: `{"ok","err","psram","psram_free","frames","captures","fails","last_capture":{"w","h","bytes","ms"}}`. 카메라가 안 켜지면 `/frame`, `/capture`는 503이고 10초마다 다시 켠다.
 
 ## 4. C3 (role `oled`)
 

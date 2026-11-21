@@ -149,7 +149,9 @@ Arduino-ESP32 3.1.1(pioarduino), LVGL 8.4, ESP32_Display_Panel. 부팅 뒤에는
 
 아직 없는 것: 식물 찾기 흐름(촬영 → PlantNet → LLM → 검사 → PUT /profile), LLM 우선순위 줄, AI 한마디 생성, 이상 감지 규칙, 다른 기기 OTA·Wi-Fi 일괄 적용.
 
-### 4.2 devkit (만들 것)
+### 4.2 devkit (firmware/node, 센서 없이 동작 중)
+
+2026-11-21 0.1.0: 공통 모듈, 센서 없는 /state, /thermal 503, PUT /profile(안전 범위, NVS), POST /pump·/light(안전 상한, 유량 미측정), CAM 중계(TCP 4000, /cam/*). USB로 한 번 올린 뒤 espota로 다시 올리고 롤백 확정까지 확인했다. 아래 표에서 센서, 제어 루프, 시연 모드는 아직 없다.
 
 | 부분 | 내용 |
 | --- | --- |
@@ -161,9 +163,9 @@ Arduino-ESP32 3.1.1(pioarduino), LVGL 8.4, ESP32_Display_Panel. 부팅 뒤에는
 | 시연 모드 | 하루를 1분으로 줄이거나 "지금 주기" 버튼 |
 | 공통 | Wi-Fi·설정 AP, UDP 알림, /info, /wifi, /ota와 롤백 |
 
-### 4.3 CAM (만들 것)
+### 4.3 CAM (firmware/cam, 동작 중)
 
-/frame, /capture만 남긴다. 처음부터 UXGA로 초기화해 버퍼를 크게 잡고 /frame 때 QVGA로 낮췄다가 /capture 때 올린다(smartfarm에서는 해상도를 바꾸면 영상이 5~20초 멈췄다. 가장 먼저 실물로 확인할 것). OTA 받는 동안 카메라를 멈춘다. 4MB라 min_spiffs 파티션.
+/frame, /capture만 남긴다. 처음부터 UXGA로 초기화해 버퍼를 크게 잡고 /frame 때 QVGA로 낮췄다가 /capture 때 올린다. 2026-11-21 실물 확인: SXGA q12 사진이 0.6초에 나오고, 바로 다음 /frame이 QVGA로 돌아온다(smartfarm은 QVGA로 초기화해서 크기를 올리면 프레임이 안 나왔다). OTA 받는 동안 카메라를 멈춘다. 4MB라 min_spiffs 파티션. 처음 설치는 CAM-MB USB로 했고(CH340 오류 31 우회, firmware/cam/README.md), 그 뒤 espota로 다시 올렸다. devkit 중계(`pio run -e cam-wired`)는 4가닥을 납땜한 뒤 시험한다.
 
 ### 4.4 C3 (만들 것)
 
@@ -218,9 +220,9 @@ sequenceDiagram
 | 상황 | 방법 |
 | --- | --- |
 | 개발 | espota(같은 Wi-Fi). S3는 `pio run -e s3-ota -t upload` |
-| 현장 | `python tools/release.py <버전>`이 빌드하고 manifest.json(기기별 버전·주소·SHA-256·크기)과 함께 GitHub 릴리스를 만든다. S3는 부팅 1분 뒤와 6시간마다 releases/latest의 manifest를 확인하고, 자동 업데이트가 켜져 있으면 메인 화면을 10분 동안 아무도 만지지 않을 때 설치한다(설정 > 소프트웨어 업데이트에서 끄거나 바로 설치). 다른 기기는 S3가 POST /ota로 알려 줄 예정, S3 자신은 마지막 |
+| 현장 | `python tools/release.py <버전>`이 빌드하고 manifest.json(기기별 버전·주소·SHA-256·크기)과 함께 GitHub 릴리스를 만든다. S3는 부팅 1분 뒤와 6시간마다 releases/latest의 manifest를 확인하고, 자동 업데이트가 켜져 있으면 메인 화면을 10분 동안 아무도 만지지 않을 때 설치한다(설정 > 소프트웨어 업데이트에서 끄거나 바로 설치). 다른 기기는 S3가 POST /ota로 먼저 올리고(S3 2.1.0부터), S3 자신은 마지막 |
 | 복구 | OTA 칸 2개. 새 펌웨어는 부팅 뒤 2분 안에 UI가 돌고 Wi-Fi에 다시 붙어야 확정되고, 아니면(죽거나 Wi-Fi를 못 잡으면) 이전 펌웨어로 돌아간다 |
-| 마지막 수단 | C3 USB(C3, S3 중계), 센서 노드 USB-C(devkit, CAM 중계). 중계도 안 되면 케이스를 열고 USB-UART |
+| 마지막 수단 | C3 USB(C3, S3 중계), 센서 노드 USB-C(devkit). CAM은 devkit의 Wi-Fi 중계(TCP 4000, `pio run -e cam-wired`)라 USB도 필요 없다. 중계도 안 되면 케이스를 열고 USB-UART(CAM은 CAM-MB) |
 | Wi-Fi 바꾸기 | S3가 먼저 연결 확인 → 각 기기에 POST /wifi → S3 이동. 2분 넘게 못 붙은 기기는 설정 AP(AIPLANT-이름)로 바뀌고 S3가 붙어서 넣어 준다 |
 
 ## 7. 시연 대비
