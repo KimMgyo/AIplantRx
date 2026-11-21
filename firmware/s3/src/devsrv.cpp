@@ -1,4 +1,5 @@
 #include "devsrv.h"
+#include "fwupdate.h"
 #include "app.h"
 #include "lvgl_v8_port.h"
 #include "net.h"
@@ -67,21 +68,34 @@ static void h_info() {
     // Why the last boot happened and how close each task came to its stack end, so a crash can be told
     // apart from a power dip without a USB cable (1 power-on, 3 software, 4 panic, 5/6/7 watchdogs,
     // 9 brownout).
-    static const char *TASKS[] = {"lvgl", "cam", "jpeg", "node", "disc", "net", "dev", "llm"};
+    static const char *TASKS[] = {"lvgl", "cam", "jpeg", "node", "disc", "net", "dev", "llm", "fwu"};
     char st[160] = "";
     int k = 0;
     for (const char *t : TASKS) {
         TaskHandle_t h = xTaskGetHandle(t);
         if (h) k += snprintf(st + k, sizeof st - k, "%s\"%s\":%u", k ? "," : "", t, (unsigned)uxTaskGetStackHighWaterMark(h));
     }
-    char b[560];
+    char fw[200];
+    fwu_json(fw, sizeof fw);
+    char b[780];
     snprintf(b, sizeof b,
              "{\"name\":\"%s\",\"ver\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap_int\":%u,\"heap_int_min\":%u,\"psram\":%u,\"uptime_s\":%lu,"
-             "\"reset\":%d,\"stack_free\":{%s}}",
+             "\"reset\":%d,\"stack_free\":{%s},\"fw\":%s}",
              APP_HOST, FW_VERSION, net_ip().c_str(), net_rssi(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned long)(millis() / 1000), (int)esp_reset_reason(), st);
+             (unsigned long)(millis() / 1000), (int)esp_reset_reason(), st, fw);
     s_srv.send(200, "application/json", b);
+}
+
+// GET /update            update state (same as "fw" in /info)
+// GET /update?check=1    ask GitHub now
+// GET /update?install=1  install what the last check found
+static void h_update() {
+    if (s_srv.hasArg("check")) fwu_check_now();
+    if (s_srv.hasArg("install")) fwu_install_now();
+    char fw[200];
+    fwu_json(fw, sizeof fw);
+    s_srv.send(200, "application/json", fw);
 }
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
@@ -190,6 +204,7 @@ static void srv_task(void *) {
             s_srv.on("/reboot", h_reboot);
             s_srv.on("/set", h_set);
             s_srv.on("/perf", h_perf);
+            s_srv.on("/update", h_update);
             s_srv.begin();
             ArduinoOTA.setHostname(APP_HOST);
             ArduinoOTA.setMdnsEnabled(false);       // net.cpp owns mDNS

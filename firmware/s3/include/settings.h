@@ -18,6 +18,7 @@ struct Settings {
     uint8_t ai_idle_min = 10;
     bool ai_hand = true, ai_device = true, ai_values = true;
     bool demo_fast = false;
+    bool auto_update = true;      // install new releases by itself (fwupdate.h)
 };
 
 // Targets and schedule the devkit runs (LLM_ARCHITECTURE.md). Stored as one blob.

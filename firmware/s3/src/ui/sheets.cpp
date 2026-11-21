@@ -2,6 +2,7 @@
 // (UI.md 4). They live on lv_layer_top; the dim behind them is drawn once.
 #include "ui_int.h"
 #include "app.h"
+#include "ui.h"
 
 static struct {
     lv_obj_t *dim, *ta, *kb;
@@ -10,11 +11,17 @@ static struct {
     int mode;                // 0 lower, 1 upper, 2 symbols, 3 more symbols
 } K;
 
+// The firmware-update card (ui_update_overlay). Its objects live under K.dim like any sheet.
+static struct {
+    lv_obj_t *ver, *msg, *fill;
+} U;
+
 bool sheet_open() { return K.dim != nullptr; }
 
 void sheet_close() {
     if (K.dim) lv_obj_del(K.dim);
     memset(&K, 0, sizeof(K));
+    memset(&U, 0, sizeof(U));
 }
 
 // Buttons close the sheet they sit on, so the delete waits until their event has finished.
@@ -64,6 +71,41 @@ void sheet_info(const char *title, const char *body) {
     lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 56);
     lv_obj_t *ok = sheet_cap(s, "확인", true, [](lv_event_t *) { close_async(); });
     lv_obj_align(ok, LV_ALIGN_BOTTOM_MID, 0, -18);
+}
+
+// ---------------------------------------------------------------- firmware update
+
+static const int UPD_BAR_W = 380;
+
+void ui_update_overlay(const char *ver, int pct, const char *msg) {
+    if (!U.fill) {
+        dim_layer();
+        lv_obj_t *s = sheet_box(190, 140, 420, 190);
+        lv_obj_t *t = label(s, &f_s16, P->text, "소프트웨어 업데이트");
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 22);
+        U.ver = label(s, &f_r15, P->text2, "");
+        lv_obj_align(U.ver, LV_ALIGN_TOP_MID, 0, 56);
+        fill(s, 20, 102, UPD_BAR_W, 8, P->prog, 4);
+        U.fill = fill(s, 20, 102, 8, 8, P->prog_fill, 4);
+        U.msg = label(s, &f_m15, P->text, "");
+        lv_obj_align(U.msg, LV_ALIGN_TOP_MID, 0, 128);
+    }
+    char b[48];
+    snprintf(b, sizeof b, "AIplantRx %s", ver);
+    set_text(U.ver, b);
+    lv_obj_align(U.ver, LV_ALIGN_TOP_MID, 0, 56);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int w = UPD_BAR_W * pct / 100;
+    lv_obj_set_width(U.fill, w < 8 ? 8 : w);
+    if (pct < 100) snprintf(b, sizeof b, "%s %d%%", msg, pct);
+    else strlcpy(b, msg, sizeof b);
+    set_text(U.msg, b);
+    lv_obj_align(U.msg, LV_ALIGN_TOP_MID, 0, 128);
+}
+
+void ui_update_overlay_close() {
+    if (U.fill) sheet_close();
 }
 
 // ---------------------------------------------------------------- keyboard

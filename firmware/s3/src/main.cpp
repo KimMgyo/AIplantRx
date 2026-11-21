@@ -8,6 +8,7 @@
 #include <lvgl.h>
 #include "app.h"
 #include "devsrv.h"
+#include "fwupdate.h"
 #include "lvgl_v8_port.h"
 #include "net.h"
 #include "nodes.h"
@@ -85,6 +86,7 @@ void setup() {
     lvgl_port_unlock();
     devsrv_init();
     devsrv_serial_init();
+    fwu_init();
     delay(200);
     if (bl) bl->on();
     Serial.printf("[boot] ui ready, heap int=%u psram=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

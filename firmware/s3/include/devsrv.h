@@ -7,6 +7,7 @@
 //   GET /set?llm_url=..&llm_key=..&pn_key=..   (any of them; saved to NVS)
 //   GET /set?theme=0..2 | /set?screen=main | /set?screen=settings&page=N
 //   GET /perf[?reset=1]   frame timing (perf.h)
+//   GET /update[?check=1|?install=1]   firmware update state, check or install (fwupdate.h)
 //   GET /reboot
 //
 // The same over the USB serial port (115200, one command per line), for when there is no Wi-Fi:

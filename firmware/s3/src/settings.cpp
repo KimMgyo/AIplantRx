@@ -38,6 +38,7 @@ void settings_load() {
     g_set.ai_device = p.getBool("ai_dev", true);
     g_set.ai_values = p.getBool("ai_val", true);
     g_set.demo_fast = p.getBool("demo", false);
+    g_set.auto_update = p.getBool("autoupd", true);
     p.end();
 
     p.begin("plant", true);
@@ -60,6 +61,7 @@ void settings_save() {
     p.putBool("ai_dev", g_set.ai_device);
     p.putBool("ai_val", g_set.ai_values);
     p.putBool("demo", g_set.demo_fast);
+    p.putBool("autoupd", g_set.auto_update);
     p.end();
 }
 

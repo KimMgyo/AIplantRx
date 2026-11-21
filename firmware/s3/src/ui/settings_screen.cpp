@@ -3,12 +3,14 @@
 #include "ui_int.h"
 #include "ui.h"
 #include "app.h"
+#include "fwupdate.h"
 #include "llm.h"
 #include "net.h"
 #include "nodes.h"
 #include "settings.h"
 #include <WiFi.h>
 #include <esp_mac.h>
+#include <time.h>
 
 enum Page { PG_WIFI, PG_AI, PG_PLANTNET, PG_GENERAL, PG_UPDATE, PG_DEVICES, PG_PLANT, PG_CONTROL, PG_LIGHT, PG_WATER,
             PG_CAMERA, PG_DISPLAY, PG_AITALK, PG_DEMO, PG_ABOUT, PG_COUNT };
@@ -277,10 +279,42 @@ static void page_update(lv_obj_t *c) {
     lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, 4);
     lv_obj_t *h = label(s, &f_b18, P->text, "AIplantRx " FW_VERSION);
     lv_obj_align(h, LV_ALIGN_TOP_MID, 0, 52);
-    lv_obj_t *t = label(s, &f_r13, P->text2, "Wi-Fi로 올리기: pio run -e s3-ota -t upload (" APP_HOST ".local)");
+    FwuInfo u = fwu_info();
+    char b[96];
+    switch (u.state) {
+        case FWU_CHECKING: strlcpy(b, "새 버전을 확인하는 중", sizeof b); break;
+        case FWU_LATEST: strlcpy(b, "최신 버전이에요", sizeof b); break;
+        case FWU_AVAILABLE: snprintf(b, sizeof b, "새 버전 %s이 있어요", u.latest); break;
+        case FWU_INSTALLING: snprintf(b, sizeof b, "%s 받는 중 %d%%", u.latest, u.pct); break;
+        case FWU_RESTARTING: strlcpy(b, "다시 시작하는 중", sizeof b); break;
+        case FWU_FAIL: snprintf(b, sizeof b, "확인하지 못했어요 · %s", u.err); break;
+        default: strlcpy(b, u.pending ? "새 버전을 점검하는 중" : "아직 확인하지 않았어요", sizeof b); break;
+    }
+    lv_obj_t *t = label(s, &f_r13, P->text2, b);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 78);
-    hdr(c, "기기");
+
     lv_obj_t *p = plat(c);
+    lv_obj_t *r = row(p, "업데이트 확인");
+    if (u.state == FWU_CHECKING || u.state == FWU_INSTALLING || u.state == FWU_RESTARTING) spinner(r, 15);
+    else if (u.state == FWU_AVAILABLE) small_cap(r, "지금 설치", [](lv_event_t *) { fwu_install_now(); }, nullptr, true);
+    else small_cap(r, "확인", [](lv_event_t *) { fwu_check_now(); }, nullptr, true);
+    if (u.checked) {
+        time_t ts = u.checked;
+        struct tm tm;
+        localtime_r(&ts, &tm);
+        snprintf(b, sizeof b, "%d월 %d일 %02d:%02d", tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+        val(row(p, "마지막 확인"), b);
+    }
+    toggle(row(p, "자동 업데이트"), g_set.auto_update,
+           [](lv_event_t *e) { g_set.auto_update = toggle_on(lv_event_get_target(e)); settings_save(); }, nullptr);
+    if (u.rolled_back[0]) {
+        snprintf(b, sizeof b, "%s → 이전 버전", u.rolled_back);
+        val(row(p, "되돌림"), b);
+    }
+    foot(c, "GitHub Releases를 6시간마다 확인합니다. 자동 업데이트를 켜 두면 메인 화면을 10분 동안 아무도 만지지 않을 때 "
+            "설치합니다. 시연 중에는 끄세요. 새 버전은 2분 안에 Wi-Fi에 다시 붙어야 확정되고, 아니면 이전 버전으로 돌아갑니다.");
+    hdr(c, "기기");
+    p = plat(c);
     val(row(p, "메인 화면", "S3 · " FW_VERSION " · 이 기기"), "현재");
     const char *nm[3] = {"카메라", "센서 노드", "OLED"};
     const char *hw[3] = {"CAM", "devkit", "C3"};
@@ -290,7 +324,7 @@ static void page_update(lv_obj_t *c) {
         snprintf(sub, sizeof sub, "%s · %s", hw[k], ni.online ? (ni.ver[0] ? ni.ver : "버전 모름") : "찾는 중");
         val(row(p, nm[k], sub), ni.online ? "연결됨" : "-");
     }
-    foot(c, "다른 기기의 업데이트(POST /ota)와 GitHub Releases 확인은 각 기기의 새 펌웨어와 함께 켭니다.");
+    foot(c, "다른 기기의 업데이트(POST /ota)는 각 기기의 새 펌웨어와 함께 켭니다.");
 }
 
 static void page_devices(lv_obj_t *c) {
@@ -517,7 +551,8 @@ static uint32_t page_sig() {
             break;
         }
         case PG_AI: s = s * 31 + llm_test().state; break;
-        case PG_UPDATE: case PG_DEVICES: case PG_CONTROL: case PG_LIGHT: case PG_WATER:
+        case PG_UPDATE: s = s * 31 + fwu_gen(); [[fallthrough]];
+        case PG_DEVICES: case PG_CONTROL: case PG_LIGHT: case PG_WATER:
             for (int k = 0; k < 3; k++) s = s * 31 + node_info((Role)k).online;
             s = s * 31 + net_state();
             break;
@@ -588,6 +623,7 @@ static void side_values() {
             case PG_WIFI: strlcpy(b, net_state() == NET_UP ? net_ssid().c_str() : g_set.wifi_on ? "연결 안 됨" : "끔", sizeof b); break;
             case PG_AI: strlcpy(b, llm_ok() ? "연결됨" : "", sizeof b); break;
             case PG_PLANTNET: strlcpy(b, g_set.plantnet_key.length() ? "" : "키 없음", sizeof b); break;
+            case PG_UPDATE: strlcpy(b, fwu_info().state == FWU_AVAILABLE ? "새 버전" : "", sizeof b); break;
             case PG_DEVICES: snprintf(b, sizeof b, "%d대", 1 + nodes_online()); break;
             case PG_PLANT: strlcpy(b, g_prof.identified ? g_prof.name_ko : "기본", sizeof b); break;
             case PG_DISPLAY: strlcpy(b, g_set.theme == 1 ? "다크" : g_set.theme == 2 ? "라이트" : "유리", sizeof b); break;

@@ -230,3 +230,7 @@ void ui_set_theme(uint8_t t) {
     lv_scr_load(g_settings);
     lv_obj_del(tmp);
 }
+
+bool ui_main_idle(uint32_t ms) {
+    return g_main && lv_scr_act() == g_main && !sheet_open() && lv_disp_get_inactive_time(nullptr) >= ms;
+}

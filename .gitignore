@@ -23,3 +23,6 @@ cases/*/research/
 # but keep local env files out just in case.
 .env
 *.env
+
+# Release images and manifests built by tools/release.py (they are uploaded to GitHub Releases)
+/dist/
