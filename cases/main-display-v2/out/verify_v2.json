@@ -1,0 +1,80 @@
+{
+ "module": {
+  "v2_01_pod_left x brass standoffs": 2.309,
+  "v2_02_pod_right x brass standoffs": 2.309
+ },
+ "keepouts": {},
+ "parts": {},
+ "OLED pushed 0.35 back x lid posts (> 0: posts hold it)": 3.63,
+ "lid on its fitting path x body / board / back parts (all 0)": [
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "lid slid straight up from the bottom (old way) x back parts (> 0: posts would hit C6 / C3)": 1.375,
+ "depth": {
+  "glass front -> pod inner face (wire room, need >= 25)": 25.55,
+  "glass front -> back face": 27.85,
+  "wall front edge proud of glass": 0.55,
+  "case depth incl. wall lip": 28.4,
+  "spine front face (PCBA parts end -13.7)": -16.1,
+  "C3 USB-C face behind the back face": 8.45
+ },
+ "screws (M3 x 10: seat -> tip, nut zone)": {
+  "module standoffs (4)": [
+   -23.1,
+   -13.100000000000001,
+   "into brass standoff from -16.5, bite 3.40"
+  ],
+  "walls -> pods / spine": [
+   -24.5,
+   -14.5,
+   [
+    -21.5,
+    -18.35
+   ]
+  ],
+  "OLED cells (5)": [
+   -24.5,
+   -14.5,
+   [
+    -21.5,
+    -18.35
+   ]
+  ],
+  "C3 cartridge (2)": [
+   -30.150000000000002,
+   -20.150000000000002,
+   [
+    -24.900000000000002,
+    -22.500000000000004
+   ]
+  ],
+  "TCA (2, from the board side)": [
+   -17.3,
+   -27.3,
+   [
+    -22.75,
+    -19.6
+   ]
+  ],
+  "count": 27
+ },
+ "stand": {
+  "desk contact front (case bottom-back edge) wz": 4.1,
+  "leg rear end wz": -80.9,
+  "centre of mass wz (est.)": -8.3,
+  "margin to front / rear tipping edge (mm)": [
+   12.4,
+   72.6
+  ],
+  "total mass est. g": 462
+ }
+}

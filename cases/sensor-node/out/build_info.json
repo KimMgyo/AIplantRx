@@ -1,0 +1,32 @@
+{
+  "body": {
+    "size": [
+      140.0,
+      140.0,
+      38.0
+    ],
+    "volume_cm3": 131.23,
+    "valid": true
+  },
+  "scd_cap": {
+    "size": [
+      31.06,
+      28.52,
+      2.65
+    ],
+    "volume_cm3": 1.24,
+    "valid": true
+  },
+  "lid": {
+    "size": [
+      140.0,
+      140.0,
+      5.95
+    ],
+    "volume_cm3": 30.73,
+    "valid": true
+  },
+  "interference_mm3": {},
+  "lid_x_body_mm3": 0,
+  "scd_cap_x_body_mm3": 0
+}

@@ -1,0 +1,25 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Build and tool output
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+.venv/
+
+# Case generation: regenerable caches, the SD-card copy of out/gcode, and downloaded
+# third-party reference files (Waveshare STEP/PDF, MakerWorld models) whose licences
+# do not clearly allow redistribution.
+cases/**/_cache/
+cases/**/sd_card/
+cases/*/research/
+
+# Operations notes for the school PC that runs the LLM (SSH, remote desktop, account
+# details). Local only: the public docs refer to it but it is not published.
+/LLM_SERVER.md
+
+# Secrets never live in this tree (keys are entered on the S3 and kept in NVS),
+# but keep local env files out just in case.
+.env
+*.env

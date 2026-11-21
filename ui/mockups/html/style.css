@@ -1,0 +1,229 @@
+/* AIplantRx v2 S3 mockups, 800x480. One layout, three themes (glass, dark, light) that only swap the palette.
+   Every screen fills the whole panel: no outer window, margin or round corner.
+   Only what LVGL 8.4 draws cheaply in software on the S3 (UI.md 1.6): a background per screen (baked image in
+   glass, plain rectangles in dark and light; see bake.css), opaque fills or 2-stop vertical/horizontal
+   gradients, radius, 1 px lines, and text/icons with opacity. Translucent fills only for the glass sidebar
+   selection, the small tags over video and the one-shot dim behind sheets. No shadows, blur, masks,
+   radial/conic gradients, text shadows or corner clipping (pieces of the background cover round corners).
+   Font sizes and letter spacing are whole pixels (lv_font_conv and LVGL take integers). */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 800px; height: 480px; overflow: hidden; }
+body { font-family: 'Pretendard', sans-serif; -webkit-font-smoothing: antialiased; color: var(--text);
+  background: var(--screen) 0 0/800px 480px; position: relative; word-break: keep-all; }
+.i { font-family: 'Framework7 Icons'; font-weight: normal; font-style: normal; line-height: 1; letter-spacing: normal;
+  display: inline-block; white-space: nowrap; -webkit-font-feature-settings: 'liga'; font-feature-settings: 'liga'; }
+.tn { font-variant-numeric: tabular-nums; }
+
+/* ---------------------------------------------------------------- themes */
+.t-glass {
+  --screen: #2B241D; --text: #fff; --text2: rgba(255,255,255,.55); --text3: rgba(255,255,255,.35); --chev: rgba(255,255,255,.75);
+  --status: rgba(255,255,255,.9); --plat: #2F271B; --sep: #40362A;
+  --sel: rgba(255,255,255,.13); --sel-line: rgba(255,255,255,.15);
+  --cap: #6B6255; --cap-text: #fff; --cap-hi: #837C72; --cap-hi-text: #fff; --cap-plat: #504940;
+  --go: #30D158; --sw-off: #554E44; --prog: #504940; --prog-fill: #fff; --spin: #746C60; --spin-top: #D3D1CD;
+  --ok-win: #2F522A; --ok-sheet: #375830; --ok-text: #30D158; --warn-text: #FF9F0A; --gray-glyph: #56565C;
+  --sheet1: #675A48; --sheet2: #594E3E; --sheet-plat: #392F23; --sheet-sep: #493E31; --sheet-cap: #7F7465; --sheet-cap-hi: #958C7F;
+  --sheet-line: rgba(255,255,255,.1); --kb1: #564B3C; --kb2: #483F32; --key: #696155; --key-f: #5B5245; --key-ret: #847D73;
+  --dim: rgba(0,0,0,.4);
+  --hl-temp: #FF9F0A; --hl-water: #64D2FF; --hl-nutri: #BF5AF2;
+}
+.t-dark {
+  --screen: #1C1C1E; --text: #fff; --text2: rgba(235,235,245,.6); --text3: rgba(235,235,245,.3); --chev: rgba(235,235,245,.3);
+  --status: rgba(235,235,245,.9); --plat: #2C2C2E; --sep: #464649;
+  --sel: #3A3A3C; --sel-line: transparent;
+  --cap: #3A3A3C; --cap-text: #fff; --cap-hi: #0A84FF; --cap-hi-text: #fff; --cap-plat: #3E3E42;
+  --go: #30D158; --sw-off: #444448; --prog: #3E3E42; --prog-fill: #0A84FF; --spin: #48484A; --spin-top: #AEAEB2;
+  --ok-win: #203D28; --ok-sheet: #2D4D36; --ok-text: #30D158; --warn-text: #FF9F0A; --gray-glyph: #56565C;
+  --sheet1: #2C2C2E; --sheet2: #2C2C2E; --sheet-plat: #3A3A3C; --sheet-sep: #4A4A4D; --sheet-cap: #48484A; --sheet-cap-hi: #0A84FF;
+  --sheet-line: transparent; --kb1: #2C2C2E; --kb2: #2C2C2E; --key: #4A4A4D; --key-f: #3A3A3C; --key-ret: #0A84FF;
+  --dim: rgba(0,0,0,.5);
+  --hl-temp: #FF9F0A; --hl-water: #64D2FF; --hl-nutri: #BF5AF2;
+}
+.t-light {
+  --screen: #F2F2F7; --text: #000; --text2: rgba(60,60,67,.6); --text3: rgba(60,60,67,.3); --chev: rgba(60,60,67,.3);
+  --status: rgba(60,60,67,.8); --plat: #FFFFFF; --sep: #E0E0E3;
+  --sel: #FFFFFF; --sel-line: transparent;
+  --cap: #E3E3E9; --cap-text: #007AFF; --cap-hi: #007AFF; --cap-hi-text: #fff; --cap-plat: #EFEFF0;
+  --go: #34C759; --sw-off: #E9E9EA; --prog: #E5E5EA; --prog-fill: #007AFF; --spin: #D1D1D6; --spin-top: #8E8E93;
+  --ok-win: #D4EFDE; --ok-sheet: #D4EFDE; --ok-text: #248A3D; --warn-text: #C76A00; --gray-glyph: #56565C;
+  --sheet1: #F2F2F7; --sheet2: #F2F2F7; --sheet-plat: #FFFFFF; --sheet-sep: #E0E0E3; --sheet-cap: #E3E3E9; --sheet-cap-hi: #007AFF;
+  --sheet-line: transparent; --kb1: #D3D6DC; --kb2: #D3D6DC; --key: #FFFFFF; --key-f: #ADB3BC; --key-ret: #007AFF;
+  --dim: rgba(0,0,0,.25);
+  --hl-temp: #C76A00; --hl-water: #0071A4; --hl-nutri: #8944AB;
+}
+.t-glass.main { background-image: url(assets/bg_main_glass.png); } .t-glass.vos { background-image: url(assets/bg_settings_glass.png); }
+.t-dark.main { background-image: url(assets/bg_main_dark.png); } .t-dark.vos { background-image: url(assets/bg_settings_dark.png); }
+.t-light.main { background-image: url(assets/bg_main_light.png); } .t-light.vos { background-image: url(assets/bg_settings_light.png); }
+
+/* ---------------------------------------------------------------- shared pieces */
+.vic { width: 28px; height: 28px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 15px; color: #fff; flex: none;
+  background: linear-gradient(180deg, var(--c1), var(--c2)); }
+.vic.gray { --c1: #EDEDF0; --c2: #ADADB3; color: var(--gray-glyph); }
+.dot { width: 8px; height: 8px; border-radius: 4px; background: var(--go); display: inline-block; flex: none; }
+.vplat { background: var(--plat); border-radius: 18px; margin-bottom: 18px; }
+.vplat .r { min-height: 49px; display: flex; align-items: center; gap: 13px; padding: 0 16px; font-size: 15px; font-weight: 500; position: relative; }
+.vplat .r + .r::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: var(--sep); }
+.vplat .r .t { flex: 1; min-width: 0; white-space: nowrap; }
+.vplat .r .t small { display: block; font-size: 12px; color: var(--text2); font-weight: 400; margin-top: 1px; }
+.vplat .r .v { color: var(--text2); font-weight: 400; white-space: nowrap; }
+.vplat .r.tall { min-height: 56px; }
+.vchev { color: var(--chev); font-size: 13px; font-weight: 700; }
+.vh { font-size: 15px; font-weight: 700; margin: 14px 16px 8px; display: flex; align-items: center; gap: 8px; }
+.vf { font-size: 12px; color: var(--text2); margin: -10px 16px 18px; line-height: 1.45; }
+.vsw { width: 46px; height: 28px; border-radius: 14px; background: var(--go); position: relative; flex: none; }
+.vsw::after { content: ''; position: absolute; top: 2px; left: 20px; width: 24px; height: 24px; border-radius: 12px; background: #fff; }
+.vsw.off { background: var(--sw-off); } .vsw.off::after { left: 2px; }
+.vcap { height: 32px; padding: 0 16px; border-radius: 16px; background: var(--cap); color: var(--cap-text); font-size: 14px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; }
+.vcap.hi { background: var(--cap-hi); color: var(--cap-hi-text); } .vcap.sm { height: 28px; padding: 0 12px; font-size: 13px; }
+.vplat .vcap { background: var(--cap-plat); }
+.vspin { width: 13px; height: 13px; border: 2px solid var(--spin); border-top-color: var(--spin-top); border-radius: 50%; }
+.vprog { width: 84px; height: 6px; border-radius: 3px; background: var(--prog); }
+.vprog > i { display: block; height: 100%; border-radius: 3px; background: var(--prog-fill); }
+.vbadge { min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; background: #FF453A; color: #fff; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+.cap { position: absolute; width: 20px; height: 20px; display: block; }
+
+/* sheets over a dimmed screen */
+.vdim { position: absolute; inset: 0; background-size: 800px 480px; }
+.vdim::after { content: ''; position: absolute; inset: 0; background: var(--dim); } /* drawn once when the sheet opens; video pauses */
+.vsheet { position: absolute; border-radius: 28px; color: var(--text); background: linear-gradient(180deg, var(--sheet1), var(--sheet2));
+  outline: 1px solid var(--sheet-line); outline-offset: -1px; }
+.vsheet .bar { height: 56px; display: flex; align-items: center; padding: 0 14px; position: relative; }
+.vsheet .bar .title { position: absolute; left: 0; right: 0; text-align: center; font-size: 16px; font-weight: 700; }
+.vsheet .bar .vcap { position: relative; z-index: 1; } .vsheet .bar .vcap.hi { margin-left: auto; }
+.vsheet .vplat { background: var(--sheet-plat); }
+.vsheet .vplat .r + .r::before { background: var(--sheet-sep); }
+.vsheet .vcap { background: var(--sheet-cap); } .vsheet .vcap.hi { background: var(--sheet-cap-hi); }
+.vcirc { width: 34px; height: 34px; border-radius: 17px; background: var(--sheet-cap); color: var(--text); display: flex; align-items: center;
+  justify-content: center; font-size: 15px; font-weight: 600; position: relative; z-index: 1; }
+.vcirc.hi { background: var(--sheet-cap-hi); color: var(--cap-hi-text); margin-left: auto; }
+.vkb { position: absolute; left: 56px; right: 56px; bottom: 12px; height: 214px; border-radius: 30px; padding: 12px 12px 10px;
+  background: linear-gradient(180deg, var(--kb1), var(--kb2)); outline: 1px solid var(--sheet-line); outline-offset: -1px; }
+.vkr { display: flex; gap: 7px; margin-bottom: 7px; height: 41px; }
+.vk { flex: 1; border-radius: 12px; background: var(--key); display: flex; align-items: center; justify-content: center; font-size: 19px; font-weight: 500; color: var(--text); }
+.vk.f { background: var(--key-f); font-size: 14px; } .vk.ret { background: var(--key-ret); color: var(--cap-hi-text); font-weight: 700; font-size: 15px; }
+
+/* ---------------------------------------------------------------- main */
+/* Full screen, 16 px from the edges (no outer window). Left column 432 px: status, plant, today's plan, AI note,
+   buttons. Right column the two camera tiles, 320x220 with radius 20, showing the 320x240 frames 1:1.
+   Sensor values live on the OLEDs; the main screen shows what the AI decided and what the devices do. */
+.mleft { position: absolute; left: 16px; top: 16px; width: 432px; height: 448px; }
+.status { position: absolute; top: 0; left: 0; right: 0; height: 18px; display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.status .d { color: var(--text2); font-weight: 500; }
+.status .icons { margin-left: auto; display: flex; gap: 11px; font-size: 14px; color: var(--status); }
+.hero { position: absolute; top: 30px; left: 0; right: 0; height: 68px; display: flex; gap: 14px; align-items: center; }
+.hero .ph { width: 68px; height: 68px; border-radius: 18px; overflow: hidden; flex: none; } /* pre-cut round photo on the S3 */
+.hero .ph img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hero .tx { flex: 1; min-width: 0; }
+.hero h1 { font-size: 32px; line-height: 36px; font-weight: 700; letter-spacing: -1px; display: inline-block; }
+.aicap { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border-radius: 13px;
+  background: var(--ok-win); color: var(--ok-text); font-size: 13px; font-weight: 600; vertical-align: 6px; margin-left: 8px; }
+.hero .sub { font-size: 14px; line-height: 17px; color: var(--text2); white-space: nowrap; }
+.hero .run { font-size: 13px; line-height: 17px; font-weight: 600; color: var(--ok-text); display: flex; align-items: center; gap: 6px; margin-top: 1px; }
+.hero .run .dot { width: 7px; height: 7px; border-radius: 4px; }
+.hero .run.warn { color: var(--warn-text); } .hero .run.warn .dot { background: var(--warn-text); }
+.circ { position: absolute; right: 0; top: 0; width: 36px; height: 36px; border-radius: 18px; background: var(--cap); color: var(--text);
+  display: flex; align-items: center; justify-content: center; font-size: 19px; }
+.plan { position: absolute; top: 110px; left: 0; right: 0; border-radius: 18px; background: var(--plat); padding: 10px 14px; }
+.plan .h { display: flex; align-items: baseline; font-size: 14px; height: 18px; } .plan .h b { font-weight: 600; }
+.plan .h span { margin-left: auto; color: var(--text2); font-size: 12px; }
+.lanes { position: relative; margin-top: 8px; }
+.lane { display: grid; grid-template-columns: 18px 34px 1fr 104px; gap: 8px; align-items: center; height: 22px; margin-bottom: 4px; }
+.lane:last-child { margin-bottom: 0; }
+.lane > .i { font-size: 15px; text-align: center; }
+.lane .ln { font-size: 13px; font-weight: 600; }
+.lane .lt { position: relative; height: 8px; border-radius: 4px; background: var(--prog); }
+.lane .lt i { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+.lane .lt i.pt { width: 8px; margin-left: -4px; }
+.lane .ls { font-size: 12px; color: var(--text2); white-space: nowrap; text-align: right; }
+.lane .ls b { color: var(--text); font-weight: 600; margin-right: 4px; }
+/* the track column starts 68 px in (18 + 8 + 34 + 8) and ends 112 px before the right (104 + 8) */
+.lanes .now { position: absolute; top: -3px; bottom: -3px; left: calc(68px + (100% - 180px) * var(--now)); width: 2px; margin-left: -1px;
+  background: var(--text); border-radius: 1px; outline: 2px solid var(--plat); }
+.hours { position: relative; height: 12px; margin: 4px 112px 0 68px; font-size: 11px; color: var(--text3); }
+.hours span { position: absolute; transform: translateX(-50%); white-space: nowrap; } .hours span:first-child { transform: none; } .hours span:last-child { transform: translateX(-100%); }
+.ai { position: absolute; top: 284px; left: 0; right: 0; height: 112px; border-radius: 18px; background: var(--plat); padding: 12px 14px; }
+.ai .h { display: flex; align-items: center; gap: 7px; font-size: 14px; font-weight: 600; height: 22px; }
+/* header: glyph, title, how it was written (model and seconds, or a spinner while it streams), why it spoke */
+.ai .h .meta { display: flex; align-items: center; gap: 5px; margin-left: 2px; font-size: 12px; font-weight: 400; color: var(--text2); white-space: nowrap; }
+.ai .h .meta .vspin { width: 11px; height: 11px; }
+.ai .why { margin-left: auto; height: 22px; padding: 0 9px; border-radius: 11px; background: var(--cap-plat); font-size: 12px; font-weight: 600;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.ai .why .i { font-size: 12px; }
+.n.t { color: var(--hl-temp); } .n.w { color: var(--hl-water); } .n.e { color: var(--hl-nutri); }
+.cur { display: inline-block; width: 2px; height: 17px; background: var(--text); vertical-align: -3px; margin-left: 2px; }
+.vplat.log .t { overflow: hidden; }
+.vplat.log .l1 { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.aig { width: 22px; height: 22px; border-radius: 11px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff;
+  background: url(assets/ai_glyph.png) 0 0/22px 22px; }
+.ai p { font-size: 15px; line-height: 20px; margin-top: 6px; } /* up to 3 lines, 100 characters */
+.actions { position: absolute; top: 408px; left: 0; right: 0; display: flex; gap: 8px; }
+.pbtn, .sbtn { height: 40px; border-radius: 20px; padding: 0 18px; display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; }
+.pbtn { background: var(--go); color: #fff; } .pbtn .i { font-size: 19px; }
+.sbtn { background: var(--cap); color: var(--cap-text); }
+.mright { position: absolute; left: 464px; top: 16px; width: 320px; }
+.cam { position: relative; width: 320px; height: 220px; overflow: hidden; margin-bottom: 8px; background: #000; }
+.cam img.v { width: 320px; height: 240px; position: absolute; top: -10px; left: 0; display: block; }
+/* Over video only small things: translucent tags, a 2 px box, the crosshair and the legend image. */
+.tag, .xhv, .legend span { position: absolute; border-radius: 12px; background: rgba(0,0,0,.45); color: #fff;
+  font-weight: 600; display: flex; align-items: center; white-space: nowrap; }
+.tag { height: 24px; padding: 0 9px; font-size: 12px; gap: 5px; }
+.tag.live::before { content: ''; width: 6px; height: 6px; border-radius: 3px; background: #FF453A; }
+.pbox { position: absolute; border: 2px solid #fff; border-radius: 10px; }
+.plabel { position: absolute; height: 22px; padding: 0 8px; border-radius: 11px; background: #fff; color: #000; font-size: 13px; font-weight: 700; display: flex; align-items: center; }
+.xh { position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px; }
+.xh::before, .xh::after { content: ''; position: absolute; background: #fff; }
+.xh::before { left: 7px; top: 0; width: 2px; height: 16px; } .xh::after { top: 7px; left: 0; width: 16px; height: 2px; }
+.xhv { height: 20px; padding: 0 6px; border-radius: 10px; font-size: 12px; font-weight: 700; }
+.legend { position: absolute; right: 10px; top: 40px; width: 6px; height: 130px; background: url(assets/legend.png) 0 0/6px 130px; }
+.legend span { right: 10px; height: 18px; padding: 0 5px; border-radius: 9px; font-size: 11px; font-weight: 700; }
+
+/* ---------------------------------------------------------------- identify result sheet */
+.res .head { display: flex; gap: 14px; padding: 0 18px; align-items: center; }
+.res .photo { width: 120px; height: 90px; border-radius: 12px; overflow: hidden; flex: none; }
+.res .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.res h2 { font-size: 26px; font-weight: 700; letter-spacing: -1px; display: flex; align-items: center; gap: 8px; }
+.conf { height: 24px; padding: 0 9px; border-radius: 12px; background: var(--ok-sheet); color: var(--ok-text); font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; letter-spacing: 0; }
+.res .sci { font-size: 14px; color: var(--text2); margin-top: 4px; }
+.res .src { font-size: 13px; color: var(--text2); margin-top: 8px; display: flex; align-items: center; gap: 5px; }
+.res .body { padding: 0 18px; }
+.res .vh { margin: 10px 14px 6px; }
+.res .vplat { margin-bottom: 10px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; }
+.grid2 .g { position: relative; display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 12px; font-size: 14px; font-weight: 500; }
+.grid2 .g:nth-child(odd) { border-right: 1px solid var(--sheet-sep); }
+.grid2 .g:nth-child(n+3)::after { content: ''; position: absolute; top: 0; right: 0; left: 44px; height: 1px; background: var(--sheet-sep); }
+.grid2 .g .t { flex: 1; min-width: 0; white-space: nowrap; }
+.grid2 .g .v { font-weight: 600; white-space: nowrap; }
+.grid2 .vic { width: 24px; height: 24px; border-radius: 12px; font-size: 13px; }
+.intro { padding: 10px 14px; font-size: 14px; line-height: 1.5; }
+.steps { display: flex; gap: 12px; font-size: 13px; color: var(--text2); padding: 0 32px; margin-top: 10px; align-items: center; }
+.steps .i { color: var(--ok-text); font-size: 13px; margin-right: 3px; }
+.steps .end { margin-left: auto; }
+
+/* ---------------------------------------------------------------- settings (visionOS Settings) */
+/* Sizes follow Settings-visionOS (window 1000x730 pt, HStack spacing 15, circle icon 32, list padding 45,
+   sign-in icon 50) and system list metrics measured from its README screenshots, all scaled by 0.88
+   (body 17 pt -> 15 px). The window fills the screen (no outer margin, round corner or window bar); its glass,
+   the sidebar tint or divider are the background. The close button sits at the right of the title bar. */
+.win { position: absolute; inset: 0; }
+.vside { position: absolute; left: 0; top: 0; bottom: 0; width: 242px; }
+.vscroll { position: absolute; left: 12px; right: 10px; top: 18px; bottom: 0; overflow: hidden; }
+.vfade { position: absolute; left: 0; top: 18px; width: 242px; height: 30px; display: block; }
+.vacct { display: flex; gap: 9px; padding: 0 6px 0 4px; align-items: flex-start; margin-bottom: 26px; }
+.vacct .av { width: 44px; height: 44px; border-radius: 22px; overflow: hidden; flex: none; }
+.vacct .av img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.vacct b { font-size: 15px; font-weight: 700; display: block; margin-top: 2px; }
+.vacct small { font-size: 12px; color: var(--text2); line-height: 1.38; display: block; margin-top: 2px; }
+.vgrp { margin-bottom: 21px; }
+.vrow { height: 46px; display: flex; align-items: center; gap: 13px; padding: 0 9px; border-radius: 14px; font-size: 15px; font-weight: 500; }
+.vrow.sel { background: var(--sel); outline: 1px solid var(--sel-line); outline-offset: -1px; }
+.vrow .v { margin-left: auto; color: var(--text2); font-size: 13px; font-weight: 400; white-space: nowrap; }
+.vdet { position: absolute; left: 242px; top: 0; right: 0; bottom: 0; overflow: hidden; }
+.vtitle { height: 60px; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; position: relative; }
+.vclose { position: absolute; right: 16px; top: 13px; width: 34px; height: 34px; border-radius: 17px; background: var(--cap); color: var(--text);
+  display: flex; align-items: center; justify-content: center; font-size: 15px; font-weight: 600; }
+.vlist { padding: 0 40px; }
+.vstatus { text-align: center; padding: 4px 0 14px; }
+.vstatus .i { font-size: 40px; } .vstatus h2 { font-size: 18px; font-weight: 700; margin-top: 6px; }
+.vstatus p { font-size: 13px; color: var(--text2); margin: 3px 0 10px; }

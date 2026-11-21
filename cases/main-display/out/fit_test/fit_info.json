@@ -1,0 +1,117 @@
+{
+  "fit_01_bezel_gauge": {
+    "size": [
+      196.8,
+      114.6,
+      2.65
+    ],
+    "solids": 1
+  },
+  "fit_02_oled_cell": {
+    "size": [
+      34.0,
+      31.9,
+      5.2
+    ],
+    "solids": 1
+  },
+  "fit_03_nut_chin": {
+    "size": [
+      13.9,
+      20.5,
+      11.75
+    ],
+    "solids": 1
+  },
+  "fit_04_cover_chin": {
+    "size": [
+      13.9,
+      20.5,
+      5.1
+    ],
+    "solids": 1
+  },
+  "fit_05_nut_top": {
+    "size": [
+      16.0,
+      8.6,
+      11.75
+    ],
+    "solids": 1
+  },
+  "fit_06_cover_top": {
+    "size": [
+      16.0,
+      11.3,
+      5.1
+    ],
+    "solids": 1
+  },
+  "fit_08_standoff": {
+    "size": [
+      14.0,
+      14.0,
+      12.45
+    ],
+    "solids": 1
+  },
+  "fit_09_screw_gauge": {
+    "size": [
+      166.8,
+      94.9,
+      17.7
+    ],
+    "solids": 1
+  },
+  "fit_13_oled_frame_slice": {
+    "size": [
+      49.8,
+      36.9,
+      28.55
+    ],
+    "solids": 1
+  },
+  "fit_14_oled_cover_slice": {
+    "size": [
+      49.8,
+      36.9,
+      25.4
+    ],
+    "solids": 1
+  },
+  "plate_C_checks": {
+    "frame slice x cover slice (mm3)": 0.0,
+    "OLED board x frame slice (mm3)": 0.0,
+    "OLED board x cover slice (mm3)": 0.0,
+    "OLED board pushed 0.3 mm back x cover slice (mm3, posts stop it)": 3.063
+  },
+  "fit_15_cover_lower_standoff": {
+    "size": [
+      14.0,
+      14.0,
+      7.2
+    ],
+    "solids": 1
+  },
+  "fit_16_cover_c3_posts": {
+    "size": [
+      25.9,
+      23.6,
+      7.2
+    ],
+    "solids": 1
+  },
+  "04_tca_bracket": {
+    "size": [
+      135.2,
+      49.1,
+      6.5
+    ],
+    "solids": 1
+  },
+  "checks": {
+    "bezel gauge x glass (glass drops in)": 0.0,
+    "screw gauge x module (glass, LCD, bracket, PCB parts)": 0.0,
+    "screw gauge hole centres = cover holes": true
+  }
+}

@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="fonts.css"><link rel="stylesheet" href="style.css"></head>
+<body class="{{THEME}} main">
+<div class="mleft">
+  <div class="status"><span class="tn">14:32</span><span class="d">11월 11일 수요일</span>
+    <span class="icons"><i class="i">wifi</i><i class="i">sparkles</i><i class="i">camera_fill</i><i class="i">thermometer</i></span></div>
+  <div class="hero">
+    <div class="ph"><img src="assets/plant.png"></div>
+    <div class="tx">
+      <h1>바질</h1><span class="aicap"><i class="i">sparkles</i>AI 확인 82%</span>
+      <div class="sub">Ocimum basilicum · 꿀풀과 · 재배 3일째</div>
+      <div class="run"><span class="dot"></span>AI 맞춤 환경으로 자동 운영 중</div>
+    </div>
+    <div class="circ"><i class="i">gear_alt_fill</i></div>
+  </div>
+  <div class="plan">
+    <div class="h"><b>오늘</b><span>AI가 정한 일정</span></div>
+    <div class="lanes" style="--now:.605">
+      <div class="lane"><i class="i" style="color:#FFD60A">lightbulb_fill</i><span class="ln">조명</span>
+        <div class="lt"><i style="left:25%;width:50%;background:#FFD60A"></i></div><span class="ls"><b>켜짐</b>18:00 끔</span></div>
+      <div class="lane"><i class="i" style="color:#FF453A">flame_fill</i><span class="ln">히터</span>
+        <div class="lt"><i style="left:20.1%;width:2.1%;background:#FF453A"></i></div><span class="ls"><b>꺼짐</b>오늘 30분</span></div>
+      <div class="lane"><i class="i" style="color:#32ADE6">drop_fill</i><span class="ln">물</span>
+        <div class="lt"><i class="pt" style="left:40.3%;background:#32ADE6"></i></div><span class="ls"><b>대기</b>오늘 120ml</span></div>
+      <div class="lane"><i class="i" style="color:#BF5AF2">drop_triangle_fill</i><span class="ln">물약</span>
+        <div class="lt"></div><span class="ls"><b>11/14</b>다음 10ml</span></div>
+      <div class="now"></div>
+    </div>
+    <div class="hours"><span style="left:0">0시</span><span style="left:25%">6</span><span style="left:50%">12</span><span style="left:75%">18</span><span style="left:100%">24시</span></div>
+  </div>
+  {{AICARD}}
+  <div class="actions">
+    <div class="pbtn"><i class="i">camera_viewfinder</i>식물 다시 찾기</div>
+    <div class="sbtn">종류 바꾸기</div>
+  </div>
+</div>
+<div class="mright">
+  <div class="cam"><img class="v" src="assets/rgb.png">
+    <span class="tag live" style="left:10px;top:10px">RGB 카메라</span><span class="tag" style="right:10px;top:10px">5 fps</span></div>
+  <div class="cam"><img class="v" src="assets/thermal.png">
+    <span class="tag live" style="left:10px;top:10px">열화상</span>
+    <div class="pbox" style="{{TH_BOX}}"></div>
+    <span class="plabel" style="{{TH_LABEL}}">잎 23.1°</span>
+    <div class="xh" style="{{TH_XH}}"></div><span class="xhv" style="{{TH_XHV}}">{{TH_MAX}}°</span>
+    <div class="legend"><span style="top:-6px">{{TH_HI}}</span><span style="bottom:-6px">{{TH_LO}}</span></div>
+    <span class="tag" style="right:10px;top:10px">공기 24.6° · 잎 23.1° · 차이 −1.5°</span></div>
+</div>
+{{CAMCAPS}}
+</body></html>

@@ -1,0 +1,26 @@
+# PCB mount by Lars Christian Nygård | Download free STL model
+URL: https://www.printables.com/model/300894-pcb-mount
+
+## PCB mount
+
+[1 reviews](https://www.printables.com/model/300894-pcb-mount/comments)[Lars Christian Nygård](https://www.printables.com/@LarsChristian_407868)
+
+[
+
+@LarsChristian\_407868
+
+](https://www.printables.com/@LarsChristian_407868)
+
+Parametric PCB mount customizable to fit any board. Made with openSCAD. Clip in for easy insert/removal of PCB.
+
+## Description
+
+I designed this because I needed a clip in mount for various PCB boards in electronics projects. It's mostly parametric and made in openscad so that it can quickly adapted to any board.
+
+## Tags
+
+---
+
+## Model origin
+
+The author marked this model as their own original creation.

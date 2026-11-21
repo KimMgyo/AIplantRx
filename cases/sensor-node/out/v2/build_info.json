@@ -1,0 +1,40 @@
+{
+  "plate": {
+    "size": [
+      140.0,
+      140.0,
+      24.15
+    ],
+    "volume_cm3": 62.18,
+    "valid": true
+  },
+  "frame": {
+    "size": [
+      140.0,
+      140.0,
+      35.35
+    ],
+    "volume_cm3": 66.83,
+    "valid": true
+  },
+  "lid": {
+    "size": [
+      140.0,
+      140.0,
+      5.95
+    ],
+    "volume_cm3": 30.73,
+    "valid": true
+  },
+  "interference_mm3": {
+    "plate x dev": 1.19,
+    "plate x lr1": 10.05,
+    "plate x lr2": 10.05,
+    "plate x lr3": 10.05,
+    "plate x perf": 0.2,
+    "plate x scd": 20.41
+  },
+  "plate_x_frame_mm3": 0,
+  "lid_x_frame_mm3": 0,
+  "lid_x_plate_mm3": 0
+}

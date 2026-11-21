@@ -1,0 +1,28 @@
+{
+ "sn_01_body_M600": {
+  "ok": true,
+  "time": "5h 51m 32s",
+  "grams": "124.61",
+  "support": "0",
+  "warnings": [
+   "[2026-11-18 14:03:16.117031] [0x00007ef4] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "[2026-11-18 14:03:16.130459] [0x00009034] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "[2026-11-18 14:03:16.145458] [0x0000b818] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth."
+  ],
+  "m600_at_z": "1.25"
+ },
+ "sn_03_scd_cap": {
+  "ok": true,
+  "time": "5m 11s",
+  "grams": "1.64",
+  "support": "0",
+  "warnings": []
+ },
+ "sn_04_lid": {
+  "ok": true,
+  "time": "1h 38m 57s",
+  "grams": "37.60",
+  "support": "0",
+  "warnings": []
+ }
+}

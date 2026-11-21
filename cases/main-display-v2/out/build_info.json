@@ -1,0 +1,161 @@
+{
+  "v2_01_pod_left": {
+    "size": [
+      59.2,
+      146.8,
+      11.75
+    ],
+    "solids": 1,
+    "volume_cm3": 24.8
+  },
+  "v2_02_pod_right": {
+    "size": [
+      59.2,
+      146.8,
+      11.75
+    ],
+    "solids": 1,
+    "volume_cm3": 24.6
+  },
+  "v2_03_spine": {
+    "size": [
+      79.4,
+      146.8,
+      11.75
+    ],
+    "solids": 1,
+    "volume_cm3": 64.5
+  },
+  "v2_04_wall_left": {
+    "size": [
+      99.2,
+      146.8,
+      23.3
+    ],
+    "solids": 1,
+    "volume_cm3": 20.4
+  },
+  "v2_05_wall_right": {
+    "size": [
+      103.2,
+      146.8,
+      23.3
+    ],
+    "solids": 1,
+    "volume_cm3": 20.8
+  },
+  "v2_06_oled_body": {
+    "size": [
+      33.0,
+      30.6,
+      11.4
+    ],
+    "solids": 1,
+    "volume_cm3": 2.6
+  },
+  "v2_06_oled_body_end_L": {
+    "size": [
+      46.6,
+      37.2,
+      11.4
+    ],
+    "solids": 1,
+    "volume_cm3": 3.9
+  },
+  "v2_06_oled_body_end_R": {
+    "size": [
+      46.6,
+      37.2,
+      11.4
+    ],
+    "solids": 1,
+    "volume_cm3": 3.9
+  },
+  "v2_07_oled_lid": {
+    "size": [
+      30.0,
+      17.3,
+      28.7
+    ],
+    "solids": 1,
+    "volume_cm3": 2.6
+  },
+  "v2_08_c3_cart": {
+    "size": [
+      35.0,
+      26.4,
+      8.6
+    ],
+    "solids": 1,
+    "volume_cm3": 1.8
+  },
+  "v2_09_c3_lid": {
+    "size": [
+      19.4,
+      18.5,
+      1.0
+    ],
+    "solids": 1,
+    "volume_cm3": 0.4
+  },
+  "v2_10_leg": {
+    "size": [
+      80.4,
+      105.5,
+      8.0
+    ],
+    "solids": 1,
+    "volume_cm3": 25.7
+  },
+  "v2_06c_oled_chin_onepiece": {
+    "size": [
+      193.3,
+      37.2,
+      11.4
+    ],
+    "solids": 1,
+    "volume_cm3": 16.2
+  },
+  "v2_07c_oled_lid_onepiece": {
+    "size": [
+      163.1,
+      17.3,
+      28.7
+    ],
+    "solids": 1,
+    "volume_cm3": 14.5
+  },
+  "v2_06e_oled_chin_even": {
+    "size": [
+      193.3,
+      37.2,
+      11.4
+    ],
+    "solids": 1,
+    "volume_cm3": 20.3
+  },
+  "v2_07e_oled_lid_even": {
+    "size": [
+      177.0,
+      17.3,
+      28.7
+    ],
+    "solids": 1,
+    "volume_cm3": 14.5
+  },
+  "legs": {
+    "A": [
+      -88.41,
+      -27.85
+    ],
+    "B": [
+      -59.34,
+      -107.72
+    ],
+    "C": [
+      20.0,
+      -27.85
+    ],
+    "desk_wy": -92.6
+  }
+}

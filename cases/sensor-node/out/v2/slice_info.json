@@ -1,0 +1,16 @@
+{
+ "sn2_01_plate": {
+  "ok": true,
+  "time": "3h 34m 41s",
+  "grams": "68.18",
+  "brim": "8 mm, gap 0.15 mm",
+  "stability_warning": false
+ },
+ "sn2_02_frame": {
+  "ok": true,
+  "time": "3h 7m 32s",
+  "grams": "62.15",
+  "brim": "10 mm, gap 0.15 mm",
+  "stability_warning": false
+ }
+}

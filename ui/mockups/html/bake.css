@@ -1,0 +1,15 @@
+/* Generator only (make_mockups.py bake()): the static layer of each S3 screen per theme, filling the whole
+   screen (no outer window, margin or round corner). Glass is baked into one 800x480 image the S3 stores; dark
+   and light are one color plus the settings sidebar divider, which the S3 draws itself. Anything LVGL 8
+   cannot draw cheaply is allowed here and nowhere else. */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 800px; height: 480px; overflow: hidden; }
+body { position: relative; }
+.win { position: absolute; inset: 0; }
+.t-glass .win { background: linear-gradient(155deg, rgba(88,77,60,.86) 0%, rgba(74,64,49,.88) 45%, rgba(66,57,44,.9) 100%), url(assets/env_blur.png) 0 0/800px 480px; }
+.t-dark .win { background: #1C1C1E; }
+.t-light .win { background: #F2F2F7; }
+.side { position: absolute; left: 0; top: 0; bottom: 0; width: 242px; }
+.t-glass .side { background: linear-gradient(180deg, rgba(22,16,9,.42) 0%, rgba(22,16,9,.36) 30%, rgba(96,92,88,.24) 58%, rgba(22,16,9,.3) 85%, rgba(22,16,9,.4) 100%); }
+.t-dark .side { border-right: 1px solid #38383A; }
+.t-light .side { border-right: 1px solid #C6C6C8; }

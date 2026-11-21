@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>메인 디스플레이 v2 체크리스트</title>
+<style>
+:root{--ink:#0f172a;--mut:#64748b;--line:#e2e8f0;--bg:#f8fafc;--acc:#f97316;--ok:#16a34a}
+*{box-sizing:border-box}
+body{margin:0;font-family:Pretendard,"Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;color:var(--ink);background:var(--bg);line-height:1.5}
+header{padding:28px 24px 10px;max-width:1200px;margin:0 auto}
+h1{font-size:24px;margin:0 0 4px}
+.sub{color:var(--mut);font-size:14px}
+.bar{position:sticky;top:0;z-index:5;background:rgba(248,250,252,.96);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.bar .in{max-width:1200px;margin:0 auto;padding:10px 24px;display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+.stat b{font-size:20px;font-variant-numeric:tabular-nums}
+.stat span{display:block;font-size:12px;color:var(--mut)}
+.prog{flex:1;min-width:180px;height:10px;background:var(--line);border-radius:99px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--ok);width:0;transition:width .3s}
+main{max-width:1200px;margin:0 auto;padding:4px 24px 70px}
+h2{font-size:19px;margin:34px 0 10px}
+h2 small{font-size:13px;color:var(--mut);font-weight:400;margin-left:6px}
+.card{display:grid;grid-template-columns:54px 1fr 540px;gap:16px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;margin:10px 0;align-items:start;transition:opacity .2s}
+.card.done{background:#f0fdf4;border-color:#bbf7d0}
+.card.off{opacity:.38}
+.card.next{border-color:var(--acc);box-shadow:0 0 0 2px rgba(249,115,22,.25)}
+.chk{display:flex;flex-direction:column;align-items:center;gap:6px;padding-top:2px}
+.chk input{width:30px;height:30px;accent-color:var(--ok);cursor:pointer}
+.chk input:disabled{cursor:not-allowed}
+.num{font-weight:700;color:var(--mut);font-size:13px;text-align:center}
+.t{font-size:17px;font-weight:700}
+.file{font-family:Consolas,"D2Coding",monospace;font-size:13px;color:#334155;background:#f1f5f9;border-radius:6px;padding:2px 7px;display:inline-block;margin:4px 0;word-break:break-all}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+.chip{font-size:12px;border:1px solid var(--line);border-radius:99px;padding:2px 9px;color:#334155;background:#fff}
+.chip.w{border-color:#fdba74;background:#fff7ed;color:#9a3412}
+.chip.o{border-color:#bfdbfe;background:#eff6ff;color:#1e40af}
+.chip.n{border-color:var(--acc);background:var(--acc);color:#fff;font-weight:700;display:none}
+.card.next .chip.n{display:inline-block}
+.what{font-size:14px;margin:6px 0}
+.split{font-size:13px;color:#334155;margin:4px 0}
+.ckh{font-size:12px;font-weight:700;color:var(--mut);margin-top:8px}
+ul.ck{margin:2px 0 0;padding-left:18px;font-size:13px;color:#334155}
+.pics{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.pics.one{grid-template-columns:1fr 1fr}
+figure{margin:0}
+figure img{width:100%;border:1px solid var(--line);border-radius:10px;cursor:zoom-in;display:block;background:#fff}
+figcaption{font-size:12px;color:var(--mut);text-align:center;margin-top:3px}
+.vhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:22px 0 4px}
+.vhead .lab{font-weight:700}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.seg label{padding:7px 14px;font-size:14px;cursor:pointer;border-right:1px solid var(--line);user-select:none}
+.seg label:last-child{border-right:0}
+.seg input{display:none}
+.seg label.on{background:var(--ink);color:#fff}
+.list{background:#fff;border:1px solid var(--line);border-radius:14px;padding:4px 16px}
+.list h3{font-size:14px;margin:10px 0 2px;color:var(--mut)}
+.row{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.row:last-child{border-bottom:0}
+.row input{width:22px;height:22px;margin-top:1px;accent-color:var(--ok);flex:none;cursor:pointer}
+.row .q{margin-left:auto;font-weight:700;white-space:nowrap;padding-left:10px;font-size:14px}
+.row small{display:block;color:var(--mut);font-size:12px}
+.row .lbl{font-size:14px}
+.row.done .lbl{text-decoration:line-through;color:var(--mut)}
+.row .sn{font-weight:700;color:var(--mut);width:18px;flex:none;text-align:right}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.btn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px;color:var(--ink)}
+.btn:hover{border-color:#94a3b8}
+#lb{position:fixed;inset:0;background:rgba(15,23,42,.82);display:none;align-items:center;justify-content:center;z-index:9;cursor:zoom-out}
+#lb img{max-width:94vw;max-height:92vh;border-radius:12px;background:#fff}
+@media (max-width:980px){.card{grid-template-columns:44px 1fr}.pics{grid-column:1/-1}.cols{grid-template-columns:1fr}}
+@media print{.bar,.btn,#lb,.seg{display:none}.card{break-inside:avoid}body{background:#fff}.card.off{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1>메인 디스플레이 v2 · 출력 / 조립 체크리스트</h1>
+  <div class="sub">Prusa i3 MK2S · 0.4 노즐 · PrusaSlicer 0.35mm FAST · Generic PLA · 서포트·브림 없음 · 체크한 내용은 이 브라우저에 저장됩니다. 사진은 누르면 크게 보입니다.</div>
+</header>
+<div class="bar"><div class="in">
+  <div class="stat"><b id="sDone">0 / 0</b><span>필수 출력 완료</span></div>
+  <div class="stat"><b id="sLeft">-</b><span>남은 출력 시간</span></div>
+  <div class="stat"><b id="sG">-</b><span>남은 필라멘트</span></div>
+  <div class="stat"><b id="sNext">-</b><span>다음 출력</span></div>
+  <div class="prog"><i id="sBar"></i></div>
+  <button class="btn" id="reset">체크 모두 지우기</button>
+</div></div>
+<main>
+  <h2>1. 준비물</h2>
+  <div class="cols"><div class="list" id="hw"><h3>나사·소모품</h3></div><div class="list" id="el"><h3>전자 부품</h3></div></div>
+  <h2>2. 출력 <small>추천 순서대로 · 주황색이 그 부품</small></h2>
+  <div id="prints"></div>
+  <h2>3. 예비 출력 <small>잘못 나온 부품을 다시 뽑을 때만</small></h2>
+  <div id="spares"></div>
+  <h2>4. 조립</h2>
+  <div class="list" id="asm"></div>
+</main>
+<div id="lb"><img alt=""></div>
+<script>
+var D = __DATA__;
+var KEY = "main-display-v2-checklist";
+var S = {};
+try { S = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { S = {}; }
+S.c = S.c || {};
+S.v = S.v || "cells";
+function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
+function fmt(s) { var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60); if (m === 60) { h += 1; m = 0; } return h ? h + "시간 " + m + "분" : m + "분"; }
+function E(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+var VNAME = { cells: "5칸", onepiece: "통짜", even: "통짜 등간격" };
+var cards = [];
+
+function fig(key, cap) {
+  var f = E("figure"); var im = E("img"); im.src = D.img[key]; im.alt = cap; im.loading = "lazy";
+  im.addEventListener("click", function () { var lb = document.getElementById("lb"); lb.querySelector("img").src = im.src; lb.style.display = "flex"; });
+  f.appendChild(im); f.appendChild(E("figcaption", null, cap)); return f;
+}
+
+function card(it) {
+  var c = E("div", "card");
+  var k = E("div", "chk");
+  var cb = E("input"); cb.type = "checkbox"; cb.checked = !!S.c[it.id];
+  cb.addEventListener("change", function () { S.c[it.id] = cb.checked; save(); update(); });
+  k.appendChild(cb); k.appendChild(E("div", "num", it.step));
+  var t = E("div");
+  t.appendChild(E("div", "t", it.title));
+  t.appendChild(E("div", "file", it.file));
+  var ch = E("div", "chips");
+  ch.appendChild(E("span", "chip n", "다음 출력"));
+  ch.appendChild(E("span", "chip", "시간 " + it.time));
+  ch.appendChild(E("span", "chip", it.g.toFixed(1) + " g"));
+  ch.appendChild(E("span", "chip", it.orient));
+  if (it.optional) ch.appendChild(E("span", "chip o", "선택 · 가장 먼저 추천"));
+  if (it.warn) ch.appendChild(E("span", "chip w", "세워 뽑는 부품 있음: PEI를 IPA로 닦고 60 °C, 들리면 딱풀"));
+  t.appendChild(ch);
+  t.appendChild(E("div", "what", it.what));
+  if (it.split) {
+    t.appendChild(E("div", "split", "한 판 대신 따로 뽑으려면: <span class=\"file\">" + it.split[0].file + "</span> (" + it.split[0].time + ") + <span class=\"file\">" + it.split[1].file + "</span> (" + it.split[1].time + ")"));
+  }
+  if (it.checks && it.checks.length) {
+    t.appendChild(E("div", "ckh", "뽑은 뒤 확인"));
+    var ul = E("ul", "ck"); it.checks.forEach(function (x) { ul.appendChild(E("li", null, x)); }); t.appendChild(ul);
+  }
+  var p = E("div", "pics");
+  p.appendChild(fig(it.part, "출력된 모양 (베드 위)"));
+  if (it.where) p.appendChild(fig(it.where, it.wcap));
+  c.appendChild(k); c.appendChild(t); c.appendChild(p);
+  cards.push({ it: it, el: c, cb: cb });
+  return c;
+}
+
+var P = document.getElementById("prints");
+D.prints.forEach(function (it) {
+  if (it.variant === "cells") {
+    var h = E("div", "vhead");
+    h.appendChild(E("span", "lab", "7. OLED 턱: 셋 중 하나만 뽑으세요"));
+    var seg = E("div", "seg");
+    Object.keys(VNAME).forEach(function (v) {
+      var l = E("label", null, VNAME[v]); l.dataset.v = v;
+      l.addEventListener("click", function () { S.v = v; save(); update(); });
+      seg.appendChild(l);
+    });
+    h.appendChild(seg); P.appendChild(h);
+  }
+  P.appendChild(card(it));
+});
+D.spares.forEach(function (it) { document.getElementById("spares").appendChild(card(it)); });
+
+function row(box, it, n) {
+  var r = E("label", "row");
+  var cb = E("input"); cb.type = "checkbox"; cb.checked = !!S.c[it.id];
+  cb.addEventListener("change", function () { S.c[it.id] = cb.checked; save(); r.classList.toggle("done", cb.checked); });
+  r.appendChild(cb);
+  if (n) r.appendChild(E("span", "sn", n));
+  var l = E("div"); l.appendChild(E("div", "lbl", it.label)); if (it.note) l.appendChild(E("small", null, it.note));
+  r.appendChild(l);
+  if (it.qty) r.appendChild(E("span", "q", it.qty));
+  r.classList.toggle("done", cb.checked);
+  box.appendChild(r);
+}
+D.hw.forEach(function (it) { row(document.getElementById("hw"), it); });
+D.el.forEach(function (it) { row(document.getElementById("el"), it); });
+D.asm.forEach(function (it, i) { row(document.getElementById("asm"), it, String(i + 1)); });
+
+function update() {
+  document.querySelectorAll(".seg label").forEach(function (l) { l.classList.toggle("on", l.dataset.v === S.v); });
+  var req = 0, done = 0, left = 0, g = 0, next = null;
+  cards.forEach(function (o) {
+    var it = o.it, off = !!(it.variant && it.variant !== S.v), on = !!S.c[it.id];
+    o.cb.disabled = off;
+    o.el.classList.toggle("off", off);
+    o.el.classList.toggle("done", on && !off);
+    o.el.classList.remove("next");
+    if (off || it.optional || it.spare) return;
+    req += 1;
+    if (on) { done += 1; } else { left += it.sec; g += it.g; if (!next) next = o; }
+  });
+  if (next) next.el.classList.add("next");
+  document.getElementById("sDone").textContent = done + " / " + req;
+  document.getElementById("sLeft").textContent = left ? fmt(left) : "끝!";
+  document.getElementById("sG").textContent = Math.round(g) + " g";
+  document.getElementById("sNext").textContent = next ? next.it.title : "-";
+  document.getElementById("sBar").style.width = (req ? 100 * done / req : 0) + "%";
+}
+document.getElementById("lb").addEventListener("click", function () { this.style.display = "none"; });
+document.getElementById("reset").addEventListener("click", function () {
+  if (confirm("체크를 모두 지울까요?")) { S.c = {}; save(); location.reload(); }
+});
+update();
+</script>
+</body>
+</html>

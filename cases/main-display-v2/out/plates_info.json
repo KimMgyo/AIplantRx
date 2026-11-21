@@ -1,0 +1,230 @@
+{
+ "v2_01_pod_left": {
+  "time": "1h 18m 29s",
+  "grams": "29.85",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   59.2,
+   146.8
+  ],
+  "height": 11.75,
+  "brim": 0.0
+ },
+ "v2_02_pod_right": {
+  "time": "1h 15m 54s",
+  "grams": "29.64",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   59.2,
+   146.8
+  ],
+  "height": 11.75,
+  "brim": 0.0
+ },
+ "v2_03_spine": {
+  "time": "2h 13m 37s",
+  "grams": "51.62",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   79.4,
+   146.8
+  ],
+  "height": 11.75,
+  "brim": 0.0
+ },
+ "v2_04_wall_left": {
+  "time": "1h 2m 3s",
+  "grams": "22.84",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   99.2,
+   146.8
+  ],
+  "height": 23.3,
+  "brim": 0.0
+ },
+ "v2_05_wall_right": {
+  "time": "1h 1m 13s",
+  "grams": "23.00",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   103.2,
+   146.8
+  ],
+  "height": 23.3,
+  "brim": 0.0
+ },
+ "v2_06_07_oled_cells_x5": {
+  "time": "1h 38m 5s",
+  "grams": "32.46",
+  "ok": true,
+  "warnings": [
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   204.1,
+   58.5
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_06_07_oled_cell_x1": {
+  "time": "22m 4s",
+  "grams": "5.95",
+  "ok": true,
+  "warnings": [
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   69.0,
+   30.6
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_08_09_c3_cartridge": {
+  "time": "9m 59s",
+  "grams": "2.57",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   60.5,
+   26.4
+  ],
+  "height": 8.6,
+  "brim": 0.0
+ },
+ "v2_10_legs_x2": {
+  "time": "1h 19m 26s",
+  "grams": "32.20",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   166.8,
+   105.5
+  ],
+  "height": 8.0,
+  "brim": 0.0
+ },
+ "v2_10_leg_x1": {
+  "time": "39m 58s",
+  "grams": "16.19",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   80.4,
+   105.5
+  ],
+  "height": 8.0,
+  "brim": 0.0
+ },
+ "v2_06_07c_oled_onepiece": {
+  "time": "1h 36m 33s",
+  "grams": "32.62",
+  "ok": true,
+  "warnings": [
+   "[2026-11-10 02:26:43.825459] [0x0000227c] [warning] Detected missing Voronoi vertex, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:26:43.826459] [0x000053d8] [warning] Detected missing Voronoi vertex, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:26:43.826459] [0x0000b1dc] [warning] Detected missing Voronoi vertex, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:26:43.835458] [0x0000688c] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   193.3,
+   60.5
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_06c_oled_chin_onepiece": {
+  "time": "53m 46s",
+  "grams": "17.21",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   193.3,
+   37.2
+  ],
+  "height": 11.4,
+  "brim": 0.0
+ },
+ "v2_07c_oled_lid_onepiece": {
+  "time": "43m 31s",
+  "grams": "15.60",
+  "ok": true,
+  "warnings": [
+   "[2026-11-10 02:26:47.901358] [0x0000399c] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   163.1,
+   17.3
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_00_fit_test": {
+  "time": "52m 47s",
+  "grams": "14.77",
+  "ok": true,
+  "warnings": [
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   135.4,
+   59.3
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_06_07e_oled_even": {
+  "time": "1h 39m 26s",
+  "grams": "33.79",
+  "ok": true,
+  "warnings": [
+   "[2026-11-10 02:35:56.014278] [0x00009490] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:35:56.015285] [0x00007ee8] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:35:56.016284] [0x00001d48] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   193.3,
+   60.5
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ },
+ "v2_06e_oled_chin_even": {
+  "time": "56m 27s",
+  "grams": "18.36",
+  "ok": true,
+  "warnings": [],
+  "bed_xy": [
+   193.3,
+   37.2
+  ],
+  "height": 11.4,
+  "brim": 0.0
+ },
+ "v2_07e_oled_lid_even": {
+  "time": "43m 41s",
+  "grams": "15.61",
+  "ok": true,
+  "warnings": [
+   "[2026-11-10 02:36:00.185185] [0x0000b3ac] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "[2026-11-10 02:36:00.185185] [0x00008994] [warning] Detected non-planar Voronoi diagram, input polygons will be rotated back and forth.",
+   "print warning: Detected print stability issues:"
+  ],
+  "bed_xy": [
+   177.0,
+   17.3
+  ],
+  "height": 28.7,
+  "brim": 0.0
+ }
+}

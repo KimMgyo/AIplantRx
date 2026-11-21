@@ -1,0 +1,153 @@
+{
+  "overlaps_mm3": {
+    "back_cover x standoffs": 2.309,
+    "front_frame x back_cover": 0.0,
+    "tca_bracket x front_frame": 0.0,
+    "tca_bracket x back_cover": 0.0,
+    "stand x front_frame": 0.0,
+    "stand x back_cover": 0.0,
+    "stand x tca_bracket": 0.0,
+    "stand x usb_cables": 0.0,
+    "stand x usb_plugs": 0.0,
+    "frame screw heads (socket 3.0) x back_cover": 0.0,
+    "frame screw heads (pan d6.0 x 2.4) x back_cover": 0.0,
+    "stand x frame screw heads": 0.0,
+    "insertion sweep: 7in glass outline x front_frame": 0.0,
+    "cable route: 50 x 14.7 bundle through cover hole x back_cover": 0.0,
+    "cable route: 44 x 14.7 bundle through plate hole x stand": 0.0,
+    "TCA parts + headers x ESP32 PCBA parts": 0.0,
+    "insertion sweep: TCA bracket + board lowered from the back": 0.0,
+    "cable route: 40 x 30 bundle down through base hole x stand": 0.0,
+    "cable route: USB-A plug out the back window x stand": 0.0,
+    "cable route: d44 bundle out the round rear window x stand": 0.0,
+    "insertion sweep: OLED straight from the back x front_frame": 0.0,
+    "side exit (knock-out opened): USB-C plugs slid in through the left wall x frame/module": 0.0,
+    "side exit: plugs + cables out of the left wall x stand": 0.0,
+    "TCA board x bracket (sits on the two seats)": 0.0,
+    "TCA parts/joints + underside wires x bracket/cover": 0.0,
+    "TCA screw heads (socket 3.0) x back cover": 0.0,
+    "C3 SuperMini x bracket (pocket, ledges, floor)": 0.0,
+    "C3 SuperMini x back cover": 0.0,
+    "C3 SuperMini x front frame": 0.0,
+    "C3 SuperMini x module, TCA, HY2.0, OLEDs, USB cables": 0.0,
+    "C3 pushed 0.2 mm toward the cover x cover posts": 0.0,
+    "C3 pushed 0.5 mm toward the cover x cover posts (posts stop it)": 2.121,
+    "C3 USB-C plug, cover off x frame/bracket/module/OLEDs/standoffs": 0.0,
+    "cover posts x OLED pins (pin tips in the post pockets)": 0.0,
+    "cover x OLED boards, pressed 0.2 mm toward the posts": 0.0,
+    "cover x OLED boards, pressed 0.3 mm (posts stop them)": 15.315
+  },
+  "clearances_mm": {
+    "glass_edge_to_wall": 0.3,
+    "hy20_wires_to_cover_inner(after relief)": 2.25,
+    "oled_wires_to_cover_inner": 2.3,
+    "oled_post_tip_to_pcb_back": 0.2,
+    "oled_pin_depth_in_pcb_hole": 1.05,
+    "oled_board_travel_to_leave_pins_vs_post_gap": [
+      1.05,
+      0.2
+    ],
+    "oled_pin_in_hole_radial_play": 0.15,
+    "oled_pin_tip_to_post_face": 0.35,
+    "rim_boss_top_to_frame_pocket_floor": 0.35,
+    "oled_post_to_bottom_wall": 0.65,
+    "cover_boss_preload_on_standoff": 0.05,
+    "usb_plug_front_to_bracket_back(-6.0)": 2.48,
+    "socket_head_below_cover_outer_face": 0.35,
+    "pan_head_below_cover_outer_face": 0.95,
+    "plastic_between_rim_pocket_and_nut": 2.1,
+    "frame_top_wall_skin_at_pocket": 1.2,
+    "lower_standoff_ends_pulled_back_onto_bracket_cups": 0.1,
+    "tca_screw_tip_to_module_back(-7.87)": 5.43,
+    "tca_screw_head_to_cover_relief(socket_3.0)": 1.35,
+    "tca_underside_wires_to_cover_relief": 1.75,
+    "side_usb_knockout_skin": 0.6,
+    "side_usb_slot_around_plug_y_z(at the plug corners)": [
+      0.86,
+      1.25
+    ],
+    "c3_underside_to_cover_posts(pcb_1.0,_0.9)": [
+      0.25,
+      0.35
+    ],
+    "c3_usb_shell_to_pocket_floor(3.16,_3.12)": [
+      -0.01,
+      0.03
+    ],
+    "c3_pocket_fits_board_lengths": [
+      22.52,
+      22.8
+    ],
+    "c3_usb_shell_length_on_the_bar(min)": 5.22,
+    "c3_usb_mouth_past_stop_face_at_least": 0.82,
+    "c3_pocket_to_tca_board_top_edge": 0.25,
+    "c3_plug_slot_width": 14.0,
+    "mating_heights_off_the_layer_grid": []
+  },
+  "tipping": {
+    "printed_g": {
+      "front": 91.9,
+      "cover": 88.87,
+      "stand": 74.19,
+      "bracket": 5.93
+    },
+    "display_g_assumed": 250,
+    "total_mass_g": 511,
+    "com_z_world": -13.6,
+    "touch_height_mm": 135.5,
+    "tipping_force_N_at_top_of_screen": 3.79
+  },
+  "desk": {
+    "front_frame": 0.513,
+    "back_cover": -0.0,
+    "stand": 0.0,
+    "front_edge_height_above_desk_mm": 10.3,
+    "com_behind_contact_edge_mm": 17.6,
+    "com_ahead_of_stand_rear_edge_mm": 76.4
+  },
+  "fasteners": {
+    "front frame <- back cover": {
+      "count": 6,
+      "nut_vs_parts_mm3": 0.0,
+      "nut_way_blocked_mm3": 0.0,
+      "screw_vs_parts_mm3": 0.0,
+      "screw_vs_module_cables_mm3": 0.0,
+      "min_thread_engagement_mm": {
+        "brass_support_3.0": 3.0,
+        "nut_2.4": 2.4
+      }
+    },
+    "TCA9548A -> TCA bracket": {
+      "count": 2,
+      "nut_vs_parts_mm3": 0.0,
+      "nut_way_blocked_mm3": 0.0,
+      "screw_vs_parts_mm3": 0.0,
+      "screw_vs_module_cables_mm3": 0.0,
+      "min_thread_engagement_mm": {
+        "brass_support_3.0": 3.0,
+        "nut_2.4": 2.4
+      }
+    },
+    "back cover -> 7in module standoffs": {
+      "count": 4,
+      "nut_vs_parts_mm3": 0.0,
+      "nut_way_blocked_mm3": 0.0,
+      "screw_vs_parts_mm3": 0.0,
+      "screw_vs_module_cables_mm3": 0.0,
+      "min_thread_engagement_mm": {
+        "module_brass_standoff": 3.4
+      }
+    },
+    "back cover -> stand": {
+      "count": 4,
+      "nut_vs_parts_mm3": 0.0,
+      "nut_way_blocked_mm3": 0.0,
+      "screw_vs_parts_mm3": 0.0,
+      "screw_vs_module_cables_mm3": 0.0,
+      "min_thread_engagement_mm": {
+        "brass_support_3.0": 3.0,
+        "nut_2.4": 2.4
+      }
+    }
+  }
+}
