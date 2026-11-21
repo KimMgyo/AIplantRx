@@ -11,7 +11,7 @@
 #define F7_DROP_FILL "\xEE\x92\xBE"
 #define F7_DROP_TRIANGLE_FILL "\xEE\x8F\x9F"
 #define F7_EYE "\xEE\x8D\xA3"
-#define F7_FLAME_FILL "\xEE\x82\xAE"
+#define F7_EYEDROPPER_HALFFULL "\xEE\x89\x90"
 #define F7_GEAR_ALT_FILL "\xEE\x91\xB8"
 #define F7_INFO_CIRCLE_FILL "\xEE\x88\x90"
 #define F7_LEAF_ARROW_CIRCLEPATH "\xEE\x8A\xBD"

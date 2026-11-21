@@ -399,8 +399,8 @@ static void page_control(lv_obj_t *c) {
     node_row(c);
     lv_obj_t *pl = plat(c);
     char b[48];
-    snprintf(b, sizeof b, "낮 %.0f° · 밤 %.0f° 아래면 켬", p.day_lo, p.night_lo);
-    val(row(pl, "히터"), b);
+    snprintf(b, sizeof b, "낮 %.0f–%.0f° · 밤 %.0f–%.0f°", p.day_lo, p.day_hi, p.night_lo, p.night_hi);
+    val(row(pl, "온도", "조절 장치 없음 · 보여 주고 알리기만"), b);
     snprintf(b, sizeof b, "흙 %.0f%% 아래면 %uml", p.soil_lo, p.water_ml);
     val(row(pl, "물 펌프"), b);
     snprintf(b, sizeof b, "%u일마다 %uml", p.nutr_days, p.nutr_ml);

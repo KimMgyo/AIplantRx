@@ -33,15 +33,18 @@ const uint16_t *cam_take(uint32_t *seq);
 uint32_t cam_seq();             // sequence of the newest frame, without taking it
 float cam_fps();
 
-// Sensor node.
+// Sensor node, GET /state (INTERFACES.md 2). Missing numbers are NAN.
+enum PumpKind : uint8_t { EV_WATER = 1, EV_NUTR = 2, EV_PH = 3 };
 struct SensorState {
     bool live;
-    float air_c, rh, co2, soil_pct, ec, ph;
-    bool heater, light, water, nutr;
-    uint16_t heater_min_today, water_ml_today;
+    float air_c, rh, co2, soil_c, soil_pct, ec, ph, leaf_c;
+    bool day, light, water, nutr, ph_pump, capture;
+    bool ok_scd41, ok_mlx, ok_soil;     // the node's own view of its sensors
+    uint16_t water_ml_today, nutr_ml_today, ph_ml_today;
     uint8_t nev;
-    struct { uint8_t kind; uint16_t at_min, len_min; } ev[16];   // kind: 1 heater, 2 water, 3 nutrient
-    uint32_t next_nutr;                 // epoch seconds, 0 unknown
+    struct { uint8_t kind; uint16_t at_min, len_s, ml; } ev[16];   // today's pump runs (PumpKind)
+    uint32_t t, last_water, next_water, next_nutr;   // epoch seconds, 0 unknown
+    char grade[8];                      // the profile the node runs: "llm" or "default"
 };
 SensorState sensor_get();
 

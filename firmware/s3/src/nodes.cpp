@@ -277,27 +277,41 @@ static void parse_state(const uint8_t *buf, int len) {
     JsonDocument doc;
     if (deserializeJson(doc, buf, len)) return;
     SensorState s{};
+    // `| NAN` keeps NAN for a missing field and for null (a sensor that is not answering).
     s.air_c = doc["air_c"] | NAN;
     s.rh = doc["rh"] | NAN;
     s.co2 = doc["co2"] | NAN;
+    s.soil_c = doc["soil_c"] | NAN;
     s.soil_pct = doc["soil_pct"] | NAN;
     s.ec = doc["ec"] | NAN;
     s.ph = doc["ph"] | NAN;
-    s.heater = doc["heater"] | false;
+    s.leaf_c = doc["leaf_c"] | NAN;
+    s.day = doc["day"] | true;
     s.light = doc["light"] | false;
     s.water = doc["water"] | false;
     s.nutr = doc["nutr"] | false;
-    s.heater_min_today = doc["heater_min_today"] | 0;
+    s.ph_pump = doc["ph_pump"] | false;
+    s.capture = doc["capture"] | false;
+    s.ok_scd41 = doc["sensors"]["scd41"] | true;
+    s.ok_mlx = doc["sensors"]["mlx"] | true;
+    s.ok_soil = doc["sensors"]["soil"] | true;
     s.water_ml_today = doc["water_ml_today"] | 0;
+    s.nutr_ml_today = doc["nutr_ml_today"] | 0;
+    s.ph_ml_today = doc["ph_ml_today"] | 0;
+    s.t = doc["t"] | 0;
+    s.last_water = doc["last_water"] | 0;
+    s.next_water = doc["next_water"] | 0;
     s.next_nutr = doc["next_nutr"] | 0;
+    strlcpy(s.grade, doc["profile"]["grade"] | "", sizeof s.grade);
     for (JsonObject e : doc["events"].as<JsonArray>()) {
         if (s.nev >= 16) break;
         const char *k = e["kind"] | "";
-        uint8_t kind = !strcmp(k, "heater") ? 1 : !strcmp(k, "water") ? 2 : !strcmp(k, "nutr") ? 3 : 0;
+        uint8_t kind = !strcmp(k, "water") ? EV_WATER : !strcmp(k, "nutr") ? EV_NUTR : !strcmp(k, "ph") ? EV_PH : 0;
         if (!kind) continue;
         s.ev[s.nev].kind = kind;
         s.ev[s.nev].at_min = e["at_min"] | 0;
-        s.ev[s.nev].len_min = e["len_min"] | 0;
+        s.ev[s.nev].len_s = e["len_s"] | 0;
+        s.ev[s.nev].ml = e["ml"] | 0;
         s.nev++;
     }
     portENTER_CRITICAL(&s_smux);

@@ -74,11 +74,12 @@ static void lanes_update(bool force) {
     SensorState s = sensor_get();
     const Profile &p = g_prof;
     uint32_t sig = s.live ? 1 : 0;
-    sig = sig * 31 + s.heater + 2 * s.light + 4 * s.water + 8 * s.nutr;
-    sig = sig * 31 + s.heater_min_today;
+    sig = sig * 31 + s.light + 2 * s.water + 4 * s.nutr + 8 * s.ph_pump;
     sig = sig * 31 + s.water_ml_today;
+    sig = sig * 31 + s.ph_ml_today;
+    sig = sig * 31 + (isnan(s.ph) ? 0 : (int)lroundf(s.ph * 10));
     sig = sig * 31 + s.nev;
-    for (int i = 0; i < s.nev; i++) sig = sig * 31 + s.ev[i].at_min * 7 + s.ev[i].len_min;
+    for (int i = 0; i < s.nev; i++) sig = sig * 31 + s.ev[i].at_min * 7 + s.ev[i].kind;
     sig = sig * 31 + p.light_on_h * 60 + p.light_on_m + (p.light_off_h * 60 + p.light_off_m) * 1440;
     sig = sig * 31 + s.next_nutr;
     if (!force && sig == M.lanes_sig) return;
@@ -103,39 +104,40 @@ static void lanes_update(bool force) {
     }
     set_text(M.val[0], v);
 
-    // Heater, water, nutrient: what the node did today; the rule when it is not there.
-    lv_color_t red = lv_color_hex(0xFF453A), cyan = lv_color_hex(0x32ADE6), pur = lv_color_hex(0xBF5AF2);
+    // Water, nutrient, pH: when each pump ran today (a dot per run); the rule when the node is not there.
+    // No heater: the box has no actuator for temperature (ARCHITECTURE.md 8, 11-13).
+    lv_color_t cyan = lv_color_hex(0x32ADE6), pur = lv_color_hex(0xBF5AF2), grn = lv_color_hex(0x30D158);
     if (s.live) {
         for (int i = 0; i < s.nev; i++) {
-            float at = s.ev[i].at_min / 1440.0f;
-            if (s.ev[i].kind == 1) seg(M.track[1], at, at + s.ev[i].len_min / 1440.0f, red);
-            else if (s.ev[i].kind == 2) fill(M.track[2], (int)lroundf(at * 224) - 4, 0, 8, 8, cyan, 4);
-            else if (s.ev[i].kind == 3) fill(M.track[3], (int)lroundf(at * 224) - 4, 0, 8, 8, pur, 4);
+            int x = (int)lroundf(s.ev[i].at_min / 1440.0f * 224) - 4;
+            int lane = s.ev[i].kind == EV_WATER ? 1 : s.ev[i].kind == EV_NUTR ? 2 : 3;
+            fill(M.track[lane], x, 0, 8, 8, lane == 1 ? cyan : lane == 2 ? pur : grn, 4);
         }
-        set_text(M.bold[1], s.heater ? "켜짐" : "꺼짐");
-        snprintf(v, sizeof v, "오늘 %u분", s.heater_min_today);
-        set_text(M.val[1], v);
-        set_text(M.bold[2], s.water ? "주는 중" : "대기");
+        set_text(M.bold[1], s.water ? "주는 중" : "대기");
         snprintf(v, sizeof v, "오늘 %uml", s.water_ml_today);
-        set_text(M.val[2], v);
+        set_text(M.val[1], v);
         if (s.next_nutr > 1700000000) {
             time_t t = s.next_nutr;
             struct tm tm;
             localtime_r(&t, &tm);
             snprintf(b, sizeof b, "%d/%d", tm.tm_mon + 1, tm.tm_mday);
         } else strlcpy(b, "-", sizeof b);
-        set_text(M.bold[3], s.nutr ? "주는 중" : b);
+        set_text(M.bold[2], s.nutr ? "주는 중" : b);
         snprintf(v, sizeof v, "다음 %uml", p.nutr_ml);
+        set_text(M.val[2], v);
+        set_text(M.bold[3], s.ph_pump ? "넣는 중" : "대기");
+        if (isnan(s.ph)) strlcpy(v, "pH -", sizeof v);
+        else snprintf(v, sizeof v, "pH %.1f", s.ph);
         set_text(M.val[3], v);
     } else {
         set_text(M.bold[1], "");
-        snprintf(v, sizeof v, "%.0f° 아래면 켬", p.night_lo < p.day_lo ? p.night_lo : p.day_lo);
+        snprintf(v, sizeof v, "흙 %.0f%% 아래면", p.soil_lo);
         set_text(M.val[1], v);
         set_text(M.bold[2], "");
-        snprintf(v, sizeof v, "흙 %.0f%% 아래면", p.soil_lo);
+        snprintf(v, sizeof v, "%u일마다 %uml", p.nutr_days, p.nutr_ml);
         set_text(M.val[2], v);
         set_text(M.bold[3], "");
-        snprintf(v, sizeof v, "%u일마다 %uml", p.nutr_days, p.nutr_ml);
+        snprintf(v, sizeof v, "%.1f–%.1f 유지", p.ph_lo, p.ph_hi);
         set_text(M.val[3], v);
     }
     for (int i = 0; i < 4; i++) show(M.bold[i], *lv_label_get_text(M.bold[i]));
@@ -154,8 +156,8 @@ static void run_update() {
     } else if (!isnan(s.soil_pct) && s.soil_pct < p.soil_lo) {
         t = s.water ? "흙이 말라서 물 주는 중" : "흙이 말랐어요";
         c = Col{P->warn_text, LV_OPA_COVER};
-    } else if (!isnan(s.air_c) && s.air_c < p.night_lo) {
-        t = s.heater ? "추워서 히터 켜는 중" : "온도가 낮아요";
+    } else if (!isnan(s.air_c) && s.air_c < (s.day ? p.day_lo : p.night_lo) - 2) {
+        t = "온도가 낮아요";
         c = Col{P->warn_text, LV_OPA_COVER};
     } else if (!isnan(s.air_c) && s.air_c > p.day_hi + 2) {
         t = "온도가 높아요";
@@ -455,9 +457,9 @@ lv_obj_t *main_build() {
     lv_obj_t *r = label(plan, &f_r12, P->text2, "AI가 정한 일정");
     lv_obj_align(r, LV_ALIGN_TOP_RIGHT, -14, 12);
     build_lane(plan, 0, F7_LIGHTBULB_FILL, 0xFFD60A, "조명");
-    build_lane(plan, 1, F7_FLAME_FILL, 0xFF453A, "히터");
-    build_lane(plan, 2, F7_DROP_FILL, 0x32ADE6, "물");
-    build_lane(plan, 3, F7_DROP_TRIANGLE_FILL, 0xBF5AF2, "물약");
+    build_lane(plan, 1, F7_DROP_FILL, 0x32ADE6, "물");
+    build_lane(plan, 2, F7_DROP_TRIANGLE_FILL, 0xBF5AF2, "물약");
+    build_lane(plan, 3, F7_EYEDROPPER_HALFFULL, 0x30D158, "pH");
     // The "now" line: a 2 px line over a 6 px gap in the platter color (an outline on an object this thin
     // is drawn over the object itself).
     M.now_gap = fill(plan, 80, 33, 6, 106, P->plat, 0);
