@@ -3,6 +3,10 @@
 #include "settings.h"
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <esp_crt_bundle.h>
+#include <esp_tls.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
 #include <mbedtls/platform.h>
 #include <time.h>
 
@@ -168,11 +172,12 @@ static void net_task(void *) {
 // stay internal where the handshake math is fast. IDF supports TLS buffers in PSRAM on the S3
 // (CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC); the AES/SHA DMA drivers bounce external buffers themselves.
 static const size_t TLS_PSRAM_FROM = 4096;
+static volatile bool s_tls_psram = true;   // tls_probe() can turn it off to compare
 
 static void *tls_calloc(size_t n, size_t size) {
     size_t total = n * size;
     void *p = nullptr;
-    if (total >= TLS_PSRAM_FROM) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_tls_psram && total >= TLS_PSRAM_FROM) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p) p = heap_caps_calloc(n, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!p && total < TLS_PSRAM_FROM) p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return p;
@@ -210,3 +215,85 @@ bool tls_lock(uint32_t wait_ms) {
 }
 
 void tls_unlock() { xSemaphoreGive(s_tls); }
+
+// ---------------------------------------------------------------- TLS probe (GET /tlstest, devsrv.cpp)
+// Times DNS, a bare TCP connect and a full esp-tls connection (DNS + TCP + handshake, certificate checked
+// against the bundle) to host:port, to find where an S3 HTTPS request spends its time.
+
+struct Probe {
+    const char *host;
+    uint16_t port;
+    bool psram;
+    char out[320];
+    SemaphoreHandle_t done;
+};
+
+static void probe_task(void *arg) {
+    Probe *p = (Probe *)arg;
+    bool old = s_tls_psram;
+    s_tls_psram = p->psram;
+    uint32_t t0 = millis();
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int gai = getaddrinfo(p->host, nullptr, &hints, &res);
+    uint32_t dns = millis() - t0;
+    char first[48] = "", v4[16] = "";
+    int naddr = 0;
+    for (struct addrinfo *a = res; a; a = a->ai_next, naddr++) {
+        if (!first[0]) strlcpy(first, a->ai_family == AF_INET6 ? "ipv6" : "ipv4", sizeof first);
+        if (a->ai_family == AF_INET && !v4[0]) inet_ntoa_r(((sockaddr_in *)a->ai_addr)->sin_addr, v4, sizeof v4);
+    }
+    if (res) freeaddrinfo(res);
+    int tcp = -1;
+    if (!gai && v4[0]) {
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(p->port);
+        inet_aton(v4, &a.sin_addr);
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        uint32_t t1 = millis();
+        if (s >= 0 && connect(s, (sockaddr *)&a, sizeof a) == 0) tcp = millis() - t1;
+        if (s >= 0) close(s);
+    }
+    size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    esp_tls_cfg_t cfg = {};
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.timeout_ms = 40000;
+    uint32_t t2 = millis();
+    esp_tls_t *tls = esp_tls_init();
+    int r = tls ? esp_tls_conn_new_sync(p->host, strlen(p->host), p->port, &cfg, tls) : -1;
+    uint32_t full = millis() - t2;
+    size_t int_during = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    char peer[48] = "";
+    if (r == 1) {
+        int fd = -1;
+        esp_tls_get_conn_sockfd(tls, &fd);
+        sockaddr_storage ss;
+        socklen_t sl = sizeof ss;
+        if (fd >= 0 && getpeername(fd, (sockaddr *)&ss, &sl) == 0) {
+            if (ss.ss_family == AF_INET) inet_ntoa_r(((sockaddr_in *)&ss)->sin_addr, peer, sizeof peer);
+            else strlcpy(peer, "ipv6", sizeof peer);
+        }
+    }
+    if (tls) esp_tls_conn_destroy(tls);
+    s_tls_psram = old;
+    snprintf(p->out, sizeof p->out,
+             "{\"host\":\"%s\",\"psram\":%s,\"dns_ms\":%lu,\"addrs\":%d,\"first\":\"%s\",\"tcp_ms\":%d,"
+             "\"tls_ok\":%s,\"tls_total_ms\":%lu,\"peer\":\"%s\",\"internal_used_by_tls\":%d}",
+             p->host, p->psram ? "true" : "false", (unsigned long)dns, naddr, first, tcp, r == 1 ? "true" : "false",
+             (unsigned long)full, peer, (int)int_before - (int)int_during);
+    xSemaphoreGive(p->done);
+    vTaskDelete(nullptr);
+}
+
+String tls_probe(const char *host, uint16_t port, bool psram) {
+    if (!tls_lock(30000)) return "{\"err\":\"TLS busy\"}";
+    Probe p = {host, port, psram, "", xSemaphoreCreateBinary()};
+    // Same stack and core as the LLM's tasks (core 0, internal stack: lwIP refuses PSRAM stacks).
+    xTaskCreatePinnedToCore(probe_task, "tlsprobe", 12288, &p, 2, nullptr, 0);
+    xSemaphoreTake(p.done, portMAX_DELAY);
+    vSemaphoreDelete(p.done);
+    tls_unlock();
+    return String(p.out);
+}

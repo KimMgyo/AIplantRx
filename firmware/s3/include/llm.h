@@ -15,6 +15,7 @@ struct LlmTest {
 
 void llm_test_start();
 LlmTest llm_test();
+void llm_stream_test_start();   // GET /llmstream: one streamed answer, result in the log
 bool llm_ok();          // the last request succeeded, within 10 minutes
 
 // One chat completion constrained to a JSON schema (prompts.h). Requests go one at a time (the server has
@@ -27,7 +28,10 @@ bool llm_chat(const char *system, const char *user, const char *schema_json, con
 
 // Streamed chat completion with a GBNF grammar (the AI note, UI.md 6.3). piece() gets each new bit of text
 // as it arrives; all gets the whole text. Gives up when nothing has arrived after first_ms.
+// first_ms was 4 s: on a new connection through the public Funnel the TLS handshake alone took 0.5-6.8 s
+// from a PC and longer from the S3, so every note failed with "응답 없음" (2026-11-22). On the kept
+// connection (llm.cpp) the first text comes after about one round trip.
 typedef void (*llm_piece_fn)(const char *piece, void *user);
 bool llm_stream(const char *system, const char *user, const char *grammar, int max_tokens, float temperature, float top_p,
-                llm_piece_fn piece, void *arg, String &all, char *err, size_t errn, uint32_t first_ms = 4000,
-                uint32_t total_ms = 20000);
+                llm_piece_fn piece, void *arg, String &all, char *err, size_t errn, uint32_t first_ms = 25000,
+                uint32_t total_ms = 45000);

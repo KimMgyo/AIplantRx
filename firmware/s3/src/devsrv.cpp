@@ -1,5 +1,6 @@
 #include "devsrv.h"
 #include "fwupdate.h"
+#include "llm.h"
 #include "nodes.h"
 #include "app.h"
 #include "lvgl_v8_port.h"
@@ -206,6 +207,15 @@ static void srv_task(void *) {
             s_srv.on("/set", h_set);
             s_srv.on("/perf", h_perf);
             s_srv.on("/update", h_update);
+            // GET /tlstest?host=2.tailb0610e.ts.net&port=443&psram=1: where an HTTPS connection spends its time.
+            s_srv.on("/tlstest", []() {
+                String host = s_srv.hasArg("host") ? s_srv.arg("host") : String("github.com");
+                uint16_t port = s_srv.hasArg("port") ? s_srv.arg("port").toInt() : 443;
+                bool psram = !s_srv.hasArg("psram") || s_srv.arg("psram") != "0";
+                s_srv.send(200, "application/json", tls_probe(host.c_str(), port, psram));
+            });
+            // GET /llmstream: one streamed LLM answer over the AI note's path; the result goes to the log.
+            s_srv.on("/llmstream", []() { llm_stream_test_start(); s_srv.send(200, "text/plain", "started"); });
             // Board images through the S3 (fwupdate.cpp update_board): no TLS on the board.
             s_srv.on("/fw/c3.bin", []() { fwu_serve_image("c3", s_srv); });
             s_srv.on("/fw/cam.bin", []() { fwu_serve_image("cam", s_srv); });

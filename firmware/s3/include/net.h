@@ -31,3 +31,7 @@ void net_join(const char *ssid, const char *pass);
 // mbedtls_ssl_setup -0x7F00. Pl@ntNet, the LLM and the firmware update take this first.
 bool tls_lock(uint32_t wait_ms);
 void tls_unlock();
+// Times DNS, TCP and a full TLS connection to host:port (GET /tlstest). psram=false keeps mbedTLS's big
+// buffers internal for that one connection, to compare. Takes the TLS lock. Returns JSON.
+#include <WString.h>
+String tls_probe(const char *host, uint16_t port, bool psram);

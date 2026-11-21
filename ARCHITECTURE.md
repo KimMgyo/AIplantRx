@@ -178,7 +178,19 @@ Arduino-ESP32 3.1.1(pioarduino), LVGL 8.4, ESP32_Display_Panel. 부팅 뒤에는
 
 ### 4.5 PC
 
-llama-server만 돈다. 새 프로그램은 만들지 않는다. 프롬프트와 JSON 스키마는 S3 펌웨어(prompts.h)에 있다. 2026-11-21부터 `--api-key-file C:\llm\api-keys.txt --no-webui`로 돌고, Tailscale Funnel이 https://2.tailb0610e.ts.net/v1/chat/completions 한 경로만 127.0.0.1:8080으로 넘긴다(다른 경로는 404, 키 없으면 401). S3 연결 시험 3.0초.
+llama-server만 돈다. 새 프로그램은 만들지 않는다. 프롬프트와 JSON 스키마는 S3 펌웨어(prompts.h)에 있다. 2026-11-21부터 `--api-key-file C:\llm\api-keys.txt --no-webui`로 돌고, Tailscale Funnel이 https://2.tailb0610e.ts.net/v1/chat/completions 한 경로만 127.0.0.1:8080으로 넘긴다(다른 경로는 404, 키 없으면 401).
+
+공개 Funnel 경로 측정(2026-11-22, S3는 tailnet 밖이라 공개 입구 103.84.155.x를 탄다):
+
+| 항목 | 값 |
+| --- | --- |
+| 새 TLS 연결 | S3 3.5~7초, PC 0.5~6.8초(입구에 따라 다름). PSRAM 버퍼와 내부 RAM 버퍼의 차이 없음 |
+| 열린 연결에서 요청 한 번 | 약 1초(입구와 학교 PC 사이 왕복) |
+| 쉬는 연결 | 120초 뒤에도 그대로 쓸 수 있었다. S3는 110초 넘게 쉬면 닫고 새로 연다 |
+| S3 연결 시험 | 새 연결 10.0초, 열린 연결 1.6초 |
+| AI 한마디 스트림 | 새 연결 첫 글자 8.1초, 열린 연결 1.4~4.7초 |
+
+이 PC(tailnet 안)에서는 같은 주소가 MagicDNS로 100.71.14.71에 바로 가서 0.3초다. PC에서 S3 경로를 재려면 `curl --resolve 2.tailb0610e.ts.net:443:103.84.155.153`. S3의 `GET /tlstest?host=...`(DNS·TCP·TLS 시간)와 `GET /llmstream`(스트림 한 번, 결과는 로그)으로 S3 쪽을 잰다.
 
 ## 5. 식물 찾기 흐름
 
