@@ -47,7 +47,7 @@ VER_OK = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?")
 
 def run(cmd, cwd=ROOT, env=None, capture=False):
     print("$", " ".join(cmd))
-    r = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=capture)
+    r = subprocess.run(cmd, cwd=cwd, env=env, text=True, encoding="utf-8", errors="replace", capture_output=capture)
     if r.returncode != 0:
         if capture:
             print(r.stdout, r.stderr)
@@ -56,7 +56,7 @@ def run(cmd, cwd=ROOT, env=None, capture=False):
 
 
 def owner_env():
-    tok = subprocess.run(["gh", "auth", "token", "-u", OWNER_ACCOUNT], text=True, capture_output=True).stdout.strip()
+    tok = subprocess.run(["gh", "auth", "token", "-u", OWNER_ACCOUNT], text=True, encoding="utf-8", capture_output=True).stdout.strip()
     if not tok:
         sys.exit(f"no gh token for {OWNER_ACCOUNT}: run gh auth login and sign in as {OWNER_ACCOUNT}")
     env = dict(os.environ)
@@ -85,7 +85,7 @@ def sha256(path):
 
 def latest_manifest(env):
     """The manifest of the current latest release, or {} if there is none yet."""
-    r = subprocess.run(["gh", "api", f"repos/{REPO}/releases/latest"], env=env, capture_output=True, text=True)
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/releases/latest"], env=env, capture_output=True, text=True, encoding="utf-8")
     if r.returncode != 0:
         return {}
     rel = json.loads(r.stdout)
