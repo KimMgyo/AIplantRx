@@ -7,6 +7,8 @@
 #include "settings.h"
 #include "ui.h"
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
 #include <esp_app_desc.h>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
@@ -31,6 +33,20 @@ static SemaphoreHandle_t s_mu;
 // What the manifest offers for this board.
 static char s_url[512], s_sha[65];
 static uint32_t s_size;
+
+// ...and for the others (the S3 tells each one to update, itself last).
+struct Dev {
+    const char *key;        // manifest key
+    Role role;
+    bool have;              // the release has an image for it
+    char ver[24], url[512], sha[65];
+    uint32_t size;
+    volatile DevState state;
+    volatile int8_t pct;
+};
+static Dev s_dev[3] = {{"c3", ROLE_OLED}, {"cam", ROLE_CAM}, {"node", ROLE_NODE}};
+static int devices_behind();
+static void board_ui(const Dev &d, const char *msg);
 
 static void set_state(FwuState st, const char *err = nullptr) {
     xSemaphoreTake(s_mu, portMAX_DELAY);
@@ -211,6 +227,20 @@ static bool check() {
             JsonObject d = doc["devices"]["s3"];
             const char *v = d["version"] | "", *u = d["url"] | "", *sh = d["sha256"] | "";
             uint32_t sz = d["size"] | 0;
+            // The other boards (INTERFACES.md 5): what the release has for each.
+            xSemaphoreTake(s_mu, portMAX_DELAY);
+            for (Dev &x : s_dev) {
+                JsonObject o = doc["devices"][x.key];
+                const char *ov = o["version"] | "", *ou = o["url"] | "", *os = o["sha256"] | "";
+                uint32_t osz = o["size"] | 0;
+                x.have = *ov && *ou && strlen(os) == 64 && osz && strlen(ou) < sizeof x.url;
+                if (!x.have) continue;
+                strlcpy(x.ver, ov, sizeof x.ver);
+                strlcpy(x.url, ou, sizeof x.url);
+                strlcpy(x.sha, os, sizeof x.sha);
+                x.size = osz;
+            }
+            xSemaphoreGive(s_mu);
             if (!*v || !*u || strlen(sh) != 64 || !sz) strlcpy(e, "manifest에 S3 없음", sizeof e);
             else {
                 strlcpy(s_url, u, sizeof s_url);
@@ -233,9 +263,126 @@ static bool check() {
         return false;
     }
     bool newer = fwu_vercmp(s_info.latest, FW_VERSION) > 0;
-    Serial.printf("[fwu] manifest s3 %s (running %s)%s\n", s_info.latest, FW_VERSION, newer ? ", newer" : "");
-    set_state(newer ? FWU_AVAILABLE : FWU_LATEST);
+    int others = devices_behind();
+    Serial.printf("[fwu] manifest s3 %s (running %s)%s, %d other board(s) behind\n", s_info.latest, FW_VERSION,
+                  newer ? ", newer" : "", others);
+    set_state(newer || others ? FWU_AVAILABLE : FWU_LATEST);
     return true;
+}
+
+// ---------------------------------------------------------------- the other boards
+
+// Announced version of the board in this role, "" when it is not online.
+static void online_ver(Role r, char *out, size_t n) {
+    NodeInfo ni = node_info(r);
+    strlcpy(out, ni.online ? ni.ver : "", n);
+}
+
+static bool dev_behind(const Dev &d) {
+    char cur[24];
+    online_ver(d.role, cur, sizeof cur);
+    return d.have && cur[0] && fwu_vercmp(d.ver, cur) > 0;
+}
+
+static int devices_behind() {
+    int k = 0;
+    for (const Dev &d : s_dev) k += dev_behind(d);
+    return k;
+}
+
+int fwu_devices(FwuDev *out, int max) {
+    int k = 0;
+    xSemaphoreTake(s_mu, portMAX_DELAY);
+    for (const Dev &d : s_dev) {
+        if (k >= max) break;
+        FwuDev &o = out[k++];
+        memset(&o, 0, sizeof o);
+        strlcpy(o.key, d.key, sizeof o.key);
+        o.role = d.role;
+        online_ver(d.role, o.cur, sizeof o.cur);
+        strlcpy(o.latest, d.have ? d.ver : "", sizeof o.latest);
+        o.behind = dev_behind(d);
+        o.state = d.state;
+        o.pct = d.pct;
+    }
+    xSemaphoreGive(s_mu);
+    return k;
+}
+
+// POST /ota to one board (INTERFACES.md 1), then wait for it to come back announcing the new version.
+static bool update_board(Dev &d) {
+    NodeInfo ni = node_info(d.role);
+    if (!ni.online) return false;
+    Serial.printf("[fwu] %s: %s -> %s\n", d.key, ni.ver, d.ver);
+    d.state = DEV_SENDING;
+    d.pct = 0;
+    s_gen++;
+    char url[48];
+    snprintf(url, sizeof url, "http://%s:%u/ota", ni.ip, ni.port);
+    JsonDocument b;
+    b["url"] = d.url;
+    b["sha256"] = d.sha;
+    b["size"] = d.size;
+    b["version"] = d.ver;
+    String body;
+    serializeJson(b, body);
+    int code;
+    {
+        WiFiClient c;
+        HTTPClient h;
+        h.setConnectTimeout(3000);
+        h.setTimeout(5000);
+        code = h.begin(c, url) ? h.POST(body) : -1;
+        h.end();
+    }
+    if (code != 202) {
+        Serial.printf("[fwu] %s refused the update: %d\n", d.key, code);
+        d.state = DEV_FAIL;
+        s_gen++;
+        return false;
+    }
+    d.state = DEV_UPDATING;
+    s_gen++;
+    // The board downloads by itself; progress is in its /info until it restarts, then it announces the
+    // new version (and confirms it within 2 minutes, or goes back on its own).
+    uint32_t t0 = millis();
+    snprintf(url, sizeof url, "http://%s:%u/info", ni.ip, ni.port);
+    while (millis() - t0 < 300000) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        NodeInfo now = node_info(d.role);
+        if (now.online && !fwu_vercmp(now.ver, d.ver)) {
+            d.state = DEV_DONE;
+            d.pct = 100;
+            s_gen++;
+            Serial.printf("[fwu] %s now runs %s (%lu s)\n", d.key, d.ver, (unsigned long)((millis() - t0) / 1000));
+            return true;
+        }
+        WiFiClient c;
+        HTTPClient h;
+        h.setConnectTimeout(1500);
+        h.setTimeout(2000);
+        if (h.begin(c, url) && h.GET() == 200) {
+            JsonDocument i;
+            if (!deserializeJson(i, h.getString())) {
+                int pct = i["ota"]["pct"] | -1;
+                const char *st = i["ota"]["state"] | "";
+                if (pct >= 0) d.pct = pct;
+                board_ui(d, !strcmp(st, "verifying") ? "확인 중" : !strcmp(st, "restarting") ? "다시 시작하는 중" : "받는 중");
+                if (!strcmp(st, "fail")) {
+                    Serial.printf("[fwu] %s: %s\n", d.key, (const char *)(i["ota"]["err"] | ""));
+                    h.end();
+                    d.state = DEV_FAIL;
+                    s_gen++;
+                    return false;
+                }
+                s_gen++;
+            }
+        }
+        h.end();
+    }
+    d.state = DEV_FAIL;
+    s_gen++;
+    return false;
 }
 
 // ---------------------------------------------------------------- install
@@ -269,8 +416,39 @@ static bool partition_sha_ok(const esp_partition_t *p, uint32_t size) {
     return !strcasecmp(hex, s_sha);
 }
 
+static void install_s3();
+
+static const char *board_ko(const Dev &d) {
+    return d.role == ROLE_OLED ? "OLED" : d.role == ROLE_CAM ? "카메라" : "센서 노드";
+}
+
+static void board_ui(const Dev &d, const char *msg) {
+    if (!lvgl_port_lock(200)) return;
+    char v[48];
+    snprintf(v, sizeof v, "%s %s", board_ko(d), d.ver);
+    ui_update_overlay(v, d.pct < 0 ? 0 : d.pct, msg);
+    lvgl_port_unlock();
+}
+
+// Other boards first, one at a time (a board that fails keeps its old image and the rest go on), then
+// the S3 itself, which restarts.
 static void install() {
     if (s_info.state != FWU_AVAILABLE) return;
+    set_state(FWU_INSTALLING);
+    for (Dev &d : s_dev) {
+        if (!dev_behind(d)) continue;
+        board_ui(d, "보내는 중");
+        update_board(d);
+    }
+    if (fwu_vercmp(s_info.latest, FW_VERSION) > 0) {
+        install_s3();
+        return;
+    }
+    if (lvgl_port_lock(200)) { ui_update_overlay_close(); lvgl_port_unlock(); }
+    set_state(devices_behind() ? FWU_AVAILABLE : FWU_LATEST);
+}
+
+static void install_s3() {
     Serial.printf("[fwu] installing %s (%u bytes)\n", s_info.latest, (unsigned)s_size);
     cam_set_wanted(false);   // free core 0 and the radio for the download
     nodes_pause(true);

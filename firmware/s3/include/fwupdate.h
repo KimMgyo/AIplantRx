@@ -28,6 +28,20 @@ struct FwuInfo {
     char rolled_back[24];   // version the bootloader refused at the last boot, or ""
 };
 
+// The other boards (INTERFACES.md 5): updated first, one at a time, the S3 last.
+enum DevState : uint8_t { DEV_IDLE, DEV_SENDING, DEV_UPDATING, DEV_DONE, DEV_FAIL };
+#include "nodes.h"
+struct FwuDev {
+    char key[6];            // "c3", "cam", "node"
+    Role role;
+    char cur[24];           // the version it announces, "" when it is not online
+    char latest[24];        // what the release has, "" when nothing
+    bool behind;
+    DevState state;
+    int8_t pct;
+};
+int fwu_devices(FwuDev *out, int max);
+
 void fwu_init();            // after net_init()
 FwuInfo fwu_info();
 uint32_t fwu_gen();         // bumps on every state change (for redrawing the settings page)

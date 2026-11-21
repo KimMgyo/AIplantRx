@@ -354,6 +354,76 @@ static void ingest_thermal(const int16_t *raw) {
     s_th_ms = millis();
 }
 
+// ---------------------------------------------------------------- commands to the boards
+//
+// POSTs the UI asks for (pump test, Wi-Fi move). They go out from node_task, which already talks to the
+// network, so the LVGL task never waits on a socket.
+
+struct Cmd {
+    bool used, done;
+    Role role;
+    char path[16];
+    char body[200];
+    int result;
+};
+static Cmd s_cmds[4];
+static portMUX_TYPE s_cmux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_cmd_gen;
+
+int node_post(Role r, const char *path, const char *json) {
+    int slot = -1;
+    portENTER_CRITICAL(&s_cmux);
+    for (int i = 0; i < 4; i++)
+        if (!s_cmds[i].used) {
+            slot = i;
+            s_cmds[i].used = true;
+            s_cmds[i].done = false;
+            s_cmds[i].role = r;
+            strlcpy(s_cmds[i].path, path, sizeof s_cmds[i].path);
+            strlcpy(s_cmds[i].body, json, sizeof s_cmds[i].body);
+            s_cmds[i].result = 0;
+            break;
+        }
+    portEXIT_CRITICAL(&s_cmux);
+    return slot;
+}
+
+int node_post_result(int slot, bool *done) {
+    if (slot < 0 || slot >= 4) { *done = true; return -1; }
+    *done = s_cmds[slot].done;
+    int r = s_cmds[slot].result;
+    if (*done) s_cmds[slot].used = false;   // read once
+    return r;
+}
+
+uint32_t node_cmd_gen() { return s_cmd_gen; }
+
+static void run_cmds() {
+    for (int i = 0; i < 4; i++) {
+        Cmd &c = s_cmds[i];
+        if (!c.used || c.done) continue;
+        NodeInfo t = node_info(c.role);
+        int code = -1;
+        if (t.online && net_state() == NET_UP) {
+            char url[64];
+            snprintf(url, sizeof url, "http://%s:%u%s", t.ip, t.port, c.path);
+            WiFiClient wc;
+            HTTPClient hc;
+            hc.setConnectTimeout(2000);
+            hc.setTimeout(4000);
+            if (hc.begin(wc, url)) {
+                hc.addHeader("Content-Type", "application/json");
+                code = hc.POST((uint8_t *)c.body, strlen(c.body));
+                hc.end();
+            }
+        }
+        Serial.printf("[nodes] POST %s to role %d -> %d\n", c.path, (int)c.role, code);
+        c.result = code;
+        c.done = true;
+        s_cmd_gen++;
+    }
+}
+
 static void node_task(void *) {
     uint8_t *buf = (uint8_t *)ps_malloc_or_null(8192);
     static int16_t prev[768];
@@ -361,6 +431,7 @@ static void node_task(void *) {
     uint32_t last_state = 0;
     Http h;
     for (;;) {
+        run_cmds();
         NodeInfo n = node_info(ROLE_NODE);
         if (!n.online || net_state() != NET_UP || s_node_paused) { h.drop(); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
         uint32_t t0 = millis();

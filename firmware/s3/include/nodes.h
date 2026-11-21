@@ -31,6 +31,12 @@ void cam_set_wanted(bool on);          // the main screen is visible
 // Stops the sensor node polling (8 Hz thermal) for a while: a big TLS upload needs the internal RAM
 // that its lwIP buffers take (identify.cpp).
 void nodes_pause(bool on);
+
+// POST json to a board (pump test, Wi-Fi move), sent from the node task. Returns a slot (-1 if 4 are
+// already waiting); node_post_result() gives the HTTP status once done (-1 = not reached).
+int node_post(Role r, const char *path, const char *json);
+int node_post_result(int slot, bool *done);
+uint32_t node_cmd_gen();
 bool cam_live();
 const uint16_t *cam_take(uint32_t *seq);
 uint32_t cam_seq();             // sequence of the newest frame, without taking it

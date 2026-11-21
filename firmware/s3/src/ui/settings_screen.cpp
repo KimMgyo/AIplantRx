@@ -9,6 +9,7 @@
 #include "net.h"
 #include "nodes.h"
 #include "settings.h"
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <esp_mac.h>
 #include <time.h>
@@ -143,7 +144,34 @@ static void restart_page() { build_page(); }
 static void wifi_toggle(lv_event_t *e) { net_set_enabled(toggle_on(lv_event_get_target(e))); }
 
 static char s_join_ssid[33];
-static void join_pass_done(const char *pass, void *) { net_join(s_join_ssid, pass); }
+static char s_join_pass[65];
+
+// Changing network (UI.md 7): the other boards are told first, over the network they are on now, then
+// the S3 moves 2 s later. Each board tries the new network for 30 s and goes back to the old one if it
+// cannot join, so a wrong password leaves everything where it was.
+static void join_now(lv_timer_t *t) {
+    lv_timer_del(t);
+    net_join(s_join_ssid, s_join_pass);
+}
+
+static void join_all(const char *ssid, const char *pass) {
+    strlcpy(s_join_ssid, ssid, sizeof s_join_ssid);
+    strlcpy(s_join_pass, pass, sizeof s_join_pass);
+    int told = 0;
+    if (net_state() == NET_UP) {
+        JsonDocument d;
+        d["ssid"] = ssid;
+        d["pass"] = pass;
+        char body[160];
+        serializeJson(d, body, sizeof body);
+        for (int k = 0; k < ROLE_COUNT; k++)
+            if (node_info((Role)k).online && node_post((Role)k, "/wifi", body) >= 0) told++;
+    }
+    if (told) lv_timer_create(join_now, 2000, nullptr);
+    else net_join(s_join_ssid, s_join_pass);
+}
+
+static void join_pass_done(const char *pass, void *) { join_all(s_join_ssid, pass); }
 static void join_ssid_done(const char *ssid, void *) {
     if (!ssid[0]) return;
     strlcpy(s_join_ssid, ssid, sizeof s_join_ssid);
@@ -158,7 +186,7 @@ static void ap_tap(lv_event_t *e) {
         char t[64];
         snprintf(t, sizeof t, "‘%s’의 암호 입력", a->ssid);
         sheet_text(t, "", true, join_pass_done, nullptr);
-    } else net_join(a->ssid, "");
+    } else join_all(a->ssid, "");
 }
 static void other_tap(lv_event_t *) { sheet_text("네트워크 이름", "", false, join_ssid_done, nullptr); }
 
@@ -285,8 +313,11 @@ static void page_update(lv_obj_t *c) {
     switch (u.state) {
         case FWU_CHECKING: strlcpy(b, "새 버전을 확인하는 중", sizeof b); break;
         case FWU_LATEST: strlcpy(b, "최신 버전이에요", sizeof b); break;
-        case FWU_AVAILABLE: snprintf(b, sizeof b, "새 버전 %s이 있어요", u.latest); break;
-        case FWU_INSTALLING: snprintf(b, sizeof b, "%s 받는 중 %d%%", u.latest, u.pct); break;
+        case FWU_AVAILABLE:
+            if (fwu_vercmp(u.latest, FW_VERSION) > 0) snprintf(b, sizeof b, "새 버전 %s이 있어요", u.latest);
+            else strlcpy(b, "다른 기기에 새 버전이 있어요", sizeof b);
+            break;
+        case FWU_INSTALLING: strlcpy(b, "업데이트하는 중", sizeof b); break;
         case FWU_RESTARTING: strlcpy(b, "다시 시작하는 중", sizeof b); break;
         case FWU_FAIL: snprintf(b, sizeof b, "확인하지 못했어요 · %s", u.err); break;
         default: strlcpy(b, u.pending ? "새 버전을 점검하는 중" : "아직 확인하지 않았어요", sizeof b); break;
@@ -316,16 +347,30 @@ static void page_update(lv_obj_t *c) {
             "설치합니다. 시연 중에는 끄세요. 새 버전은 2분 안에 Wi-Fi에 다시 붙어야 확정되고, 아니면 이전 버전으로 돌아갑니다.");
     hdr(c, "기기");
     p = plat(c);
-    val(row(p, "메인 화면", "S3 · " FW_VERSION " · 이 기기"), "현재");
-    const char *nm[3] = {"카메라", "센서 노드", "OLED"};
-    const char *hw[3] = {"CAM", "devkit", "C3"};
-    for (int k = 0; k < 3; k++) {
-        NodeInfo ni = node_info((Role)k);
-        char sub[48];
-        snprintf(sub, sizeof sub, "%s · %s", hw[k], ni.online ? (ni.ver[0] ? ni.ver : "버전 모름") : "찾는 중");
-        val(row(p, nm[k], sub), ni.online ? "연결됨" : "-");
+    char sub[64];
+    if (u.latest[0] && fwu_vercmp(u.latest, FW_VERSION) > 0) snprintf(sub, sizeof sub, "S3 · %s → %s", FW_VERSION, u.latest);
+    else snprintf(sub, sizeof sub, "S3 · %s · 이 기기", FW_VERSION);
+    val(row(p, "메인 화면", sub), u.latest[0] && fwu_vercmp(u.latest, FW_VERSION) > 0 ? "새 버전" : "최신");
+    // Other boards: the version each announces, what the release has, and how its update is going.
+    FwuDev dv[3];
+    int nd = fwu_devices(dv, 3);
+    for (int k = 0; k < nd; k++) {
+        const char *nm = dv[k].role == ROLE_OLED ? "OLED" : dv[k].role == ROLE_CAM ? "카메라" : "센서 노드";
+        const char *hw = dv[k].role == ROLE_OLED ? "C3" : dv[k].role == ROLE_CAM ? "CAM" : "devkit";
+        if (!dv[k].cur[0]) snprintf(sub, sizeof sub, "%s · 찾는 중", hw);
+        else if (dv[k].behind) snprintf(sub, sizeof sub, "%s · %s → %s", hw, dv[k].cur, dv[k].latest);
+        else snprintf(sub, sizeof sub, "%s · %s", hw, dv[k].cur);
+        char st[32];
+        switch (dv[k].state) {
+            case DEV_SENDING: strlcpy(st, "보내는 중", sizeof st); break;
+            case DEV_UPDATING: snprintf(st, sizeof st, "받는 중 %d%%", dv[k].pct < 0 ? 0 : dv[k].pct); break;
+            case DEV_DONE: strlcpy(st, "완료", sizeof st); break;
+            case DEV_FAIL: strlcpy(st, "다음에 다시", sizeof st); break;
+            default: strlcpy(st, !dv[k].cur[0] ? "-" : dv[k].behind ? "새 버전" : dv[k].latest[0] ? "최신" : "릴리스에 없음", sizeof st);
+        }
+        val(row(p, nm, sub), st);
     }
-    foot(c, "다른 기기의 업데이트(POST /ota)는 각 기기의 새 펌웨어와 함께 켭니다.");
+    foot(c, "설치하면 다른 기기를 하나씩 먼저 올리고 이 화면은 마지막에 올립니다. 기기는 직접 받아 확인한 뒤 다시 켜지고, 2분 안에 확정되지 않으면 이전 버전으로 돌아갑니다.");
 }
 
 static void page_devices(lv_obj_t *c) {
@@ -408,7 +453,25 @@ static void page_control(lv_obj_t *c) {
     val(row(pl, "물약 펌프"), b);
     snprintf(b, sizeof b, "%.1f–%.1f 밖이면 맞춤", p.ph_lo, p.ph_hi);
     val(row(pl, "pH"), b);
-    foot(c, "센서 노드가 연결되면 여기서 장치를 5초씩 시험하고, 하루 최대 물 양을 정할 수 있어요.");
+    // Pump test (POST /pump, 3 s): the node keeps its own safety limits and answers 409 while another
+    // pump runs or a picture is being taken.
+    hdr(c, "펌프 시험");
+    pl = plat(c);
+    static const char *const PUMP[3] = {"water", "nutr", "ph"};
+    static const char *const NAME[3] = {"물 펌프 3초", "물약 펌프 3초", "pH 펌프 3초"};
+    bool on = node_info(ROLE_NODE).online;
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *r = row(pl, NAME[i]);
+        if (on)
+            small_cap(r, "돌리기", [](lv_event_t *e) {
+                int k = (int)(intptr_t)lv_event_get_user_data(e);
+                char body[48];
+                snprintf(body, sizeof body, "{\"pump\":\"%s\",\"s\":3}", PUMP[k]);
+                node_post(ROLE_NODE, "/pump", body);
+            }, (void *)(intptr_t)i);
+        else val(r, "센서 노드 없음");
+    }
+    foot(c, "펌프는 한 번에 하나만 돌고, 사진을 찍는 동안과 하루 상한을 넘으면 센서 노드가 거절합니다.");
 }
 
 static void page_light(lv_obj_t *c) {
