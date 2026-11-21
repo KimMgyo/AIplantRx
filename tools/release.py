@@ -1,6 +1,6 @@
 """Build the firmware and publish a GitHub release the devices update from (UI.md 8, INTERFACES.md 5).
 
-    python tools/release.py 2.1.0 --s3 2.1.0 --c3 1.0.1 [--notes "what changed"] [--dry-run] [--prerelease]
+    python tools/release.py 2.1.0 --s3 2.1.0 --c3 1.0.1 [--notes "one line" | --notes-file notes.md] [--dry-run] [--prerelease]
     python tools/release.py 2.0.3                      shorthand: only the S3, at the release version
 
 One release is one tested set: every device's image is attached to every release, and manifest.json lists
@@ -102,10 +102,14 @@ def main():
     ap.add_argument("release", help="release version, e.g. 2.1.0 (no leading v)")
     for d in DEVICES:
         ap.add_argument(f"--{d}", metavar="VER", help=f"build the {d} firmware with this version")
-    ap.add_argument("--notes", default="", help="release notes (Markdown)")
+    ap.add_argument("--notes", default="", help="release notes (Markdown, one line)")
+    # On Windows `python` is often a .bat shim (pyenv-win) that cuts an argument at its first newline.
+    ap.add_argument("--notes-file", help="release notes from a UTF-8 file (for several lines)")
     ap.add_argument("--prerelease", action="store_true", help="publish without the boards seeing it")
     ap.add_argument("--dry-run", action="store_true", help="build and write dist/, do not commit or publish")
     a = ap.parse_args()
+    if a.notes_file:
+        a.notes = open(a.notes_file, encoding="utf-8").read().strip()
     rel = a.release.lstrip("v")
     if not VER_OK.fullmatch(rel):
         sys.exit("release must look like 2.1.0 or 2.1.0-rc1")

@@ -2,6 +2,7 @@
 //
 //   GET /frame                        QVGA (320x240) JPEG for the S3's screen: the newest frame, up to 12 fps
 //   GET /capture?size=uxga|sxga&q=N   one still for identification (q 4..63, default 12; 1-3 s)
+//   GET :81/stream?fps=N              the same QVGA frames pushed as multipart (the S3 uses this)
 //   + the common module (firmware/common): /info, /wifi, /ota from GitHub, espota, rollback.
 //
 // The driver is initialised at UXGA so its buffers hold a full still; the live picture is the same driver
@@ -14,6 +15,7 @@
 #include <Arduino.h>
 #include <aipnode.h>
 #include <esp_camera.h>
+#include <lwip/sockets.h>
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -195,6 +197,122 @@ static esp_err_t h_capture(httpd_req_t *req) {
     return r;
 }
 
+// ---------------------------------------------------------------- push stream (port 81)
+//
+// GET :81/stream?fps=N (1..20, default 15): multipart/x-mixed-replace, one QVGA JPEG per part with its
+// Content-Length. Polling /frame costs a request round trip per frame on a radio the camera keeps busy
+// (80 ms a frame at the S3, so 12 fps at best); pushed, the frames only wait for the sensor and the link.
+// One viewer at a time (the S3); its own task, so port 80 (/info, /capture, /ota) stays free.
+
+static const uint16_t STREAM_PORT = 81;
+static const int SCAP = 64 * 1024;
+static uint8_t *s_sbuf;                  // part header + JPEG + CRLF, sent with one send()
+static volatile bool s_streaming;
+static uint32_t s_stream_frames, s_stream_clients;
+static float s_stream_fps;
+
+static bool sock_send(int fd, const uint8_t *p, size_t n) {
+    while (n > 0) {
+        int k = send(fd, p, n, 0);
+        if (k <= 0) return false;   // SO_SNDTIMEO ran out, or the viewer went away
+        p += k;
+        n -= k;
+    }
+    return true;
+}
+
+static void stream_serve(int fd) {
+    char req[512];
+    int got = 0;
+    uint32_t t0 = millis();
+    while (got < (int)sizeof req - 1 && millis() - t0 < 2000) {   // the request, up to the blank line
+        int k = recv(fd, req + got, sizeof req - 1 - got, 0);
+        if (k <= 0) break;
+        got += k;
+        req[got] = 0;
+        if (strstr(req, "\r\n\r\n")) break;
+    }
+    req[got] = 0;
+    if (strncmp(req, "GET /stream", 11)) {
+        static const char nf[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        sock_send(fd, (const uint8_t *)nf, sizeof nf - 1);
+        return;
+    }
+    int fps = 15;
+    const char *q = strstr(req, "fps=");
+    if (q) fps = constrain(atoi(q + 4), 1, 20);
+    static const char hdr[] = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace;boundary=aipframe\r\n"
+                              "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if (!sock_send(fd, (const uint8_t *)hdr, sizeof hdr - 1)) return;
+    s_streaming = true;
+    s_stream_clients++;
+    aipnode_logf("[cam] stream to a viewer at %d fps\n", fps);
+    const uint32_t period = 1000 / fps;
+    uint32_t next = millis(), win_t = millis(), win_n = 0, idle = millis();
+    for (;;) {
+        if (aipnode_ota_busy()) break;
+        int32_t w = (int32_t)(next - millis());
+        if (w > 0) vTaskDelay(pdMS_TO_TICKS(w));
+        next = max(next + period, millis());
+        int n = 0;
+        if (s_cam_ok && xSemaphoreTake(s_cam_mu, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            camera_fb_t *fb = s_cam_ok ? grab(320, 0, 3) : nullptr;
+            if (fb) {
+                int h = snprintf((char *)s_sbuf, 96, "--aipframe\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                 (unsigned)fb->len);
+                if (h + fb->len + 2 <= (size_t)SCAP) {
+                    memcpy(s_sbuf + h, fb->buf, fb->len);
+                    memcpy(s_sbuf + h + fb->len, "\r\n", 2);
+                    n = h + fb->len + 2;
+                }
+                esp_camera_fb_return(fb);
+            }
+            xSemaphoreGive(s_cam_mu);
+        }
+        if (!n) {
+            if (millis() - idle > 5000) break;   // no camera for 5 s: let the viewer fall back and retry
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        idle = millis();
+        if (!sock_send(fd, s_sbuf, n)) break;
+        s_stream_frames++;
+        if (++win_n == 30) {
+            s_stream_fps = 30000.0f / (millis() - win_t);
+            win_t = millis();
+            win_n = 0;
+        }
+    }
+    s_streaming = false;
+    aipnode_logf("[cam] stream ended\n");
+}
+
+static void stream_task(void *) {
+    while (!aipnode_wifi_up()) vTaskDelay(pdMS_TO_TICKS(500));
+    int ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(STREAM_PORT);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(ls, (sockaddr *)&a, sizeof a) < 0 || listen(ls, 2) < 0) {
+        aipnode_logf("[cam] stream port did not open\n");
+        close(ls);
+        vTaskDelete(nullptr);
+    }
+    for (;;) {
+        int fd = accept(ls, nullptr, nullptr);
+        if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        timeval tv = {3, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        stream_serve(fd);
+        close(fd);
+    }
+}
+
 // ---------------------------------------------------------------- common module hooks
 
 static bool before_ota() {
@@ -215,6 +333,11 @@ static void info_extra(JsonObject o) {
     c["frames"] = s_frames;
     c["captures"] = s_captures;
     c["fails"] = s_fails;
+    JsonObject st = c["stream"].to<JsonObject>();
+    st["on"] = (bool)s_streaming;
+    st["clients"] = s_stream_clients;
+    st["frames"] = s_stream_frames;
+    st["fps"] = roundf(s_stream_fps * 10) / 10;
     if (s_captures) {
         JsonObject l = c["last_capture"].to<JsonObject>();
         l["w"] = s_capture_w;
@@ -247,6 +370,9 @@ void setup() {
     httpd_uri_t u = {};
     u.uri = "/frame"; u.method = HTTP_GET; u.handler = h_frame; httpd_register_uri_handler(h, &u);
     u.uri = "/capture"; u.method = HTTP_GET; u.handler = h_capture; httpd_register_uri_handler(h, &u);
+
+    s_sbuf = (uint8_t *)heap_caps_malloc(SCAP, MALLOC_CAP_SPIRAM);
+    if (s_sbuf) xTaskCreatePinnedToCore(stream_task, "stream", 4096, nullptr, 2, nullptr, 1);
 }
 
 void loop() {

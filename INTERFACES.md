@@ -5,6 +5,8 @@
 공통 규칙:
 
 - 응답에는 항상 `Content-Length`가 있다(esp_http_server의 `httpd_resp_send`). S3와 C3는 기기마다 연결 하나를 열어 두고 계속 쓴다(keep-alive).
+- 기기의 HTTP 소켓은 TCP_NODELAY다(공통 모듈). 아니면 헤더와 본문이 따로 나가면서 본문이 상대의 지연 ACK(lwIP 250ms 타이머)를 기다렸다.
+- 기기가 응답하는 동안은 UDP 알림이 몇 번 빠져도 S3가 "연결됨"으로 본다(카메라 프레임, `/state` 성공이 마지막 확인 시각을 갱신).
 - JSON은 UTF-8. 모르는 필드는 무시하고, 없는 필드는 "모름"으로 다룬다(숫자는 생략하거나 `null`).
 - 시각은 epoch 초(UTC). 하루 안의 위치는 0시부터 분(`at_min`, KST).
 - 온도 °C, 습도·흙 수분 %, CO2 ppm, EC **mS/cm**, 물 양 ml.
@@ -110,10 +112,11 @@ S3가 식물을 찾은 뒤 보낸다. 센서 노드는 하드웨어 안전 범�
 
 | 요청 | 내용 |
 | --- | --- |
-| `GET /frame` | 화면용 QVGA(320×240) JPEG. S3가 최대 12fps로 읽는다. 같은 프레임을 두 번 줄 수 있다(S3가 걸러 냄) |
+| `GET :81/stream?fps=15` | 화면용 QVGA(320×240) JPEG를 CAM이 계속 밀어 보낸다. `multipart/x-mixed-replace;boundary=aipframe`, 부분마다 `Content-Length`. `fps` 1~20(기본 15). 한 번에 한 연결. S3가 쓰는 길이고, 연결이 안 되면 S3는 30초 동안 `/frame`으로 읽는다. 2026-11-21 측정: `/frame` 요청 방식은 S3에서 한 장에 80ms(약 11fps), 스트림은 13~15fps |
+| `GET /frame` | 화면용 QVGA(320×240) JPEG 한 장. 같은 프레임을 두 번 주지 않는다(드라이버 버퍼를 한 번씩만 꺼냄) |
 | `GET /capture?size=sxga&q=12` | 식별용 사진. `size`는 `uxga`(1600×1200, 기본) 또는 `sxga`(1280×1024), `q`는 OV2640 JPEG 품질(4~63, 낮을수록 좋음, 기본 12). S3는 `sxga`, `q=12`로 부른다(짧은 변 1024px로 PlantNet에 충분하고, 먼 서버로 올리는 시간이 UXGA의 약 1/3). 1~3초 걸린다. 실패하면 503, 모르는 값은 400. 찍는 동안 `/frame`은 기다린다(서버 작업이 하나) |
 
-`/info`의 `camera`: `{"ok","err","psram","psram_free","frames","captures","fails","last_capture":{"w","h","bytes","ms"}}`. 카메라가 안 켜지면 `/frame`, `/capture`는 503이고 10초마다 다시 켠다.
+`/info`의 `camera`: `{"ok","err","psram","psram_free","frames","captures","fails","stream":{"on","clients","frames","fps"},"last_capture":{"w","h","bytes","ms"}}`. 카메라가 안 켜지면 `/frame`, `/capture`는 503이고 10초마다 다시 켠다.
 
 ## 4. C3 (role `oled`)
 

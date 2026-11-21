@@ -64,6 +64,14 @@ NodeInfo node_info(Role r) {
     return n;
 }
 
+// A board that answers is online even when its UDP announcements get lost: Wi-Fi broadcasts go out at the
+// lowest rate without retries, and losing three in a row made the camera drop off the screen.
+static void peer_seen(Role r) {
+    portENTER_CRITICAL(&s_pmux);
+    if (s_peer[r].last_ms) s_peer[r].last_ms = millis();
+    portEXIT_CRITICAL(&s_pmux);
+}
+
 int nodes_online() {
     int k = 0;
     for (int r = 0; r < ROLE_COUNT; r++) k += node_info((Role)r).online;
@@ -195,11 +203,101 @@ struct Jpg { uint8_t *buf; int len; uint32_t t0_ms, fetch_us, hdr_us; };
 static Jpg s_jpg[2];
 static QueueHandle_t s_jfree, s_jfull;     // indices into s_jpg
 
+// The CAM's push stream (INTERFACES.md 3, GET :81/stream). Polling /frame paid a request round trip per
+// frame on the CAM's busy radio: 80 ms a frame, 11 fps at most (2026-11-21). Pushed, the frames only wait
+// for the sensor. Frames that arrive while both JPEG buffers are taken are read and dropped.
+static const uint16_t CAM_STREAM_PORT = 81;
+static const int CAM_STREAM_FPS = 15;
+static uint8_t s_scratch[1024];
+
+static bool rd_line(WiFiClient &c, char *b, int cap, uint32_t timeout_ms) {
+    int n = 0;
+    uint32_t t0 = millis();
+    for (;;) {
+        int ch = c.read();
+        if (ch < 0) {
+            if (!c.connected() || millis() - t0 > timeout_ms) return false;
+            vTaskDelay(1);
+            continue;
+        }
+        if (ch == '\n') {
+            if (n && b[n - 1] == '\r') n--;
+            b[n] = 0;
+            return true;
+        }
+        if (n < cap - 1) b[n++] = (char)ch;
+    }
+}
+
+// Reads len bytes into b, or throws them away when b is null.
+static bool rd_exact(WiFiClient &c, uint8_t *b, int len, uint32_t timeout_ms) {
+    int got = 0;
+    uint32_t t0 = millis();
+    while (got < len) {
+        int a = c.available();
+        if (a <= 0) {
+            if (!c.connected() || millis() - t0 > timeout_ms) return false;
+            vTaskDelay(1);
+            continue;
+        }
+        int want = min(a, len - got);
+        int r = b ? c.read(b + got, want) : c.read(s_scratch, min(want, (int)sizeof s_scratch));
+        if (r > 0) got += r;
+    }
+    return true;
+}
+
+// Runs the stream until it breaks or the camera is not wanted. false: no stream from this CAM (older
+// firmware, or no frame came), so the caller polls /frame for a while.
+static bool cam_stream(const NodeInfo &n) {
+    WiFiClient c;
+    if (!c.connect(n.ip, CAM_STREAM_PORT, 1500)) return false;
+    c.setNoDelay(true);
+    c.printf("GET /stream?fps=%d HTTP/1.1\r\nHost: %s\r\n\r\n", CAM_STREAM_FPS, n.ip);
+    char line[96];
+    if (!rd_line(c, line, sizeof line, 2000) || !strstr(line, " 200")) { c.stop(); return false; }
+    while (rd_line(c, line, sizeof line, 2000) && line[0]) {}
+    uint32_t frames = 0;
+    for (;;) {
+        NodeInfo now = node_info(ROLE_CAM);
+        if (!s_cam_wanted || !now.online || strcmp(now.ip, n.ip) || net_state() != NET_UP) break;
+        uint32_t t0 = millis();
+        if (!rd_line(c, line, sizeof line, 2000)) break;
+        if (strncmp(line, "--aipframe", 10)) continue;   // the CRLF after the previous part
+        int len = -1;
+        while (rd_line(c, line, sizeof line, 2000) && line[0])
+            if (!strncasecmp(line, "Content-Length:", 15)) len = atoi(line + 15);
+        if (len <= 0 || len > JCAP) break;
+        int k;
+        if (xQueueReceive(s_jfree, &k, 0) == pdTRUE) {
+            Jpg &j = s_jpg[k];
+            if (!rd_exact(c, j.buf, len, 2000)) { xQueueSend(s_jfree, &k, 0); break; }
+            j.len = len;
+            j.t0_ms = t0;
+            j.fetch_us = (millis() - t0) * 1000;   // mostly the wait for the next frame
+            j.hdr_us = 0;
+            xQueueSend(s_jfull, &k, 0);
+        } else if (!rd_exact(c, nullptr, len, 2000)) {
+            break;
+        }
+        peer_seen(ROLE_CAM);
+        frames++;
+    }
+    c.stop();
+    return frames > 0;
+}
+
 static void cam_fetch_task(void *) {
     Http h;
+    uint32_t poll_until = 0;   // the CAM had no stream: poll /frame until then, then try the stream again
     for (;;) {
         NodeInfo n = node_info(ROLE_CAM);
         if (!s_cam_wanted || !n.online || net_state() != NET_UP) { h.drop(); vTaskDelay(pdMS_TO_TICKS(300)); continue; }
+        if ((int32_t)(millis() - poll_until) >= 0) {
+            h.drop();
+            if (cam_stream(n)) continue;
+            poll_until = millis() + 30000;
+        }
         int k;
         if (xQueueReceive(s_jfree, &k, pdMS_TO_TICKS(500)) != pdTRUE) continue;
         Jpg &j = s_jpg[k];
@@ -207,7 +305,7 @@ static void cam_fetch_task(void *) {
         j.len = h.get(n.ip, n.port, "/frame", j.buf, JCAP, 2000);
         j.fetch_us = (millis() - j.t0_ms) * 1000;
         j.hdr_us = h.hdr_us;
-        if (j.len > 0) xQueueSend(s_jfull, &k, 0);
+        if (j.len > 0) { xQueueSend(s_jfull, &k, 0); peer_seen(ROLE_CAM); }
         else { xQueueSend(s_jfree, &k, 0); vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         uint32_t el = millis() - j.t0_ms;
         vTaskDelay(pdMS_TO_TICKS(el < CAM_PERIOD_MS ? CAM_PERIOD_MS - el : 2));
@@ -438,7 +536,7 @@ static void node_task(void *) {
         if (millis() - last_state > 1000) {
             last_state = millis();
             int len = h.get(n.ip, n.port, "/state", buf, 8192, 1500);
-            if (len > 0) parse_state(buf, len);
+            if (len > 0) { parse_state(buf, len); peer_seen(ROLE_NODE); }
         }
         if (s_cam_wanted) {
             if (h.get(n.ip, n.port, "/thermal", buf, 8192, 1500) == 768 * 2) {

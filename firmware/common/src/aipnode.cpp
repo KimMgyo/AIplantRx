@@ -9,6 +9,7 @@
 #include <esp_https_ota.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <lwip/sockets.h>
 #include <mbedtls/sha256.h>
 #include <stdarg.h>
 
@@ -391,12 +392,22 @@ static esp_err_t h_reboot(httpd_req_t *req) {
 
 httpd_handle_t aipnode_http() { return s_http; }
 
+// No Nagle: esp_http_server writes the headers and the body as separate sends, so with Nagle the body
+// waited for the ACK of the headers, and the S3's lwIP delays ACKs on its 250 ms timer. A 4 KB camera
+// frame took 248 ms to arrive at the S3 against 68 ms at the PC (2026-11-21).
+static esp_err_t on_open(httpd_handle_t, int fd) {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    return ESP_OK;
+}
+
 static void http_start() {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
     cfg.stack_size = 6144;
+    cfg.open_fn = on_open;
     if (httpd_start(&s_http, &cfg) != ESP_OK) {
         aipnode_logf("[node] HTTP server did not start\n");
         return;
